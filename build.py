@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import subprocess
 import sys
 
@@ -7,15 +8,15 @@ version = open("VERSION").read().strip()
 targets = [
     ("linux", "amd64", ""),
     ("linux", "arm64", ""),
-    ("linux", "386", ""),
     ("darwin", "amd64", ""),
     ("darwin", "arm64", ""),
     ("windows", "amd64", ".exe"),
-    ("windows", "386", ".exe"),
 ]
 
 outdir = "dist"
 os.makedirs(outdir, exist_ok=True)
+
+upx = shutil.which("upx")
 
 for os_name, arch, ext in targets:
     name = f"mdnotes_{os_name}_{arch}_{version}{ext}"
@@ -24,7 +25,8 @@ for os_name, arch, ext in targets:
     env["GOOS"] = os_name
     env["GOARCH"] = arch
     env["CGO_ENABLED"] = "0"
-    cmd = ["go", "build", "-ldflags", f"-X main.version={version}", "-o", path, "."]
+    ldflags = f"-s -w -X main.version={version}"
+    cmd = ["go", "build", "-trimpath", "-ldflags", ldflags, "-o", path, "."]
     print(f"building {name}...", end=" ", flush=True)
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
@@ -32,3 +34,9 @@ for os_name, arch, ext in targets:
         print(r.stderr)
         sys.exit(1)
     print("ok")
+    if upx and os_name == "linux":
+        print(f"  compressing...", end=" ", flush=True)
+        subprocess.run([upx, "-q", "-o", path + ".tmp", path], check=True)
+        os.replace(path + ".tmp", path)
+        size = os.path.getsize(path)
+        print(f"{size // 1024}K")

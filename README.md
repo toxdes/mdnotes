@@ -32,10 +32,10 @@ Optional environment variables:
 ## Build
 
 ```
-go build -ldflags="-X main.version=$(cat VERSION)" -o mdnotes .
+go build -trimpath -ldflags="-s -w -X main.version=$(cat VERSION)" -o mdnotes .
 ```
 
-Cross-compile all targets:
+Cross-compile all targets (Linux binaries compressed with UPX):
 
 ```
 ./build.py
