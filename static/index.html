@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#ae2448">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="mdnotes">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<title>mdnotes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Material+Symbols+Outlined" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="login-screen">
+    <form id="login-form">
+      <h1>mdnotes</h1>
+      <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+
+  <div id="dashboard" class="hidden">
+    <header>
+      <h1>mdnotes</h1>
+      <div class="header-right">
+        <button id="theme-btn" class="theme-btn" title="Toggle theme"><span class="material-symbols-outlined">light_mode</span></button>
+        <button id="logout-btn" class="btn-text">Sign out</button>
+      </div>
+    </header>
+    <div class="dashboard-body">
+      <div class="toolbar">
+        <button id="new-note-btn" class="btn-primary">+ New note</button>
+      </div>
+      <div id="tag-bar"></div>
+      <div id="note-list"></div>
+    </div>
+  </div>
+
+  <div id="editor" class="hidden">
+    <header>
+      <button id="back-btn" class="btn-text">&larr; Back</button>
+      <div class="header-right">
+        <span id="editor-status" class="status"></span>
+        <button id="theme-btn-editor" class="theme-btn" title="Toggle theme"><span class="material-symbols-outlined">light_mode</span></button>
+        <button id="save-btn" class="btn-primary">Save</button>
+        <button id="delete-btn" class="btn-text danger">Delete</button>
+      </div>
+    </header>
+    <div class="editor-body">
+      <div class="meta-pane">
+        <button class="meta-toggle" type="button" title="Toggle details">
+          <span class="material-symbols-outlined">expand_more</span>
+          <span>Details</span>
+        </button>
+        <div class="meta-body">
+          <label class="input-label" for="note-title">Title</label>
+          <input type="text" id="note-title" placeholder="Note title" autocomplete="off">
+          <label class="input-label" for="note-tags">Tags</label>
+          <input type="text" id="note-tags" placeholder="tag1, tag2, tag3" autocomplete="off">
+        </div>
+      </div>
+      <div class="editor-panels" id="editor-panels">
+        <div class="panel panel-editor">
+          <div class="panel-header">
+            <span class="panel-label">Editor</span>
+            <div class="panel-header-actions">
+              <button class="panel-fs" data-fs="editor" title="Fullscreen editor">
+                <span class="material-symbols-outlined">fullscreen</span>
+              </button>
+              <button class="panel-toggle" data-panel="editor" title="Toggle editor">
+                <span class="material-symbols-outlined">remove</span>
+              </button>
+            </div>
+          </div>
+          <div class="fmt-bar" role="toolbar" aria-label="Formatting">
+            <button type="button" data-fmt="bold" title="Bold (Ctrl+B)"><span class="material-symbols-outlined">format_bold</span></button>
+            <button type="button" data-fmt="italic" title="Italic (Ctrl+I)"><span class="material-symbols-outlined">format_italic</span></button>
+            <button type="button" data-fmt="strike" title="Strikethrough"><span class="material-symbols-outlined">format_strikethrough</span></button>
+            <span class="fmt-sep"></span>
+            <button type="button" data-fmt="code" title="Inline code"><span class="material-symbols-outlined">code</span></button>
+            <button type="button" data-fmt="codeblock" title="Code block"><span class="material-symbols-outlined">data_object</span></button>
+            <span class="fmt-sep"></span>
+            <button type="button" data-fmt="h1" title="Heading 1"><span class="fmt-label">H1</span></button>
+            <button type="button" data-fmt="h2" title="Heading 2"><span class="fmt-label">H2</span></button>
+            <button type="button" data-fmt="h3" title="Heading 3"><span class="fmt-label">H3</span></button>
+            <button type="button" data-fmt="h4" title="Heading 4"><span class="fmt-label">H4</span></button>
+            <span class="fmt-sep"></span>
+            <button type="button" data-fmt="link" title="Link"><span class="material-symbols-outlined">link</span></button>
+            <button type="button" data-fmt="image" title="Image"><span class="material-symbols-outlined">image</span></button>
+            <span class="fmt-sep"></span>
+            <button type="button" data-fmt="ul" title="Bullet list"><span class="material-symbols-outlined">format_list_bulleted</span></button>
+            <button type="button" data-fmt="ol" title="Numbered list"><span class="material-symbols-outlined">format_list_numbered</span></button>
+            <button type="button" data-fmt="task" title="Task list"><span class="material-symbols-outlined">checklist</span></button>
+            <span class="fmt-sep"></span>
+            <button type="button" data-fmt="blockquote" title="Blockquote"><span class="material-symbols-outlined">format_quote</span></button>
+            <button type="button" data-fmt="hr" title="Horizontal rule"><span class="material-symbols-outlined">horizontal_rule</span></button>
+            <button type="button" data-fmt="table" title="Insert table"><span class="material-symbols-outlined">table_chart</span></button>
+          </div>
+          <textarea id="note-content" placeholder="Write markdown here..."></textarea>
+        </div>
+        <div class="panel panel-preview">
+          <div class="panel-header">
+            <span class="panel-label">Preview</span>
+            <div class="panel-header-actions">
+              <button class="panel-fs" data-fs="preview" title="Fullscreen preview">
+                <span class="material-symbols-outlined">fullscreen</span>
+              </button>
+              <button class="panel-toggle" data-panel="preview" title="Toggle preview">
+                <span class="material-symbols-outlined">remove</span>
+              </button>
+            </div>
+          </div>
+          <div id="preview" class="preview"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/marked.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

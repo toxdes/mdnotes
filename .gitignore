@@ -1,0 +1,4 @@
+mdnotes
+*.db
+/notes/
+.env
