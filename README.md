@@ -10,14 +10,14 @@ Lightweight, low-resources single-binary markdown files editor with SQLite metad
 - Tags support with filtering
 - Mobile-friendly responsive layout with dark theme
 - Autosave (5s debounce) with manual save
-- AES-256-GCM encryption on disk (opt-in via MDNOTE_ENCRYPTION_KEY)
-- Session-based authentication (MDNOTE_PASSWORD)
+- AES-256-GCM encryption on disk (opt-in via MDNOTES_ENCRYPTION_KEY)
+- Session-based authentication (MDNOTES_PASSWORD)
 - PWA-ready (manifest, service worker, installable app)
 
 ## Usage
 
 ```
-MDNOTE_PASSWORD=<password> ./mdnotes
+MDNOTES_PASSWORD=<password> ./mdnotes
 ```
 
 Optional environment variables:
@@ -25,9 +25,9 @@ Optional environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | PORT | 8080 | HTTP listen port |
-| MDNOTE_DIR | ./notes | Directory for markdown files |
-| MDNOTE_DB | ./mdnotes.db | SQLite database path |
-| MDNOTE_ENCRYPTION_KEY | (none) | Enable file encryption (32-byte key, any string) |
+| MDNOTES_DIR | ./notes | Directory for markdown files |
+| MDNOTES_DB | ./mdnotes.db | SQLite database path |
+| MDNOTES_ENCRYPTION_KEY | (none) | Enable file encryption (32-byte key, any string) |
 
 ## Build
 
@@ -46,7 +46,7 @@ Cross-compile all targets (Linux binaries compressed with UPX):
 ```
 docker build -t mdnotes .
 docker run -d -p 8080:8080 \
-  -e MDNOTE_PASSWORD=<password> \
+  -e MDNOTES_PASSWORD=<password> \
   -v mdnotes-data:/data \
   mdnotes
 ```
