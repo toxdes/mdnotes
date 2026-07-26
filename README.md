@@ -32,7 +32,13 @@ Optional environment variables:
 ## Build
 
 ```
-go build -o mdnotes .
+go build -ldflags="-X main.version=$(cat VERSION)" -o mdnotes .
+```
+
+Cross-compile all targets:
+
+```
+./build.py
 ```
 
 ## Docker

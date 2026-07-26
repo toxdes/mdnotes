@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"embed"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -15,6 +16,8 @@ import (
 	"syscall"
 	"time"
 )
+
+var version = "dev"
 
 //go:embed static
 var staticFS embed.FS
@@ -46,6 +49,13 @@ func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 }
 
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "-v" || a == "--version" || a == "-version" {
+			fmt.Println(version)
+			return
+		}
+	}
+
 	password := os.Getenv("MDNOTE_PASSWORD")
 	if password == "" {
 		log.Fatal("MDNOTE_PASSWORD environment variable is required")
