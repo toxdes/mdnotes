@@ -1,4 +1,5 @@
 mdnotes
+/dist/
 *.db
 /notes/
 .env
