@@ -56,9 +56,9 @@ func main() {
 		}
 	}
 
-	password := os.Getenv("MDNOTE_PASSWORD")
+	password := os.Getenv("MDNOTES_PASSWORD")
 	if password == "" {
-		log.Fatal("MDNOTE_PASSWORD environment variable is required")
+		log.Fatal("MDNOTES_PASSWORD environment variable is required")
 	}
 
 	port := os.Getenv("PORT")
@@ -66,7 +66,7 @@ func main() {
 		port = "8080"
 	}
 
-	notesDir := os.Getenv("MDNOTE_DIR")
+	notesDir := os.Getenv("MDNOTES_DIR")
 	if notesDir == "" {
 		notesDir = "./notes"
 	}
@@ -78,7 +78,7 @@ func main() {
 		log.Fatalf("cannot create notes directory: %v", err)
 	}
 
-	dbPath := os.Getenv("MDNOTE_DB")
+	dbPath := os.Getenv("MDNOTES_DB")
 	if dbPath == "" {
 		dbPath = "./mdnotes.db"
 	}
@@ -96,7 +96,7 @@ func main() {
 	sessions := newSessionStore()
 
 	var encKey []byte
-	if ek := os.Getenv("MDNOTE_ENCRYPTION_KEY"); ek != "" {
+	if ek := os.Getenv("MDNOTES_ENCRYPTION_KEY"); ek != "" {
 		encKey = deriveKey(ek)
 		log.Println("file encryption enabled")
 	}
