@@ -20,15 +20,17 @@ h1{font-size:1.5rem;font-weight:700}
 
 /* header */
 header{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--card-bg);gap:12px}
+#dashboard>header{padding-left:max(20px,calc((100% - 860px) / 2));padding-right:max(20px,calc((100% - 860px) / 2))}
+#editor:has(.panels-single)>header{padding-left:max(20px,calc((100% - 860px) / 2));padding-right:max(20px,calc((100% - 860px) / 2))}
 .header-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
 header h1{font-size:1.125rem;font-weight:600}
 .btn-text{background:none;border:none;color:var(--accent);cursor:pointer;font-size:.875rem;font-family:var(--font);padding:6px 12px;border-radius:6px;transition:all .15s}
 .btn-text:hover{background:var(--border)}
 .btn-text.danger{color:var(--danger)}
 .btn-text.danger:hover{background:color-mix(in srgb,var(--danger) 15%,transparent)}
-.theme-btn{background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;border-radius:6px;display:flex;align-items:center;transition:all .15s}
-.theme-btn:hover{background:var(--border);color:var(--fg)}
-.theme-btn .material-symbols-outlined{font-size:20px}
+.theme-btn,.prefs-btn{background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;border-radius:6px;display:flex;align-items:center;transition:all .15s}
+.theme-btn:hover,.prefs-btn:hover{background:var(--border);color:var(--fg)}
+.theme-btn .material-symbols-outlined,.prefs-btn .material-symbols-outlined{font-size:20px}
 
 /* tags */
 #tag-bar{display:flex;flex-wrap:wrap;gap:8px;padding:8px 20px 4px}
@@ -37,7 +39,7 @@ header h1{font-size:1.125rem;font-weight:600}
 .tag.active{background:var(--accent);color:#fff}
 
 /* toolbar */
-.toolbar{display:flex;justify-content:flex-end;padding:0 20px 8px}
+.toolbar{display:flex;justify-content:flex-end;padding:0 20px 8px;margin-top:8px}
 .btn-primary{padding:8px 18px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:.875rem;font-family:var(--font);font-weight:500;cursor:pointer;transition:background .15s}
 .btn-primary:hover{background:var(--accent-hover)}
 .btn-primary:active{transform:scale(.97)}
@@ -85,15 +87,17 @@ header h1{font-size:1.125rem;font-weight:600}
 .fmt-bar .material-symbols-outlined{font-size:18px}
 .fmt-label{font-size:.75rem;font-weight:600;letter-spacing:.3px;color:var(--fg)}
 .fmt-sep{width:1px;height:20px;background:var(--border);margin:0 3px;flex-shrink:0}
-#note-content{flex:1;padding:14px;border:none;border-radius:0;font-family:var(--font);font-size:1.1rem;line-height:1.65;overflow-y:auto;resize:none;outline:none;tab-size:2}
+#note-content{flex:1;padding:14px;border:none;border-radius:0;font-family:var(--font);font-size:1.1rem;line-height:1.65;overflow-y:auto;resize:none;outline:none;tab-size:2;background:var(--card-bg)}
 .dark #note-content{color-scheme:dark}
 .preview{flex:1;padding:14px;border:none;overflow-y:auto;background:var(--card-bg);line-height:1.65;font-size:1.1rem}
 .preview h1,.preview h2,.preview h3,.preview h4,.preview h5,.preview h6{margin:20px 0 10px;font-weight:600;line-height:1.3}
 .preview h1:first-child{margin-top:0}
-.preview h1{font-size:1.8rem}
-.preview h2{font-size:1.4rem}
-.preview h3{font-size:1.2rem}
-.preview h4{font-size:1.1rem}
+.preview h1{font-size:2.2rem}
+.preview h2{font-size:1.7rem}
+.preview h3{font-size:1.4rem}
+.preview h4{font-size:1.2rem}
+.preview h5{font-size:1.1rem}
+.preview h6{font-size:.9rem}
 .preview p{margin-bottom:10px}
 .preview ul,.preview ol{padding-left:24px;margin-bottom:10px}
 .preview li{margin-bottom:3px}
@@ -110,6 +114,19 @@ header h1{font-size:1.125rem;font-weight:600}
 .preview th{background:var(--bg);font-weight:600}
 .preview .highlight{background:var(--highlight);border-radius:5px;margin:0 -4px;padding:2px 4px}
 .status{font-size:.825rem;color:var(--muted)}
+
+/* modal */
+.modal{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.3)}
+.modal-body{position:relative;background:var(--card-bg);border:1px solid var(--border);border-radius:10px;padding:32px 28px;width:90%;max-width:360px;box-shadow:var(--shadow)}
+.modal-body h3{margin:0 0 22px;font-weight:600;font-size:1.1rem}
+.pref-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;cursor:pointer;border-top:1px solid var(--border);font-size:.95rem}
+.pref-row:first-of-type{border-top:none}
+.pref-row input[type="checkbox"]{width:38px;height:20px;appearance:none;background:var(--border);border-radius:10px;position:relative;cursor:pointer;outline:none;transition:background .15s;flex-shrink:0}
+.pref-row input[type="checkbox"]::before{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .15s}
+.pref-row input[type="checkbox"]:checked{background:var(--accent)}
+.pref-row input[type="checkbox"]:checked::before{transform:translateX(18px)}
+#prefs-close{margin-top:20px;width:100%}
 
 #editor.fs-editor > header,
 #editor.fs-editor .meta-pane,
@@ -128,6 +145,7 @@ header h1{font-size:1.125rem;font-weight:600}
 
 .panels-single{justify-content:center}
 .panels-single .panel{flex:0 1 860px}
+.editor-body:has(.panels-single) .meta-pane{max-width:860px;align-self:center;width:100%}
 .panel-hidden{display:none!important}
 
 /* mobile */

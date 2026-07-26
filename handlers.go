@@ -171,3 +171,21 @@ func (a *app) handleListTags(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(tags)
 }
+
+func (a *app) handleGetPrefs(w http.ResponseWriter, r *http.Request) {
+	p := getPrefs(a.db)
+	json.NewEncoder(w).Encode(p)
+}
+
+func (a *app) handleSavePrefs(w http.ResponseWriter, r *http.Request) {
+	var p prefs
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := savePrefs(a.db, &p); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(&p)
+}

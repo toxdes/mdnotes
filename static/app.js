@@ -14,6 +14,8 @@ let currentNoteId = null;
 let currentTag = null;
 let isDirty = false;
 let panelState = 'both';
+let savedSnapshot = { title: '', tags: '', content: '' };
+let prefs = { autoSave: true, hidePreview: false, hideToolbar: false, collapseDetails: false, hideCursorHighlight: false };
 
 function show(screen) {
   Object.values(screens).forEach(el => el.classList.add('hidden'));
@@ -29,6 +31,7 @@ async function api(path, opts) {
     });
     if (res.status === 401) {
       show(screens.login);
+      $('#login-form input').focus();
       return null;
     }
     if (res.status === 204) return true;
@@ -50,6 +53,7 @@ $('#login-form').addEventListener('submit', async e => {
   const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
   if (res) {
     $('#login-error').textContent = '';
+    await loadPrefs();
     await loadDashboard();
   } else {
     $('#login-error').textContent = 'Wrong password';
@@ -59,6 +63,7 @@ $('#login-form').addEventListener('submit', async e => {
 $('#logout-btn').addEventListener('click', async () => {
   await api('/api/logout', {method:'POST'});
   show(screens.login);
+  $('#login-form input').focus();
 });
 
 // --- Dashboard ---
@@ -108,38 +113,55 @@ async function loadNotes() {
   });
 }
 
+function applyEditorPrefs() {
+  $('.meta-pane').classList.toggle('collapsed', prefs.collapseDetails);
+  if (prefs.hideToolbar) {
+    $('.fmt-bar').classList.add('hidden');
+  } else {
+    $('.fmt-bar').classList.remove('hidden');
+  }
+}
+
 // --- Editor ---
 $('#new-note-btn').addEventListener('click', () => {
   if (saveTimer) clearTimeout(saveTimer);
-  setPanelState('both');
+  if (previewTimer) clearTimeout(previewTimer);
+  setPanelState(prefs.hidePreview ? 'editor' : 'both');
   currentNoteId = null;
   isDirty = false;
+  savedSnapshot = { title: '', tags: '', content: '' };
   $('#note-title').value = '';
   $('#note-tags').value = '';
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
   $('#editor-status').textContent = '';
+  cachePreviewBlocks();
+  applyEditorPrefs();
   show(screens.editor);
   $('#note-title').focus();
 });
 
 $('#back-btn').addEventListener('click', async () => {
   if (saveTimer) clearTimeout(saveTimer);
+  if (previewTimer) clearTimeout(previewTimer);
   await saveCurrentNote();
   await loadDashboard();
 });
 
 async function openNote(id) {
   if (saveTimer) clearTimeout(saveTimer);
-  setPanelState('both');
+  if (previewTimer) clearTimeout(previewTimer);
+  setPanelState(prefs.hidePreview ? 'editor' : 'both');
   const data = await api(`/api/notes/${id}`);
   if (!data) return;
   currentNoteId = data.id;
   isDirty = false;
+  savedSnapshot = { title: data.title || '', tags: data.tags || '', content: data.content || '' };
   $('#note-title').value = data.title || '';
   $('#note-tags').value = data.tags || '';
   $('#note-content').value = data.content || '';
   $('#editor-status').textContent = '';
+  applyEditorPrefs();
   updatePreview();
   show(screens.editor);
 }
@@ -160,10 +182,16 @@ async function saveCurrentNote() {
   const data = {title, tags, content};
   if (currentNoteId) data.id = currentNoteId;
 
+  if (currentNoteId && data.title === savedSnapshot.title && data.tags === savedSnapshot.tags && data.content === savedSnapshot.content) {
+    isDirty = false;
+    $('#editor-status').textContent = '';
+    return;
+  }
   $('#editor-status').textContent = 'Saving...';
   const res = await api('/api/notes', {method:'POST', body:JSON.stringify(data)});
   if (res) {
     currentNoteId = res.id;
+    savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
     isDirty = false;
     $('#editor-status').textContent = 'Saved';
     setTimeout(() => {
@@ -175,8 +203,10 @@ async function saveCurrentNote() {
 }
 
 let saveTimer = null;
+let previewTimer = null;
 
 function scheduleSave() {
+  if (!prefs.autoSave) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     if (isDirty) saveCurrentNote();
@@ -280,6 +310,7 @@ function insertFmt(type) {
   ta.focus();
   ta.selectionStart = ta.selectionEnd = clean ? cursor : cursor;
   ta.dispatchEvent(new Event('input'));
+  updatePreview();
 }
 
 document.querySelector('.fmt-bar')?.addEventListener('click', e => {
@@ -352,19 +383,29 @@ $('#editor-panels').addEventListener('click', e => {
 });
 
 // --- Cursor preview highlight ---
+let previewBlocks = [];
+function cachePreviewBlocks() {
+  const pv = $('#preview');
+  previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
+}
 function highlightBlock() {
+  if (prefs.hideCursorHighlight) {
+    const cur = $('#preview').querySelector('.highlight');
+    if (cur) cur.classList.remove('highlight');
+    return;
+  }
   const ta = $('#note-content');
   const pv = $('#preview');
-  pv.querySelectorAll('.highlight').forEach(el => el.classList.remove('highlight'));
+  const cur = pv.querySelector('.highlight');
+  if (cur) cur.classList.remove('highlight');
   const text = ta.value;
   const pos = ta.selectionStart;
-  if (!text.trim() || !pv.children.length) return;
+  if (!text.trim() || !previewBlocks.length) return;
   const before = text.slice(0, pos);
   const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
   let idx = Math.max(0, nonEmpty.length - 1);
-  const blocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
-  if (idx >= blocks.length) idx = blocks.length - 1;
-  blocks[idx]?.classList.add('highlight');
+  if (idx >= previewBlocks.length) idx = previewBlocks.length - 1;
+  previewBlocks[idx]?.classList.add('highlight');
 }
 
 // --- Delete ---
@@ -382,18 +423,21 @@ $('#delete-btn').addEventListener('click', async () => {
 $('#note-content').addEventListener('input', () => {
   markDirty();
   scheduleSave();
-  updatePreview();
+  if (previewTimer) clearTimeout(previewTimer);
+  previewTimer = setTimeout(updatePreview, 500);
 });
 $('#note-content').addEventListener('click', highlightBlock);
 $('#note-content').addEventListener('keyup', highlightBlock);
 
 function updatePreview() {
+  if ($('.panel-preview').offsetParent === null) return;
   const md = $('#note-content').value;
   if (typeof marked !== 'undefined' && marked.parse) {
     $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
   }
+  cachePreviewBlocks();
   highlightBlock();
 }
 
@@ -433,15 +477,65 @@ function toggleTheme() {
   }
 })();
 
-$$('.theme-btn').forEach(el => el.addEventListener('click', toggleTheme));
+// --- Preferences ---
+$('#prefs-btn').addEventListener('click', () => {
+  $('#pref-autosave').checked = prefs.autoSave;
+  $('#pref-hidepreview').checked = prefs.hidePreview;
+  $('#pref-hidetoolbar').checked = prefs.hideToolbar;
+  $('#pref-collapse').checked = prefs.collapseDetails;
+  $('#pref-hidecursor').checked = prefs.hideCursorHighlight;
+  $('#pref-theme').checked = document.documentElement.classList.contains('dark');
+  $('#prefs-modal').classList.remove('hidden');
+});
+
+$('#prefs-close').addEventListener('click', () => {
+  $('#prefs-modal').classList.add('hidden');
+});
+
+$('#prefs-modal .modal-backdrop').addEventListener('click', () => {
+  $('#prefs-modal').classList.add('hidden');
+});
+
+async function savePref(key, value) {
+  prefs[key] = value;
+  await api('/api/prefs', { method: 'PATCH', body: JSON.stringify(prefs) });
+  applyEditorPrefs();
+}
+
+$('#pref-autosave').addEventListener('change', function () {
+  savePref('autoSave', this.checked);
+});
+$('#pref-hidepreview').addEventListener('change', function () {
+  savePref('hidePreview', this.checked);
+});
+$('#pref-hidetoolbar').addEventListener('change', function () {
+  savePref('hideToolbar', this.checked);
+});
+$('#pref-collapse').addEventListener('change', function () {
+  savePref('collapseDetails', this.checked);
+});
+$('#pref-hidecursor').addEventListener('change', function () {
+  savePref('hideCursorHighlight', this.checked);
+});
+$('#pref-theme').addEventListener('change', function () {
+  setTheme(this.checked);
+  localStorage.setItem('theme', this.checked ? 'dark' : 'light');
+});
+
+async function loadPrefs() {
+  const p = await api('/api/prefs');
+  if (p) prefs = p;
+}
 
 // --- Init ---
 async function init() {
   const res = await api('/api/check');
   if (res) {
+    await loadPrefs();
     await loadDashboard();
   } else {
     show(screens.login);
+    $('#login-form input').focus();
   }
 }
 

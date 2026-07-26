@@ -31,16 +31,48 @@
     <header>
       <h1>mdnotes</h1>
       <div class="header-right">
-        <button id="theme-btn" class="theme-btn" title="Toggle theme"><span class="material-symbols-outlined">light_mode</span></button>
+        <button id="prefs-btn" class="prefs-btn" title="Preferences"><span class="material-symbols-outlined">settings</span></button>
         <button id="logout-btn" class="btn-text">Sign out</button>
       </div>
     </header>
     <div class="dashboard-body">
       <div class="toolbar">
-        <button id="new-note-btn" class="btn-primary">+ New note</button>
+        <button id="new-note-btn" class="btn-primary">+ New</button>
       </div>
       <div id="tag-bar"></div>
       <div id="note-list"></div>
+    </div>
+  </div>
+
+  <div id="prefs-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-body">
+      <h3>Preferences</h3>
+      <label class="pref-row">
+        <span>Auto Save</span>
+        <input type="checkbox" id="pref-autosave" checked>
+      </label>
+      <label class="pref-row">
+        <span>Hide Preview by default</span>
+        <input type="checkbox" id="pref-hidepreview">
+      </label>
+      <label class="pref-row">
+        <span>Hide Editor Toolbar</span>
+        <input type="checkbox" id="pref-hidetoolbar">
+      </label>
+      <label class="pref-row">
+        <span>Collapse Details by default</span>
+        <input type="checkbox" id="pref-collapse">
+      </label>
+      <label class="pref-row">
+        <span>Hide cursor position preview</span>
+        <input type="checkbox" id="pref-hidecursor">
+      </label>
+      <label class="pref-row">
+        <span>Dark Theme</span>
+        <input type="checkbox" id="pref-theme">
+      </label>
+      <button id="prefs-close" class="btn-primary">Done</button>
     </div>
   </div>
 
@@ -49,7 +81,6 @@
       <button id="back-btn" class="btn-text">&larr; Back</button>
       <div class="header-right">
         <span id="editor-status" class="status"></span>
-        <button id="theme-btn-editor" class="theme-btn" title="Toggle theme"><span class="material-symbols-outlined">light_mode</span></button>
         <button id="save-btn" class="btn-primary">Save</button>
         <button id="delete-btn" class="btn-text danger">Delete</button>
       </div>
