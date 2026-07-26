@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -26,6 +27,14 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+type prefs struct {
+	AutoSave           bool `json:"autoSave"`
+	HidePreview        bool `json:"hidePreview"`
+	HideToolbar        bool `json:"hideToolbar"`
+	CollapseDetails    bool `json:"collapseDetails"`
+	HideCursorHighlight bool `json:"hideCursorHighlight"`
+}
+
 func initDB(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS notes (
@@ -37,7 +46,35 @@ func initDB(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes(tags);
+		CREATE TABLE IF NOT EXISTS prefs (
+			id    INTEGER PRIMARY KEY DEFAULT 1,
+			data  TEXT NOT NULL DEFAULT '{}'
+		);
 	`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("INSERT OR IGNORE INTO prefs (id, data) VALUES (1, '{\"autoSave\":true}')")
+	return err
+}
+
+func getPrefs(db *sql.DB) *prefs {
+	var data string
+	err := db.QueryRow("SELECT data FROM prefs WHERE id = 1").Scan(&data)
+	if err != nil {
+		return &prefs{AutoSave: true}
+	}
+	p := &prefs{AutoSave: true}
+	json.Unmarshal([]byte(data), p)
+	return p
+}
+
+func savePrefs(db *sql.DB, p *prefs) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("UPDATE prefs SET data = ? WHERE id = 1", string(b))
 	return err
 }
 

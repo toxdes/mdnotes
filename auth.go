@@ -78,6 +78,7 @@ type app struct {
 	notesDir string
 	encKey   []byte
 	noteCache *noteCache
+	rl        *rateLimiter
 }
 
 func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -118,9 +119,11 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Password != a.password {
+		a.rl.recordLoginAttempt(a.rl.realIP(r), false)
 		http.Error(w, "wrong password", http.StatusUnauthorized)
 		return
 	}
+	a.rl.recordLoginAttempt(a.rl.realIP(r), true)
 	token := a.sessions.create()
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",

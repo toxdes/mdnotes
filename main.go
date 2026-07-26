@@ -95,6 +95,11 @@ func main() {
 
 	sessions := newSessionStore()
 
+	rl, err := newRateLimiter(db, sessions)
+	if err != nil {
+		log.Fatalf("rate limiter: %v", err)
+	}
+
 	var encKey []byte
 	if ek := os.Getenv("MDNOTES_ENCRYPTION_KEY"); ek != "" {
 		encKey = deriveKey(ek)
@@ -108,6 +113,7 @@ func main() {
 		notesDir:  notesDir,
 		encKey:    encKey,
 		noteCache: newNoteCache(),
+		rl:        rl,
 	}
 
 	go sessions.cleanupLoop()
@@ -122,6 +128,8 @@ func main() {
 	mux.HandleFunc("POST /api/notes", app.auth(app.handleSaveNote))
 	mux.HandleFunc("DELETE /api/notes/{id}", app.auth(app.handleDeleteNote))
 	mux.HandleFunc("GET /api/tags", app.auth(app.handleListTags))
+	mux.HandleFunc("GET /api/prefs", app.auth(app.handleGetPrefs))
+	mux.HandleFunc("PATCH /api/prefs", app.auth(app.handleSavePrefs))
 
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -132,7 +140,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      gzipMiddleware(mux),
+		Handler:      gzipMiddleware(rl.banCheckMiddleware(rl.notFoundTracker(mux))),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
