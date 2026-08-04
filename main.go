@@ -76,9 +76,11 @@ func staticCacheMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/", "/index.html", "/sw.js", "/manifest.json":
-			w.Header().Set("Cache-Control", "no-cache")
+			// Cloudflare respects no-transform and therefore cannot inject its
+			// Web Analytics script into our strictly CSP-protected app shell.
+			w.Header().Set("Cache-Control", "no-cache, no-transform")
 		default:
-			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Header().Set("Cache-Control", "public, max-age=86400, no-transform")
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -88,7 +90,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' http: https: data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; font-src 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
