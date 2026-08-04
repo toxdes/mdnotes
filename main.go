@@ -155,7 +155,7 @@ func main() {
 	sessions := newSessionStore(db)
 
 	trustProxy := os.Getenv("MDNOTES_TRUST_PROXY") == "1"
-	rl, err := newRateLimiter(db, sessions, trustProxy)
+	rl, err := newRateLimiter(db, trustProxy)
 	if err != nil {
 		log.Fatalf("rate limiter: %v", err)
 	}
@@ -228,7 +228,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      securityHeaders(gzipMiddleware(rl.banCheckMiddleware(rl.notFoundTracker(mux)))),
+		Handler:      securityHeaders(gzipMiddleware(rl.banCheckMiddleware(mux))),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
