@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"embed"
 	"fmt"
 	"io"
@@ -21,6 +22,31 @@ var version = "dev"
 
 //go:embed static
 var staticFS embed.FS
+
+var appRevision = embeddedAppRevision()
+
+func embeddedAppRevision() string {
+	hash := sha256.New()
+	err := fs.WalkDir(staticFS, "static", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		data, err := staticFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, _ = hash.Write([]byte(path))
+		_, _ = hash.Write(data)
+		return nil
+	})
+	if err != nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)[:8])
+}
 
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,11 +146,11 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := initDB(db); err != nil {
+	if err := initDB(db, dbPath); err != nil {
 		log.Fatalf("init db: %v", err)
 	}
 
-	sessions := newSessionStore()
+	sessions := newSessionStore(db)
 
 	trustProxy := os.Getenv("MDNOTES_TRUST_PROXY") == "1"
 	rl, err := newRateLimiter(db, sessions, trustProxy)
@@ -161,6 +187,9 @@ func main() {
 		noteCache:  newNoteCache(),
 		rl:         rl,
 	}
+	if err := app.recoverFileOperations(); err != nil {
+		log.Fatalf("recover pending file operations: %v", err)
+	}
 	if os.Getenv("MDNOTES_MIGRATE_ENCRYPTION") == "1" {
 		count, err := migrateEncryption(app)
 		if err != nil {
@@ -178,6 +207,9 @@ func main() {
 	mux.HandleFunc("GET /api/check", app.auth(app.handleCheck))
 	mux.HandleFunc("GET /api/notes", app.auth(app.handleListNotes))
 	mux.HandleFunc("GET /api/search", app.auth(app.handleSearchNotes))
+	mux.HandleFunc("GET /api/sync", app.auth(app.handleSyncChanges))
+	mux.HandleFunc("POST /api/sync/push", app.auth(app.handleSyncPush))
+	mux.HandleFunc("GET /api/events", app.auth(app.handleEvents))
 	mux.HandleFunc("GET /api/notes/{id}", app.auth(app.handleGetNote))
 	mux.HandleFunc("POST /api/notes", app.auth(app.handleSaveNote))
 	mux.HandleFunc("DELETE /api/notes/{id}", app.auth(app.handleDeleteNote))

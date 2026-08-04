@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
@@ -10,15 +11,19 @@ import (
 	"time"
 )
 
+const sessionLifetime = 180 * 24 * time.Hour
+
 type sessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time
+	db *sql.DB
 }
 
-func newSessionStore() *sessionStore {
-	return &sessionStore{
-		sessions: make(map[string]time.Time),
-	}
+func newSessionStore(db *sql.DB) *sessionStore {
+	return &sessionStore{db: db}
+}
+
+func sessionTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *sessionStore) create() (string, error) {
@@ -27,43 +32,32 @@ func (s *sessionStore) create() (string, error) {
 		return "", err
 	}
 	token := hex.EncodeToString(b)
-	s.mu.Lock()
-	s.sessions[token] = time.Now().Add(24 * time.Hour)
-	s.mu.Unlock()
+	_, err := s.db.Exec("INSERT INTO sessions (token_hash, expires_at) VALUES (?, ?)", sessionTokenHash(token), time.Now().UTC().Add(sessionLifetime).Format(time.RFC3339))
+	if err != nil {
+		return "", err
+	}
 	return token, nil
 }
 
 func (s *sessionStore) valid(token string) bool {
-	s.mu.RLock()
-	expiry, ok := s.sessions[token]
-	s.mu.RUnlock()
-	if !ok {
+	var expiry string
+	if err := s.db.QueryRow("SELECT expires_at FROM sessions WHERE token_hash = ?", sessionTokenHash(token)).Scan(&expiry); err != nil {
 		return false
 	}
-	if time.Now().After(expiry) {
-		s.mu.Lock()
-		delete(s.sessions, token)
-		s.mu.Unlock()
+	expiresAt, err := time.Parse(time.RFC3339, expiry)
+	if err != nil || !time.Now().UTC().Before(expiresAt) {
+		s.remove(token)
 		return false
 	}
 	return true
 }
 
 func (s *sessionStore) remove(token string) {
-	s.mu.Lock()
-	delete(s.sessions, token)
-	s.mu.Unlock()
+	_, _ = s.db.Exec("DELETE FROM sessions WHERE token_hash = ?", sessionTokenHash(token))
 }
 
 func (s *sessionStore) cleanup() {
-	s.mu.Lock()
-	now := time.Now()
-	for t, exp := range s.sessions {
-		if now.After(exp) {
-			delete(s.sessions, t)
-		}
-	}
-	s.mu.Unlock()
+	_, _ = s.db.Exec("DELETE FROM sessions WHERE expires_at <= ?", time.Now().UTC().Format(time.RFC3339))
 }
 
 func (s *sessionStore) cleanupLoop() {
@@ -75,6 +69,7 @@ func (s *sessionStore) cleanupLoop() {
 
 type app struct {
 	db         *sql.DB
+	noteMu     sync.Mutex
 	sessions   *sessionStore
 	password   string
 	notesDir   string
@@ -99,7 +94,7 @@ func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *app) handleCheck(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "version": version, "revision": appRevision})
 }
 
 func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +139,7 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Secure:   a.isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   86400,
+		MaxAge:   int(sessionLifetime.Seconds()),
 	})
 	writeJSON(w, map[string]bool{"ok": true})
 }

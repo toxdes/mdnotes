@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +23,7 @@ type note struct {
 	Tags      string `json:"tags"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	Revision  int64  `json:"revision"`
 }
 
 type notesPage struct {
@@ -26,7 +31,25 @@ type notesPage struct {
 	NextCursor string `json:"nextCursor,omitempty"`
 }
 
+type syncChange struct {
+	Sequence  int64  `json:"sequence"`
+	NoteID    string `json:"note_id"`
+	Revision  int64  `json:"revision"`
+	Deleted   bool   `json:"deleted"`
+	ChangedAt string `json:"changed_at"`
+}
+
+type syncChangesPage struct {
+	Changes       []syncChange `json:"changes"`
+	NextSequence  int64        `json:"nextSequence"`
+	HasMore       bool         `json:"hasMore"`
+	ResetRequired bool         `json:"resetRequired,omitempty"`
+}
+
 var errInvalidCursor = errors.New("invalid cursor")
+
+const maxMigrationBackups = 3
+const maxSyncChanges = 100000
 
 func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-8000")
@@ -39,11 +62,12 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 type prefs struct {
-	AutoSave            bool `json:"autoSave"`
-	HidePreview         bool `json:"hidePreview"`
-	HideToolbar         bool `json:"hideToolbar"`
-	CollapseDetails     bool `json:"collapseDetails"`
-	HideCursorHighlight bool `json:"hideCursorHighlight"`
+	AutoSave               bool `json:"autoSave"`
+	HidePreview            bool `json:"hidePreview"`
+	HideHeaderOnFullscreen bool `json:"hideHeaderOnFullscreen"`
+	HideToolbar            bool `json:"hideToolbar"`
+	CollapseDetails        bool `json:"collapseDetails"`
+	HideCursorHighlight    bool `json:"hideCursorHighlight"`
 }
 
 type migration struct {
@@ -57,9 +81,14 @@ var migrations = []migration{
 	{version: 3, up: migrateRateLimitSchema},
 	{version: 4, up: migrateRemoveUnusedTagIndex},
 	{version: 5, up: migrateMetadataSearch},
+	{version: 6, up: migrateSyncSchema},
+	{version: 7, up: migrateSessionSchema},
+	{version: 8, up: migrateSyncOperationsSchema},
+	{version: 9, up: migrateSyncOperationPayloadSchema},
+	{version: 10, up: migrateFileOperationSchema},
 }
 
-func initDB(db *sql.DB) error {
+func initDB(db *sql.DB, databasePaths ...string) error {
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
@@ -67,15 +96,23 @@ func initDB(db *sql.DB) error {
 		)`); err != nil {
 		return err
 	}
-	for _, migration := range migrations {
-		var version int
-		err := db.QueryRow("SELECT version FROM schema_migrations WHERE version = ?", migration.version).Scan(&version)
-		if err == nil {
-			continue
+	pending, err := pendingMigrations(db)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	if len(databasePaths) > 0 {
+		backupPath, err := backupBeforeMigration(db, databasePaths[0], pending[0].version)
+		if err != nil {
+			return fmt.Errorf("backup before migration %d: %w", pending[0].version, err)
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
+		if backupPath != "" {
+			log.Printf("created pre-migration database backup: %s", backupPath)
 		}
+	}
+	for _, migration := range pending {
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -90,6 +127,90 @@ func initDB(db *sql.DB) error {
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration %d: %w", migration.version, err)
+		}
+	}
+	return nil
+}
+
+func pendingMigrations(db *sql.DB) ([]migration, error) {
+	pending := make([]migration, 0)
+	for _, migration := range migrations {
+		var version int
+		err := db.QueryRow("SELECT version FROM schema_migrations WHERE version = ?", migration.version).Scan(&version)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		pending = append(pending, migration)
+	}
+	return pending, nil
+}
+
+func backupBeforeMigration(db *sql.DB, databasePath string, version int) (string, error) {
+	if databasePath == "" || databasePath == ":memory:" {
+		return "", nil
+	}
+	var userTableCount int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT IN ('schema_migrations', 'sqlite_sequence')`).Scan(&userTableCount); err != nil {
+		return "", err
+	}
+	if userTableCount == 0 {
+		return "", nil
+	}
+
+	directory := filepath.Dir(databasePath)
+	base := filepath.Base(databasePath)
+	backupPath := filepath.Join(directory, fmt.Sprintf("%s.pre-migration-v%d-%s.db", base, version, time.Now().UTC().Format("20060102T150405.000000000Z")))
+	info, err := os.Stat(databasePath)
+	if err != nil {
+		return "", err
+	}
+	if _, err := db.Exec("VACUUM INTO ?", backupPath); err != nil {
+		return "", fmt.Errorf("create consistent backup (requires roughly %d additional bytes of disk space): %w", info.Size(), err)
+	}
+	if err := os.Chmod(backupPath, 0600); err != nil {
+		return "", err
+	}
+	if err := pruneMigrationBackups(directory, base); err != nil {
+		return "", err
+	}
+	return backupPath, nil
+}
+
+func pruneMigrationBackups(directory, base string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	prefix := base + ".pre-migration-v"
+	type backupFile struct {
+		name    string
+		modTime time.Time
+	}
+	backups := make([]backupFile, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) || !strings.HasSuffix(entry.Name(), ".db") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		backups = append(backups, backupFile{name: entry.Name(), modTime: info.ModTime()})
+	}
+	sort.Slice(backups, func(i, j int) bool {
+		if backups[i].modTime.Equal(backups[j].modTime) {
+			return backups[i].name > backups[j].name
+		}
+		return backups[i].modTime.After(backups[j].modTime)
+	})
+	if len(backups) > maxMigrationBackups {
+		for _, backup := range backups[maxMigrationBackups:] {
+			if err := os.Remove(filepath.Join(directory, backup.name)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -210,6 +331,73 @@ func migrateMetadataSearch(tx *sql.Tx) error {
 	return nil
 }
 
+func migrateSyncSchema(tx *sql.Tx) error {
+	if _, err := tx.Exec(`ALTER TABLE notes ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE sync_changes (
+			sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
+			note_id    TEXT NOT NULL,
+			revision   INTEGER NOT NULL,
+			deleted    INTEGER NOT NULL DEFAULT 0,
+			changed_at TEXT NOT NULL
+		);
+		CREATE INDEX idx_sync_changes_sequence ON sync_changes(sequence);
+		INSERT INTO sync_changes (note_id, revision, deleted, changed_at)
+		SELECT id, revision, 0, updated_at FROM notes;`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func migrateSessionSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE sessions (
+			token_hash TEXT PRIMARY KEY,
+			expires_at TEXT NOT NULL
+		);
+		CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);`)
+	return err
+}
+
+func migrateSyncOperationsSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE sync_device_state (
+			device_id     TEXT PRIMARY KEY,
+			last_sequence INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE TABLE sync_operations (
+			device_id      TEXT NOT NULL,
+			client_sequence INTEGER NOT NULL,
+			op_id          TEXT NOT NULL,
+			op_type        TEXT NOT NULL,
+			result         TEXT NOT NULL,
+			applied_at     TEXT NOT NULL,
+			PRIMARY KEY (device_id, client_sequence),
+			UNIQUE (device_id, op_id)
+		);`)
+	return err
+}
+
+func migrateSyncOperationPayloadSchema(tx *sql.Tx) error {
+	_, err := tx.Exec("ALTER TABLE sync_operations ADD COLUMN operation TEXT NOT NULL DEFAULT '{}'")
+	return err
+}
+
+func migrateFileOperationSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE file_operations (
+			id         TEXT PRIMARY KEY,
+			action     TEXT NOT NULL,
+			note_id    TEXT NOT NULL,
+			stage_name TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX idx_file_operations_created_at ON file_operations(created_at);`)
+	return err
+}
+
 func getPrefs(db *sql.DB) (*prefs, error) {
 	var data string
 	err := db.QueryRow("SELECT data FROM prefs WHERE id = 1").Scan(&data)
@@ -237,13 +425,13 @@ func listNotes(db *sql.DB, tag string) ([]note, error) {
 	var err error
 	if tag != "" {
 		rows, err = db.Query(`
-			SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at
+			SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision
 			FROM notes n
 			JOIN note_tags nt ON nt.note_id = n.id
 			WHERE nt.tag = ?
 			ORDER BY n.updated_at DESC`, tag)
 	} else {
-		rows, err = db.Query("SELECT id, title, filename, tags, created_at, updated_at FROM notes ORDER BY updated_at DESC")
+		rows, err = db.Query("SELECT id, title, filename, tags, created_at, updated_at, revision FROM notes ORDER BY updated_at DESC")
 	}
 	if err != nil {
 		return nil, err
@@ -253,7 +441,7 @@ func listNotes(db *sql.DB, tag string) ([]note, error) {
 	var notes []note
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -291,7 +479,7 @@ func listNotesPage(db *sql.DB, tag, cursor string, limit int) (notesPage, error)
 		}
 	}
 
-	query := "SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at FROM notes n"
+	query := "SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision FROM notes n"
 	args := make([]any, 0, 4)
 	where := make([]string, 0, 2)
 	if tag != "" {
@@ -318,7 +506,7 @@ func listNotesPage(db *sql.DB, tag, cursor string, limit int) (notesPage, error)
 	page := notesPage{Notes: make([]note, 0, limit)}
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return notesPage{}, err
 		}
 		page.Notes = append(page.Notes, n)
@@ -342,7 +530,7 @@ func searchNotes(db *sql.DB, query string, limit int) ([]note, error) {
 		return []note{}, nil
 	}
 	rows, err := db.Query(`
-		SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at
+		SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision
 		FROM note_metadata_fts
 		JOIN notes n ON n.id = note_metadata_fts.note_id
 		WHERE note_metadata_fts MATCH ?
@@ -355,12 +543,52 @@ func searchNotes(db *sql.DB, query string, limit int) ([]note, error) {
 	var notes []note
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
 	}
 	return notes, rows.Err()
+}
+
+func listSyncChanges(db *sql.DB, since int64, limit int) (syncChangesPage, error) {
+	var oldest, newest sql.NullInt64
+	if err := db.QueryRow("SELECT MIN(sequence), MAX(sequence) FROM sync_changes").Scan(&oldest, &newest); err != nil {
+		return syncChangesPage{}, err
+	}
+	if oldest.Valid && since < oldest.Int64-1 {
+		return syncChangesPage{Changes: []syncChange{}, NextSequence: newest.Int64, ResetRequired: true}, nil
+	}
+	rows, err := db.Query(`
+		SELECT sequence, note_id, revision, deleted, changed_at
+		FROM sync_changes
+		WHERE sequence > ?
+		ORDER BY sequence
+		LIMIT ?`, since, limit+1)
+	if err != nil {
+		return syncChangesPage{}, err
+	}
+	defer rows.Close()
+
+	page := syncChangesPage{Changes: make([]syncChange, 0, limit), NextSequence: since}
+	for rows.Next() {
+		var change syncChange
+		var deleted int
+		if err := rows.Scan(&change.Sequence, &change.NoteID, &change.Revision, &deleted, &change.ChangedAt); err != nil {
+			return syncChangesPage{}, err
+		}
+		if len(page.Changes) == limit {
+			page.HasMore = true
+			break
+		}
+		change.Deleted = deleted != 0
+		page.Changes = append(page.Changes, change)
+		page.NextSequence = change.Sequence
+	}
+	if err := rows.Err(); err != nil {
+		return syncChangesPage{}, err
+	}
+	return page, nil
 }
 
 func metadataSearchQuery(raw string) string {
@@ -381,8 +609,8 @@ func metadataSearchQuery(raw string) string {
 func getNote(db *sql.DB, id string) (*note, error) {
 	var n note
 	err := db.QueryRow(
-		"SELECT id, title, filename, tags, created_at, updated_at FROM notes WHERE id = ?", id,
-	).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt)
+		"SELECT id, title, filename, tags, created_at, updated_at, revision FROM notes WHERE id = ?", id,
+	).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision)
 	if err != nil {
 		return nil, err
 	}
@@ -396,15 +624,23 @@ func upsertNote(db *sql.DB, id, title, filename, tags string) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`
-		INSERT INTO notes (id, title, filename, tags, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+	if err := upsertNoteTx(tx, id, title, filename, tags, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertNoteTx(tx *sql.Tx, id, title, filename, tags, now string) error {
+	_, err := tx.Exec(`
+		INSERT INTO notes (id, title, filename, tags, created_at, updated_at, revision)
+		VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(revision) + 1 FROM sync_changes WHERE note_id = ?), 1))
 		ON CONFLICT(id) DO UPDATE SET
 			title=excluded.title,
 			filename=excluded.filename,
 			tags=excluded.tags,
-			updated_at=excluded.updated_at
-	`, id, title, filename, tags, now, now)
+			updated_at=excluded.updated_at,
+			revision=notes.revision + 1
+	`, id, title, filename, tags, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -422,7 +658,14 @@ func upsertNote(db *sql.DB, id, title, filename, tags string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	var revision int64
+	if err := tx.QueryRow("SELECT revision FROM notes WHERE id = ?", id).Scan(&revision); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO sync_changes (note_id, revision, deleted, changed_at) VALUES (?, ?, 0, ?)", id, revision, now); err != nil {
+		return err
+	}
+	return compactSyncChangesTx(tx)
 }
 
 func deleteNote(db *sql.DB, id string) error {
@@ -431,13 +674,42 @@ func deleteNote(db *sql.DB, id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := deleteNoteTx(tx, id, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func deleteNoteTx(tx *sql.Tx, id, now string) error {
+	var revision int64
+	if err := tx.QueryRow("SELECT revision FROM notes WHERE id = ?", id).Scan(&revision); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO sync_changes (note_id, revision, deleted, changed_at) VALUES (?, ?, 1, ?)", id, revision+1, now); err != nil {
+		return err
+	}
+	if err := compactSyncChangesTx(tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM note_metadata_fts WHERE note_id = ?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM notes WHERE id = ?", id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
+}
+
+func compactSyncChangesTx(tx *sql.Tx) error {
+	var newest sql.NullInt64
+	if err := tx.QueryRow("SELECT MAX(sequence) FROM sync_changes").Scan(&newest); err != nil {
+		return err
+	}
+	if !newest.Valid || newest.Int64 <= maxSyncChanges {
+		return nil
+	}
+	_, err := tx.Exec("DELETE FROM sync_changes WHERE sequence <= ?", newest.Int64-maxSyncChanges)
+	return err
 }
 
 func listTags(db *sql.DB) ([]string, error) {
