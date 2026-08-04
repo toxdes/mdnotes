@@ -1,4 +1,4 @@
-const CACHE = 'mdnotes-v1';
+const CACHE = 'mdnotes-v2';
 const ASSETS = [
   '/', '/index.html', '/style.css', '/app.js', '/marked.min.js',
   '/manifest.json', '/favicon.ico', '/favicon.svg',

@@ -1,4 +1,6 @@
 mdnotes
+DESIGN_SYSTEM.md
+TODO.md
 /dist/
 *.db
 /notes/

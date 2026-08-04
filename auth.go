@@ -2,9 +2,9 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
@@ -21,14 +21,16 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) create() string {
+func (s *sessionStore) create() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
 	token := hex.EncodeToString(b)
 	s.mu.Lock()
 	s.sessions[token] = time.Now().Add(24 * time.Hour)
 	s.mu.Unlock()
-	return token
+	return token, nil
 }
 
 func (s *sessionStore) valid(token string) bool {
@@ -72,13 +74,17 @@ func (s *sessionStore) cleanupLoop() {
 }
 
 type app struct {
-	db       *sql.DB
-	sessions *sessionStore
-	password string
-	notesDir string
-	encKey   []byte
-	noteCache *noteCache
-	rl        *rateLimiter
+	db         *sql.DB
+	sessions   *sessionStore
+	password   string
+	notesDir   string
+	encryption *encryptionConfig
+	noteCache  *noteCache
+	rl         *rateLimiter
+}
+
+func (a *app) isSecureRequest(r *http.Request) bool {
+	return r.TLS != nil || (a.rl.trustProxy && r.Header.Get("X-Forwarded-Proto") == "https")
 }
 
 func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -93,7 +99,7 @@ func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *app) handleCheck(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +112,9 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   a.isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -114,24 +123,28 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+	if !decodeJSON(w, r, &body, 16<<10) {
 		return
 	}
-	if body.Password != a.password {
+	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.password)) != 1 {
 		a.rl.recordLoginAttempt(a.rl.realIP(r), false)
 		http.Error(w, "wrong password", http.StatusUnauthorized)
 		return
 	}
 	a.rl.recordLoginAttempt(a.rl.realIP(r), true)
-	token := a.sessions.create()
+	token, err := a.sessions.create()
+	if err != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   a.isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400,
 	})
-	json.NewEncoder(w).Encode(map[string]string{"token": token})
+	writeJSON(w, map[string]bool{"ok": true})
 }
