@@ -23,6 +23,7 @@ const (
 )
 
 var noteIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var errRevisionConflict = errors.New("note revision conflict")
 
 func randID() (string, error) {
 	b := make([]byte, 16)
@@ -46,6 +47,12 @@ func sanitizePath(base, path string) (string, error) {
 
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
@@ -150,6 +157,33 @@ func (a *app) handleSearchNotes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, notes)
 }
 
+func (a *app) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
+	since := int64(0)
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		var err error
+		since, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || since < 0 {
+			http.Error(w, "invalid sync sequence", http.StatusBadRequest)
+			return
+		}
+	}
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		var err error
+		limit, err = strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 500 {
+			http.Error(w, "invalid page limit", http.StatusBadRequest)
+			return
+		}
+	}
+	page, err := listSyncChanges(a.db, since, limit)
+	if err != nil {
+		http.Error(w, "could not list sync changes", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, page)
+}
+
 func (a *app) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	n, err := getNote(a.db, id)
@@ -200,10 +234,32 @@ func (a *app) handleGetNote(w http.ResponseWriter, r *http.Request) {
 }
 
 type saveRequest struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Tags    string `json:"tags"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Content      string `json:"content"`
+	Tags         string `json:"tags"`
+	BaseRevision *int64 `json:"base_revision,omitempty"`
+}
+
+func checkNoteRevision(db *sql.DB, id string, expected int64) error {
+	n, err := getNote(db, id)
+	if err == nil {
+		if n.Revision != expected {
+			return errRevisionConflict
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var latest int64
+	if err := db.QueryRow("SELECT COALESCE(MAX(revision), 0) FROM sync_changes WHERE note_id = ?", id).Scan(&latest); err != nil {
+		return err
+	}
+	if expected != 0 || latest != 0 {
+		return errRevisionConflict
+	}
+	return nil
 }
 
 func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
@@ -230,32 +286,20 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tags := normalizeTags(req.Tags)
-	filename := id + ".md"
-	path, err := sanitizePath(a.notesDir, filename)
-	if err != nil {
-		http.Error(w, "invalid path", http.StatusInternalServerError)
-		return
-	}
 
-	enc, err := a.encryption.encryptNote([]byte(req.Content), id)
-	if err != nil {
-		http.Error(w, "encryption failed", http.StatusInternalServerError)
+	a.noteMu.Lock()
+	defer a.noteMu.Unlock()
+	if err := a.recoverFileOperations(); err != nil {
+		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
 		return
 	}
-	if err := writeNoteFile(path, enc); err != nil {
+	n, err := a.saveNoteWithFileOperation(id, req.Title, tags, req.Content, req.BaseRevision)
+	if errors.Is(err, errRevisionConflict) {
+		http.Error(w, "note changed on another device", http.StatusConflict)
+		return
+	}
+	if err != nil {
 		http.Error(w, "write failed", http.StatusInternalServerError)
-		return
-	}
-
-	if err := upsertNote(a.db, id, req.Title, filename, tags); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	a.noteCache.set(id, req.Content)
-
-	n, err := getNote(a.db, id)
-	if err != nil {
-		http.Error(w, "note saved but could not be loaded", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, n)
@@ -263,27 +307,32 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	n, err := getNote(a.db, id)
+	var expectedRevision *int64
+	if raw := r.URL.Query().Get("base_revision"); raw != "" {
+		revision, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || revision < 1 {
+			http.Error(w, "invalid note revision", http.StatusBadRequest)
+			return
+		}
+		expectedRevision = &revision
+	}
+	a.noteMu.Lock()
+	defer a.noteMu.Unlock()
+	if err := a.recoverFileOperations(); err != nil {
+		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		return
+	}
+	err := a.deleteNoteWithFileOperation(id, expectedRevision)
+	if errors.Is(err, errRevisionConflict) {
+		http.Error(w, "note changed on another device", http.StatusConflict)
+		return
+	}
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "could not load note", http.StatusInternalServerError)
+			http.Error(w, "delete failed", http.StatusInternalServerError)
 			return
 		}
 		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	path, err := sanitizePath(a.notesDir, n.Filename)
-	if err != nil {
-		http.Error(w, "invalid path", http.StatusInternalServerError)
-		return
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		http.Error(w, "delete failed", http.StatusInternalServerError)
-		return
-	}
-	a.noteCache.del(id)
-	if err := deleteNote(a.db, id); err != nil {
-		http.Error(w, "delete failed", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
