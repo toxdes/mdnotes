@@ -19,6 +19,31 @@ type sseTestRecorder struct {
 	flushes int
 }
 
+func TestStaticCachePreventsProxyTransforms(t *testing.T) {
+	handler := staticCacheMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	for _, path := range []string{"/", "/style.css"} {
+		result := httptest.NewRecorder()
+		handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, path, nil))
+		if cacheControl := result.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-transform") {
+			t.Fatalf("Cache-Control for %s = %q, want no-transform", path, cacheControl)
+		}
+	}
+}
+
+func TestSecurityHeadersUseStrictCSP(t *testing.T) {
+	handler := securityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	csp := result.Header().Get("Content-Security-Policy")
+	for _, directive := range []string{"script-src 'self'", "style-src 'self'", "connect-src 'self'", "worker-src 'self'", "object-src 'none'"} {
+		if !strings.Contains(csp, directive) {
+			t.Fatalf("CSP %q is missing %q", csp, directive)
+		}
+	}
+}
+
 func (r *sseTestRecorder) Flush() {
 	r.flushes++
 }
