@@ -16,6 +16,9 @@ let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let prefs = { autoSave: true, hidePreview: false, hideToolbar: false, collapseDetails: false, hideCursorHighlight: false };
+let renderedPreviewSource = null;
+let previewCheckFrame = null;
+let highlightFrame = null;
 
 function show(screen) {
   Object.values(screens).forEach(el => el.classList.add('hidden'));
@@ -134,6 +137,7 @@ $('#new-note-btn').addEventListener('click', () => {
   $('#note-tags').value = '';
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
+  renderedPreviewSource = null;
   $('#editor-status').textContent = '';
   cachePreviewBlocks();
   applyEditorPrefs();
@@ -162,8 +166,8 @@ async function openNote(id) {
   $('#note-content').value = data.content || '';
   $('#editor-status').textContent = '';
   applyEditorPrefs();
-  updatePreview();
   show(screens.editor);
+  updatePreview();
 }
 
 // --- Autosave ---
@@ -218,6 +222,105 @@ $('#note-title').addEventListener('input', () => { markDirty(); scheduleSave(); 
 $('#note-tags').addEventListener('input', () => { markDirty(); scheduleSave(); });
 
 // --- Formatting toolbar ---
+const tablePicker = document.createElement('div');
+tablePicker.id = 'table-picker';
+tablePicker.className = 'table-picker hidden';
+tablePicker.setAttribute('role', 'dialog');
+tablePicker.setAttribute('aria-label', 'Choose table size');
+tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="grid"></div>';
+document.body.append(tablePicker);
+
+const tableGrid = tablePicker.querySelector('.table-grid');
+const tablePickerLabel = tablePicker.querySelector('.table-picker-label');
+const tablePickerRows = 6;
+const tablePickerColumns = 8;
+
+for (let row = 1; row <= tablePickerRows; row++) {
+  for (let column = 1; column <= tablePickerColumns; column++) {
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'table-grid-cell';
+    cell.dataset.rows = String(row);
+    cell.dataset.columns = String(column);
+    cell.setAttribute('role', 'gridcell');
+    cell.setAttribute('aria-label', `${column} columns by ${row} rows`);
+    tableGrid.append(cell);
+  }
+}
+
+function setTableGridHighlight(rows = 0, columns = 0) {
+  tablePickerLabel.textContent = rows && columns ? `${columns} × ${rows} table` : 'Table';
+  tableGrid.querySelectorAll('.table-grid-cell').forEach(cell => {
+    cell.classList.toggle('active', Number(cell.dataset.rows) <= rows && Number(cell.dataset.columns) <= columns);
+  });
+}
+
+function hideTablePicker() {
+  tablePicker.classList.add('hidden');
+  $('.fmt-bar [data-fmt="table"]').setAttribute('aria-expanded', 'false');
+  setTableGridHighlight();
+}
+
+function showTablePicker(trigger) {
+  tablePicker.classList.remove('hidden');
+  trigger.setAttribute('aria-expanded', 'true');
+  const rect = trigger.getBoundingClientRect();
+  const gutter = 8;
+  const left = Math.min(Math.max(gutter, rect.left), window.innerWidth - tablePicker.offsetWidth - gutter);
+  const top = Math.min(rect.bottom + gutter, window.innerHeight - tablePicker.offsetHeight - gutter);
+  tablePicker.style.left = `${left}px`;
+  tablePicker.style.top = `${top}px`;
+}
+
+function insertTable(rows, columns) {
+  const ta = $('#note-content');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const header = Array.from({length: columns}, (_, index) => `Column ${index + 1}`);
+  const divider = Array.from({length: columns}, () => '---');
+  const body = Array.from({length: Math.max(0, rows - 1)}, () => Array(columns).fill(''));
+  const markdownRows = [header, divider, ...body].map(row => `| ${row.join(' | ')} |`);
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  const prefix = before && !before.endsWith('\n') ? '\n\n' : '';
+  const suffix = after && !after.startsWith('\n') ? '\n\n' : '';
+  const table = markdownRows.join('\n');
+  const insertion = prefix + table + suffix;
+  const firstCell = start + prefix.length + markdownRows[0].length + 1 + markdownRows[1].length + 3;
+
+  ta.setRangeText(insertion, start, end, 'end');
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = firstCell;
+  ta.dispatchEvent(new Event('input'));
+}
+
+tableGrid.addEventListener('pointerover', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (cell) setTableGridHighlight(Number(cell.dataset.rows), Number(cell.dataset.columns));
+});
+
+tableGrid.addEventListener('focusin', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (cell) setTableGridHighlight(Number(cell.dataset.rows), Number(cell.dataset.columns));
+});
+
+tableGrid.addEventListener('click', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (!cell) return;
+  insertTable(Number(cell.dataset.rows), Number(cell.dataset.columns));
+  hideTablePicker();
+});
+
+document.addEventListener('pointerdown', e => {
+  if (!tablePicker.classList.contains('hidden') && !e.target.closest('#table-picker, [data-fmt="table"]')) hideTablePicker();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !tablePicker.classList.contains('hidden')) hideTablePicker();
+});
+
+window.addEventListener('resize', hideTablePicker);
+
 function insertFmt(type) {
   const ta = $('#note-content');
   const start = ta.selectionStart;
@@ -310,6 +413,10 @@ function insertFmt(type) {
   ta.focus();
   ta.selectionStart = ta.selectionEnd = clean ? cursor : cursor;
   ta.dispatchEvent(new Event('input'));
+  if (previewTimer) {
+    clearTimeout(previewTimer);
+    previewTimer = null;
+  }
   updatePreview();
 }
 
@@ -317,6 +424,11 @@ document.querySelector('.fmt-bar')?.addEventListener('click', e => {
   const btn = e.target.closest('[data-fmt]');
   if (btn) {
     e.preventDefault();
+    if (btn.dataset.fmt === 'table') {
+      if (tablePicker.classList.contains('hidden')) showTablePicker(btn);
+      else hideTablePicker();
+      return;
+    }
     insertFmt(btn.dataset.fmt);
   }
 });
@@ -350,9 +462,10 @@ function setPanelState(state) {
     ed.classList.add('panel-hidden');
     wrap.classList.add('panels-single');
   }
-  document.querySelectorAll('.panel-toggle .material-symbols-outlined').forEach(el => {
-    el.textContent = state === 'both' ? 'add' : 'remove';
+  document.querySelectorAll('.panel-toggle use').forEach(el => {
+    el.setAttribute('href', state === 'both' ? '#icon-plus' : '#icon-minus');
   });
+  if (state !== 'editor') schedulePreviewCheck();
 }
 
 $('#editor-panels').addEventListener('click', e => {
@@ -375,6 +488,7 @@ function toggleFullscreen(panel) {
     editor.classList.remove('fs-editor', 'fs-preview');
     editor.classList.add(cls);
   }
+  schedulePreviewCheck();
 }
 
 $('#editor-panels').addEventListener('click', e => {
@@ -384,11 +498,29 @@ $('#editor-panels').addEventListener('click', e => {
 
 // --- Cursor preview highlight ---
 let previewBlocks = [];
+function isPreviewVisible() {
+  return !screens.editor.classList.contains('hidden') && panelState !== 'editor' && !screens.editor.classList.contains('fs-editor');
+}
+function schedulePreviewCheck() {
+  if (previewCheckFrame !== null) return;
+  previewCheckFrame = requestAnimationFrame(() => {
+    previewCheckFrame = null;
+    updatePreview();
+  });
+}
+function scheduleHighlight() {
+  if (highlightFrame !== null) return;
+  highlightFrame = requestAnimationFrame(() => {
+    highlightFrame = null;
+    highlightBlock();
+  });
+}
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
 }
 function highlightBlock() {
+  if (!isPreviewVisible()) return;
   if (prefs.hideCursorHighlight) {
     const cur = $('#preview').querySelector('.highlight');
     if (cur) cur.classList.remove('highlight');
@@ -426,19 +558,24 @@ $('#note-content').addEventListener('input', () => {
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 500);
 });
-$('#note-content').addEventListener('click', highlightBlock);
-$('#note-content').addEventListener('keyup', highlightBlock);
+$('#note-content').addEventListener('click', scheduleHighlight);
+$('#note-content').addEventListener('keyup', scheduleHighlight);
 
 function updatePreview() {
-  if ($('.panel-preview').offsetParent === null) return;
+  if (!isPreviewVisible()) return;
   const md = $('#note-content').value;
+  if (md === renderedPreviewSource) {
+    scheduleHighlight();
+    return;
+  }
   if (typeof marked !== 'undefined' && marked.parse) {
     $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
   }
+  renderedPreviewSource = md;
   cachePreviewBlocks();
-  highlightBlock();
+  scheduleHighlight();
 }
 
 // --- Utils ---
@@ -458,8 +595,7 @@ function formatDate(iso) {
 function setTheme(dark) {
   const root = document.documentElement;
   root.classList.toggle('dark', dark);
-  const icon = dark ? 'dark_mode' : 'light_mode';
-  $$('.theme-btn .material-symbols-outlined').forEach(el => el.textContent = icon);
+  $$('.theme-btn use').forEach(el => el.setAttribute('href', dark ? '#icon-moon' : '#icon-sun'));
   localStorage.setItem('theme', dark ? 'dark' : 'light');
 }
 

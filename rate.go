@@ -2,60 +2,94 @@ package main
 
 import (
 	"database/sql"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 type rateLimiter struct {
-	db       *sql.DB
-	sessions *sessionStore
+	db         *sql.DB
+	sessions   *sessionStore
+	trustProxy bool
+	mu         sync.Mutex
+	bans       map[string]banCacheEntry
 }
 
-func newRateLimiter(db *sql.DB, sessions *sessionStore) (*rateLimiter, error) {
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS ip_bans (
-			ip        TEXT PRIMARY KEY,
-			reason    TEXT NOT NULL,
-			created_at TEXT NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS rate_limits (
-			ip        TEXT NOT NULL,
-			typ       TEXT NOT NULL,
-			count     INTEGER NOT NULL DEFAULT 1,
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (ip, typ)
-		)
-	`)
-	if err != nil {
-		return nil, err
-	}
-	return &rateLimiter{db: db, sessions: sessions}, nil
+type banCacheEntry struct {
+	banned  bool
+	expires time.Time
+}
+
+const (
+	banCacheTTL     = 5 * time.Minute
+	maxCachedBanIPs = 4096
+)
+
+func newRateLimiter(db *sql.DB, sessions *sessionStore, trustProxy bool) (*rateLimiter, error) {
+	return &rateLimiter{db: db, sessions: sessions, trustProxy: trustProxy, bans: make(map[string]banCacheEntry)}, nil
 }
 
 func (rl *rateLimiter) realIP(r *http.Request) string {
+	if !rl.trustProxy {
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			return host
+		}
+		return r.RemoteAddr
+	}
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		if i := strings.IndexByte(fwd, ','); i != -1 {
-			return fwd[:i]
+			return strings.TrimSpace(fwd[:i])
 		}
-		return fwd
+		return strings.TrimSpace(fwd)
 	}
 	if real := r.Header.Get("X-Real-IP"); real != "" {
 		return real
 	}
-	if i := strings.LastIndex(r.RemoteAddr, ":"); i != -1 {
-		return r.RemoteAddr[:i]
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }
 
 func (rl *rateLimiter) isBanned(ip string) (bool, error) {
+	rl.mu.Lock()
+	if cached, ok := rl.bans[ip]; ok && time.Now().Before(cached.expires) {
+		rl.mu.Unlock()
+		return cached.banned, nil
+	}
+	delete(rl.bans, ip)
+	rl.mu.Unlock()
+
 	var exists int
 	err := rl.db.QueryRow("SELECT 1 FROM ip_bans WHERE ip = ?", ip).Scan(&exists)
 	if err == sql.ErrNoRows {
+		rl.cacheBan(ip, false)
 		return false, nil
 	}
-	return true, err
+	if err != nil {
+		return false, err
+	}
+	rl.cacheBan(ip, true)
+	return true, nil
+}
+
+func (rl *rateLimiter) cacheBan(ip string, banned bool) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if len(rl.bans) >= maxCachedBanIPs {
+		now := time.Now()
+		for key, entry := range rl.bans {
+			if now.After(entry.expires) {
+				delete(rl.bans, key)
+			}
+		}
+		if len(rl.bans) >= maxCachedBanIPs {
+			return
+		}
+	}
+	rl.bans[ip] = banCacheEntry{banned: banned, expires: time.Now().Add(banCacheTTL)}
 }
 
 func (rl *rateLimiter) banIP(ip, reason string) error {
@@ -64,6 +98,9 @@ func (rl *rateLimiter) banIP(ip, reason string) error {
 		"INSERT OR IGNORE INTO ip_bans (ip, reason, created_at) VALUES (?, ?, ?)",
 		ip, reason, now,
 	)
+	if err == nil {
+		rl.cacheBan(ip, true)
+	}
 	return err
 }
 
