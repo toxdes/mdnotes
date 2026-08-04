@@ -1,9 +1,11 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -41,6 +43,113 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 		if !strings.Contains(csp, directive) {
 			t.Fatalf("CSP %q is missing %q", csp, directive)
 		}
+	}
+}
+
+func TestGzipMiddlewareCompressesErrorResponsesCorrectly(t *testing.T) {
+	handler := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/style.css", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+
+	if result.Code != http.StatusForbidden || result.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("gzip error response = status %d, encoding %q", result.Code, result.Header().Get("Content-Encoding"))
+	}
+	reader, err := gzip.NewReader(result.Body)
+	if err != nil {
+		t.Fatalf("read gzip response: %v", err)
+	}
+	decompressed, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil || string(decompressed) != "forbidden\n" {
+		t.Fatalf("gzip error body = %q, %v", decompressed, err)
+	}
+}
+
+func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create migration table: %v", err)
+	}
+	for _, migration := range migrations[:len(migrations)-1] {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("begin migration %d: %v", migration.version, err)
+		}
+		if err := migration.up(tx); err != nil {
+			tx.Rollback()
+			t.Fatalf("apply migration %d: %v", migration.version, err)
+		}
+		if _, err := tx.Exec("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", migration.version, "2025-01-01T00:00:00Z"); err != nil {
+			tx.Rollback()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit migration %d: %v", migration.version, err)
+		}
+	}
+	if _, err := db.Exec("INSERT INTO ip_bans (ip, reason, created_at) VALUES ('203.0.113.7', 'too many 404s', '2025-01-01T00:00:00Z')"); err != nil {
+		t.Fatalf("insert legacy ban: %v", err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatalf("apply ban-clearing migration: %v", err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM ip_bans").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("legacy bans after migration = %d, %v; want 0", count, err)
+	}
+}
+
+func TestRateLimiterBanIsTemporaryAndLoginWindowResets(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	for range 5 {
+		if err := rl.recordLoginAttempt("203.0.113.7", false); err != nil {
+			t.Fatalf("record failed login: %v", err)
+		}
+	}
+	if banned, err := rl.isBanned("203.0.113.7"); err != nil || !banned {
+		t.Fatalf("temporary login ban = %t, %v; want true", banned, err)
+	}
+	restarted, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("restart rate limiter: %v", err)
+	}
+	if banned, err := restarted.isBanned("203.0.113.7"); err != nil || banned {
+		t.Fatalf("ban persisted after restart = %t, %v; want false", banned, err)
+	}
+	old := time.Now().UTC().Add(-loginAttemptWindow - time.Minute).Format(time.RFC3339)
+	if _, err := db.Exec("INSERT INTO rate_limits (ip, typ, count, updated_at) VALUES (?, 'login', 4, ?)", "203.0.113.8", old); err != nil {
+		t.Fatalf("seed expired login attempts: %v", err)
+	}
+	if err := rl.recordLoginAttempt("203.0.113.8", false); err != nil {
+		t.Fatalf("record login after expired window: %v", err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT count FROM rate_limits WHERE ip = ? AND typ = 'login'", "203.0.113.8").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("expired-window login count = %d, %v; want 1", count, err)
 	}
 }
 
@@ -605,12 +714,12 @@ func TestInitDBCreatesBackupBeforePendingMigration(t *testing.T) {
 		t.Fatalf("open backup: %v", err)
 	}
 	defer backup.Close()
-	var fileOperationTable int
-	if err := backup.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_operations'").Scan(&fileOperationTable); err != nil {
-		t.Fatalf("inspect backup schema: %v", err)
+	var applied int
+	if err := backup.QueryRow("SELECT count(*) FROM schema_migrations WHERE version = ?", migrations[len(migrations)-1].version).Scan(&applied); err != nil {
+		t.Fatalf("inspect backup migration state: %v", err)
 	}
-	if fileOperationTable != 0 {
-		t.Fatal("backup contains the post-migration schema")
+	if applied != 0 {
+		t.Fatal("backup contains the pending migration")
 	}
 }
 
