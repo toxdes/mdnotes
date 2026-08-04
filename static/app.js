@@ -4,6 +4,9 @@
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+const bootScreen = $('#boot-screen');
+if (bootScreen) bootScreen.hidden = false;
+
 const screens = {
   login: $('#login-screen'),
   dashboard: $('#dashboard'),
@@ -15,7 +18,381 @@ let currentTag = null;
 let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
-let prefs = { autoSave: true, hidePreview: false, hideToolbar: false, collapseDetails: false, hideCursorHighlight: false };
+let prefs = { autoSave: true, hidePreview: false, hideHeaderOnFullscreen: false, hideToolbar: false, collapseDetails: false, hideCursorHighlight: false };
+let renderedPreviewSource = null;
+let previewCheckFrame = null;
+let highlightFrame = null;
+let currentRevision = 0;
+let currentBaseRevision = null;
+let syncInFlight = false;
+let syncingQueueOperationID = null;
+let lastSyncProblem = '';
+let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
+let panelWide = false;
+let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
+let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
+let updateToast = null;
+
+// Notes are stored locally before any network request. The service worker keeps
+// the app shell available, while IndexedDB holds the user's working set and a
+// durable queue of mutations to replay after connectivity returns.
+const offlineDBName = 'mdnotes-offline';
+let offlineDBPromise;
+
+const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
+
+function openOfflineDB() {
+  if (offlineDBPromise) return offlineDBPromise;
+  offlineDBPromise = new Promise((resolve, reject) => {
+    // Do not request a fixed database version here. A browser may have a
+    // newer local schema from a prior build; opening it with an older version
+    // fails before the app can read its offline notes.
+    const request = indexedDB.open(offlineDBName);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', {keyPath: 'id'});
+      if (!db.objectStoreNames.contains('queue')) {
+        const queue = db.createObjectStore('queue', {keyPath: 'id', autoIncrement: true});
+        queue.createIndex('note_id', 'note_id', {unique: false});
+      }
+      if (!db.objectStoreNames.contains('state')) db.createObjectStore('state', {keyPath: 'key'});
+    };
+    request.onsuccess = async () => {
+      try {
+        await repairOfflineQueue(request.result);
+        resolve(request.result);
+      } catch (error) {
+        request.result.close();
+        offlineDBPromise = undefined;
+        reject(error);
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+  return offlineDBPromise;
+}
+
+// A previous development build could leave an operation without the replay
+// metadata introduced in version 2. Repair it in place: the note snapshot is
+// kept, and the operation can be acknowledged normally instead of making a
+// healthy server look offline forever.
+async function repairOfflineQueue(db) {
+  if (!db.objectStoreNames.contains('queue') || !db.objectStoreNames.contains('state')) {
+    throw new Error('offline database is missing required stores');
+  }
+  const transaction = db.transaction(['queue', 'state'], 'readwrite');
+  const queue = transaction.objectStore('queue');
+  const state = transaction.objectStore('state');
+  const complete = transactionComplete(transaction);
+  const records = await requestValue(queue.getAll());
+  let largestSequence = 0;
+  records.sort((left, right) => left.id - right.id);
+  for (const operation of records) {
+    if (Number.isSafeInteger(operation.client_sequence) && operation.client_sequence > largestSequence) {
+      largestSequence = operation.client_sequence;
+    }
+  }
+  for (const operation of records) {
+    if (!Number.isSafeInteger(operation.client_sequence) || operation.client_sequence < 1) {
+      operation.client_sequence = ++largestSequence;
+    }
+    if (!syncOperationIDPattern.test(operation.op_id || '')) operation.op_id = `legacy-${operation.id}`;
+    if (operation.type === 'save') operation.type = 'note.save';
+    if (operation.type === 'delete') operation.type = 'note.delete';
+    if (operation.type === 'preferences') operation.type = 'prefs.save';
+    if (!operation.type) operation.type = operation.kind === 'save' ? 'note.save' : operation.kind === 'delete' ? 'note.delete' : 'prefs.save';
+    if (operation.type === 'note.save' && !operation.note) operation.note = operation.data;
+    if (operation.type === 'note.save' && !operation.note_id) operation.note_id = operation.note?.id;
+    if (operation.type === 'prefs.save') operation.note_id = '__prefs__';
+    queue.put(operation);
+  }
+  const savedSequence = await requestValue(state.get('clientSequence'));
+  const previousSequence = Number(savedSequence?.value || 0);
+  state.put({key: 'clientSequence', value: Math.max(previousSequence, largestSequence)});
+  await complete;
+}
+
+function requestValue(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function transactionComplete(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function withOfflineStore(names, mode, work) {
+  const db = await openOfflineDB();
+  const tx = db.transaction(names, mode);
+  const stores = Object.fromEntries(names.map(name => [name, tx.objectStore(name)]));
+  const complete = transactionComplete(tx);
+  const result = await work(stores);
+  await complete;
+  return result;
+}
+
+function getLocalNote(id) {
+  return withOfflineStore(['notes'], 'readonly', stores => requestValue(stores.notes.get(id)));
+}
+
+function putLocalNote(note) {
+  return withOfflineStore(['notes'], 'readwrite', stores => requestValue(stores.notes.put(note)));
+}
+
+function removeLocalNote(id) {
+  return withOfflineStore(['notes'], 'readwrite', stores => requestValue(stores.notes.delete(id)));
+}
+
+async function getLocalNotes() {
+  const notes = await getAllLocalNotes();
+  return notes.filter(note => !note.deleted).sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+}
+
+function getAllLocalNotes() {
+  return withOfflineStore(['notes'], 'readonly', stores => requestValue(stores.notes.getAll()));
+}
+
+function getOfflineState(key) {
+  return withOfflineStore(['state'], 'readonly', async stores => {
+    const value = await requestValue(stores.state.get(key));
+    return value && value.value;
+  });
+}
+
+function setOfflineState(key, value) {
+  return withOfflineStore(['state'], 'readwrite', stores => requestValue(stores.state.put({key, value})));
+}
+
+async function queueOperationInStores(stores, operation) {
+  if (operation.type === 'note.save' || operation.type === 'prefs.save') {
+    const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    const existing = queued
+      .filter(item => item.id !== syncingQueueOperationID && item.type === operation.type)
+      .sort((left, right) => right.client_sequence - left.client_sequence)[0];
+    if (existing) {
+      existing.base_revision = operation.base_revision;
+      existing.note = operation.note;
+      existing.prefs = operation.prefs;
+      await requestValue(stores.queue.put(existing));
+      return;
+    }
+  }
+  const state = await requestValue(stores.state.get('clientSequence'));
+  const sequence = Number(state?.value || 0) + 1;
+  operation.client_sequence = sequence;
+  operation.op_id = newLocalNoteID();
+  await requestValue(stores.queue.add(operation));
+  await requestValue(stores.state.put({key: 'clientSequence', value: sequence}));
+}
+
+function queueOperation(operation) {
+  return withOfflineStore(['queue', 'state'], 'readwrite', stores => queueOperationInStores(stores, operation));
+}
+
+function saveLocalNoteAndQueue(note, operation) {
+  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.put(note));
+    await queueOperationInStores(stores, operation);
+  });
+}
+
+function removeLocalNoteAndQueue(id, operation) {
+  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.delete(id));
+    await queueOperationInStores(stores, operation);
+  });
+}
+
+function removeLocalNoteAndSupersede(id, afterSequence) {
+  return withOfflineStore(['notes', 'queue'], 'readwrite', async stores => {
+    await requestValue(stores.notes.delete(id));
+    const operations = await requestValue(stores.queue.index('note_id').getAll(id));
+    operations.forEach(operation => {
+      if (operation.client_sequence > afterSequence) {
+        operation.type = 'noop';
+        stores.queue.put(operation);
+      }
+    });
+  });
+}
+
+function pendingOperations() {
+  return withOfflineStore(['queue'], 'readonly', async stores => {
+    const items = await requestValue(stores.queue.getAll());
+    return items.sort((a, b) => a.client_sequence - b.client_sequence);
+  });
+}
+
+async function hasPendingOperation(noteID) {
+  return withOfflineStore(['queue'], 'readonly', async stores => {
+    const item = await requestValue(stores.queue.index('note_id').get(noteID));
+    return Boolean(item);
+  });
+}
+
+function removePendingOperation(id) {
+  return withOfflineStore(['queue'], 'readwrite', stores => requestValue(stores.queue.delete(id)));
+}
+
+async function syncDeviceID() {
+  let deviceID = await getOfflineState('deviceID');
+  if (!deviceID) {
+    deviceID = `device_${newLocalNoteID()}`;
+    await setOfflineState('deviceID', deviceID);
+  }
+  return deviceID;
+}
+
+async function rebaseQueuedNoteOperations(noteID, acknowledgedID, revision, baseNote) {
+  return withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
+    let hasLater = false;
+    operations.forEach(operation => {
+      if (operation.id === acknowledgedID || operation.client_sequence < 1) return;
+      if (operation.type === 'note.save' || operation.type === 'note.delete') {
+        operation.base_revision = revision;
+        if (operation.note) {
+          operation.note.base_revision = revision;
+          operation.note.base_content = baseNote.content;
+          operation.note.base_title = baseNote.title;
+          operation.note.base_tags = baseNote.tags;
+        }
+        stores.queue.put(operation);
+        hasLater = true;
+      }
+    });
+    return hasLater;
+  });
+}
+
+async function supersedeQueuedNoteOperations(noteID, afterSequence) {
+  await withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
+    operations.forEach(operation => {
+      if (operation.client_sequence > afterSequence) {
+        operation.type = 'noop';
+        stores.queue.put(operation);
+      }
+    });
+  });
+}
+
+async function clearOfflineData() {
+  const db = await openOfflineDB();
+  db.close();
+  offlineDBPromise = undefined;
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(offlineDBName);
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error);
+    request.onblocked = resolve;
+  });
+}
+
+function newLocalNoteID() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+const syncStates = {
+  online: {label: 'Saved', title: 'Saved and up to date'},
+  syncing: {label: 'Syncing', title: 'Synchronizing changes'},
+  offline: {label: 'Offline', title: 'Offline — changes are saved on this device'},
+};
+let syncFailed = false;
+
+function setSyncStatus(state) {
+  const config = syncStates[state] || syncStates.offline;
+  ['#sync-status', '#editor-status'].forEach(selector => {
+    const element = $(selector);
+    if (!element) return;
+    element.dataset.state = state;
+    element.title = config.title;
+    element.setAttribute('aria-label', config.title);
+    element.querySelector('.sync-indicator-label').textContent = config.label;
+  });
+}
+
+function showToast(message, kind = '') {
+  const toast = document.createElement('div');
+  toast.className = `toast ${kind}`;
+  toast.textContent = message;
+  $('#toast-region').append(toast);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 180);
+  }, 3200);
+}
+
+function showUpdateAvailable() {
+  if (updateToast) return;
+  const toast = document.createElement('div');
+  toast.className = 'toast update';
+  const message = document.createElement('span');
+  message.textContent = 'New version available.';
+  const reload = document.createElement('button');
+  reload.type = 'button';
+  reload.className = 'toast-action';
+  reload.textContent = 'Reload';
+  reload.addEventListener('click', async () => {
+    reload.disabled = true;
+    reload.textContent = 'Updating…';
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      await registration?.update();
+    } catch (error) {
+      console.warn('service worker update check failed', error);
+    }
+    window.location.reload();
+  });
+  toast.append(message, reload);
+  $('#toast-region').append(toast);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  updateToast = toast;
+}
+
+function showOfflineNotice(checking = false) {
+  $$('.offline-notice').forEach(notice => {
+    notice.classList.remove('hidden');
+    notice.querySelector('.offline-notice-message').textContent = checking ? 'Checking…' : "You're offline. Your changes are saved on this device.";
+    const retry = notice.querySelector('.offline-retry');
+    retry.classList.toggle('hidden', checking);
+    retry.disabled = checking;
+  });
+}
+
+function hideOfflineNotice() {
+  $$('.offline-notice').forEach(notice => notice.classList.add('hidden'));
+}
+
+function showSyncCompleteToast() {
+  hideOfflineNotice();
+  showToast('Changes synced.', 'success');
+}
+
+function cacheAppVersion(response) {
+  const changedVersion = response?.version && appVersionAtLoad && response.version !== appVersionAtLoad;
+  const changedRevision = response?.revision && appRevisionAtLoad && response.revision !== appRevisionAtLoad;
+  if (changedVersion || changedRevision) showUpdateAvailable();
+  if (response?.version) {
+    if (!appVersionAtLoad) appVersionAtLoad = response.version;
+    localStorage.setItem('mdnotes-version', response.version);
+  }
+  if (response?.revision) {
+    if (!appRevisionAtLoad) appRevisionAtLoad = response.revision;
+    localStorage.setItem('mdnotes-revision', response.revision);
+  }
+  const version = response?.version || localStorage.getItem('mdnotes-version') || 'dev';
+  $('#app-version').textContent = `v${version}`;
+}
 
 function show(screen) {
   Object.values(screens).forEach(el => el.classList.add('hidden'));
@@ -46,6 +423,358 @@ async function api(path, opts) {
   }
 }
 
+async function syncFetch(path, options) {
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    headers: options?.body ? {'Content-Type': 'application/json'} : {},
+    ...options,
+  });
+  const body = response.status === 204 ? null : await response.text();
+  let data = null;
+  if (body) {
+    try { data = JSON.parse(body); } catch (_) { data = body; }
+  }
+  return {response, data};
+}
+
+async function cacheRemoteNote(note) {
+  const local = await getLocalNote(note.id);
+  if (local?.pending) return;
+  await putLocalNote({...local, ...note, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+  if (currentNoteId === note.id && !isDirty) {
+    currentRevision = note.revision || 0;
+    currentBaseRevision = null;
+    savedSnapshot = {title: note.title || '', tags: note.tags || '', content: note.content || ''};
+    $('#note-title').value = savedSnapshot.title;
+    $('#note-tags').value = savedSnapshot.tags;
+    $('#note-content').value = savedSnapshot.content;
+    renderedPreviewSource = null;
+    updatePreview();
+  }
+}
+
+async function pullRemoteChanges() {
+  let since = Number(await getOfflineState('syncSequence') || 0);
+  for (;;) {
+    const page = await api(`/api/sync?since=${since}&limit=100`);
+    if (!page) throw new Error('could not fetch sync changes');
+    if (page.resetRequired) {
+      await resetLocalNotesFromRemote(Number(page.nextSequence || 0));
+      return;
+    }
+    for (const change of page.changes) {
+      if (await hasPendingOperation(change.note_id)) continue;
+      if (change.deleted) {
+        await removeLocalNote(change.note_id);
+        if (currentNoteId === change.note_id && !isDirty) {
+          currentNoteId = null;
+          await loadDashboard();
+        }
+        continue;
+      }
+      const remote = await api(`/api/notes/${encodeURIComponent(change.note_id)}`);
+      if (!remote) throw new Error('could not download changed note');
+      await cacheRemoteNote(remote);
+    }
+    since = Number(page.nextSequence || since);
+    await setOfflineState('syncSequence', since);
+    if (!page.hasMore) return;
+  }
+}
+
+async function resetLocalNotesFromRemote(sequence) {
+  const summaries = await api('/api/notes');
+  if (!Array.isArray(summaries)) throw new Error('could not refresh notes after sync compaction');
+  const remoteIDs = new Set(summaries.map(note => note.id));
+  for (const summary of summaries) {
+    if (await hasPendingOperation(summary.id)) continue;
+    const remote = await api(`/api/notes/${encodeURIComponent(summary.id)}`);
+    if (!remote) throw new Error('could not download refreshed note');
+    await cacheRemoteNote(remote);
+  }
+  for (const local of await getAllLocalNotes()) {
+    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id)) {
+      await removeLocalNote(local.id);
+    }
+  }
+  await setOfflineState('syncSequence', sequence);
+}
+
+function updateOpenNote(note) {
+  if (currentNoteId !== note.id || isDirty) return;
+  currentRevision = note.revision || 0;
+  currentBaseRevision = note.base_revision ?? null;
+  savedSnapshot = {title: note.title || '', tags: note.tags || '', content: note.content || ''};
+  $('#note-title').value = savedSnapshot.title;
+  $('#note-tags').value = savedSnapshot.tags;
+  $('#note-content').value = savedSnapshot.content;
+  renderedPreviewSource = null;
+  updatePreview();
+}
+
+async function mergeConflictedNote(operation) {
+  if (operation.type !== 'note.save' || !operation.note || !window.MDNotesMerge) return false;
+  // A network response can arrive while the user is still typing. Capture that
+  // newer local state before deriving the merge, rather than merging an older
+  // queued snapshot and accidentally omitting the last keystrokes.
+  if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
+  const local = await getLocalNote(operation.note_id);
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  if (!local || !remote) return false;
+  // Queued edits created before three-way metadata existed cannot be merged
+  // safely for title/tags, so preserve them as a conflict copy instead.
+  if (local.base_title === undefined || local.base_tags === undefined) return false;
+
+  const base = {
+    title: local.base_title ?? operation.note.base_title ?? operation.note.title ?? '',
+    tags: local.base_tags ?? operation.note.base_tags ?? operation.note.tags ?? '',
+    content: local.base_content ?? operation.note.base_content ?? '',
+  };
+  const merged = window.MDNotesMerge.mergeNoteVersions(base, local, remote);
+  if (!merged) return false;
+
+  const now = new Date().toISOString();
+  const mergedLocal = {
+    ...remote,
+    ...merged,
+    updated_at: now,
+    pending: true,
+    base_revision: remote.revision,
+    base_content: remote.content || '',
+    base_title: remote.title || '',
+    base_tags: remote.tags || '',
+  };
+  await putLocalNote(mergedLocal);
+  // The conflicting operation is already recorded by the server. Later local
+  // snapshots have the old base, so replace them with ordered no-ops and a
+  // single merged save after them; that preserves the device event sequence.
+  await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
+  await removePendingOperation(operation.id);
+  await queueOperation({type: 'note.save', note_id: mergedLocal.id, base_revision: remote.revision, note: mergedLocal});
+  updateOpenNote(mergedLocal);
+  return true;
+}
+
+async function preserveConflict(operation) {
+  const local = await getLocalNote(operation.note_id);
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  if (remote) await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+  else await removeLocalNote(operation.note_id);
+  if (local && operation.type === 'note.save') {
+    const conflictID = newLocalNoteID();
+    const now = new Date().toISOString();
+    const conflict = {
+      id: conflictID,
+      title: `${local.title || 'Untitled'} (conflict copy)`,
+      filename: `${conflictID}.md`,
+      tags: local.tags || '',
+      content: local.content || '',
+      base_content: '',
+      created_at: now,
+      updated_at: now,
+      revision: 0,
+      base_revision: 0,
+      base_title: '',
+      base_tags: '',
+      pending: true,
+    };
+    await putLocalNote(conflict);
+    await queueOperation({type: 'note.save', note_id: conflictID, base_revision: 0, note: conflict});
+    if (currentNoteId === operation.note_id) {
+      currentNoteId = conflictID;
+      updateOpenNote(conflict);
+    }
+  }
+  await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
+  await removePendingOperation(operation.id);
+}
+
+async function acknowledgeCompactedOperation(operation) {
+  await removePendingOperation(operation.id);
+  if (operation.type !== 'note.save' && operation.type !== 'note.delete') return;
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  if (!remote) {
+    if (!await hasPendingOperation(operation.note_id)) await removeLocalNote(operation.note_id);
+    return;
+  }
+  const hasLater = await rebaseQueuedNoteOperations(operation.note_id, -1, remote.revision, remote);
+  const local = await getLocalNote(operation.note_id);
+  if (!hasLater) {
+    await cacheRemoteNote(remote);
+    return;
+  }
+  if (local) {
+    await putLocalNote({...local, revision: remote.revision, pending: true, base_revision: remote.revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags});
+  }
+}
+
+async function flushPendingChanges() {
+  for (;;) {
+    const operations = await pendingOperations();
+    if (!operations.length) return;
+    const operation = operations[0];
+    const outgoing = {
+      client_sequence: operation.client_sequence,
+      op_id: operation.op_id,
+      type: operation.type,
+      note_id: operation.note_id,
+      base_revision: operation.base_revision,
+    };
+    if (operation.type === 'note.save') {
+      outgoing.title = operation.note.title;
+      outgoing.tags = operation.note.tags;
+      outgoing.content = operation.note.content;
+      outgoing.base_content = operation.note.base_content || '';
+    } else if (operation.type === 'prefs.save') {
+      outgoing.prefs = operation.prefs;
+    }
+    syncingQueueOperationID = operation.id;
+    let result;
+    try {
+      result = await syncFetch('/api/sync/push', {
+        method: 'POST',
+        body: JSON.stringify({device_id: await syncDeviceID(), operations: [outgoing]}),
+      });
+    } finally {
+      syncingQueueOperationID = null;
+    }
+    if (result.response.status === 401) throw new Error('sign in required to sync');
+    if (result.response.status === 409) {
+      const expected = result.data?.expected_sequence;
+      throw new Error(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict');
+    }
+    if (!result.response.ok) {
+      const error = new Error(typeof result.data === 'string' ? result.data : 'sync failed');
+      error.responseStatus = result.response.status;
+      throw error;
+    }
+    const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
+    if (!acknowledgement) throw new Error('sync acknowledgement missing');
+    if (acknowledgement.status === 'compacted') {
+      await acknowledgeCompactedOperation(operation);
+      continue;
+    }
+    if (acknowledgement.status === 'conflict') {
+      if (await mergeConflictedNote(operation)) {
+        showToast('Merged your non-overlapping changes.', 'success');
+      } else {
+        await preserveConflict(operation);
+        showToast('A conflict copy was created so your changes are safe.', 'warning');
+      }
+      continue;
+    }
+    if (operation.type === 'note.save') {
+      const acknowledgedNote = operation.note;
+      const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
+      const local = await getLocalNote(operation.note_id);
+      if (local) {
+        await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+      }
+      if (currentNoteId === operation.note_id) {
+        currentRevision = acknowledgement.revision || 0;
+        currentBaseRevision = hasLater ? acknowledgement.revision : null;
+      }
+    }
+    await removePendingOperation(operation.id);
+  }
+}
+
+async function syncNow({force = false, preserveSnackbar = false} = {}) {
+  if ((!navigator.onLine && !force) || syncInFlight) return false;
+  syncInFlight = true;
+  setSyncStatus('syncing');
+  const wasOffline = syncFailed;
+  try {
+    await pullRemoteChanges();
+    await flushPendingChanges();
+    await pullRemoteChanges();
+    localStorage.setItem('mdnotes-offline-ready', '1');
+    syncFailed = false;
+    setSyncStatus('online');
+    if (!preserveSnackbar) hideOfflineNotice();
+    if (wasOffline && !preserveSnackbar) showToast('Back online. Changes synced.');
+    return true;
+  } catch (error) {
+    console.warn('sync failed', error);
+    // A 4xx response proves that this server is reachable. Keeping the UI in
+    // Offline in that case hides the actionable problem and makes retrying
+    // misleading. Network failures and unavailable servers still use Offline.
+    if (error?.responseStatus >= 400 && error.responseStatus < 500) {
+      syncFailed = false;
+      setSyncStatus('online');
+      hideOfflineNotice();
+      const message = `Sync needs attention: ${error.message}`;
+      if (lastSyncProblem !== message) {
+        lastSyncProblem = message;
+        showToast(message, 'warning');
+      }
+      return false;
+    }
+    lastSyncProblem = '';
+    markServerOffline();
+    return false;
+  } finally {
+    syncInFlight = false;
+  }
+}
+
+const sseStaleAfterMs = 70000;
+let serverEvents = null;
+let serverHeartbeatAt = 0;
+let serverEventsWatchdog = null;
+
+function markServerOffline() {
+  const shouldToast = !syncFailed;
+  syncFailed = true;
+  setSyncStatus('offline');
+  showOfflineNotice();
+  if (shouldToast) showToast('Working offline. Your changes are saved on this device.', 'warning');
+}
+
+async function handleServerHeartbeat() {
+  serverHeartbeatAt = Date.now();
+  if (!syncFailed) {
+    if (!syncInFlight) setSyncStatus('online');
+    return;
+  }
+  const synced = await syncNow({force: true});
+  if (synced && !screens.dashboard.classList.contains('hidden')) {
+    await Promise.all([loadTags(), loadNotes()]);
+  }
+}
+
+function connectServerEvents() {
+  if (!('EventSource' in window) || serverEvents) return;
+  serverHeartbeatAt = Date.now();
+  const events = new EventSource('/api/events');
+  serverEvents = events;
+  events.addEventListener('server', event => {
+    try { cacheAppVersion(JSON.parse(event.data)); } catch (_) {}
+  });
+  events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
+  events.onopen = () => { void handleServerHeartbeat(); };
+  events.onerror = () => {
+    if (serverEvents === events) markServerOffline();
+  };
+  if (!serverEventsWatchdog) {
+    serverEventsWatchdog = setInterval(() => {
+      if (!serverEvents || Date.now() - serverHeartbeatAt <= sseStaleAfterMs) return;
+      serverEvents.close();
+      serverEvents = null;
+      markServerOffline();
+      connectServerEvents();
+    }, 5000);
+  }
+}
+
+function disconnectServerEvents() {
+  if (serverEvents) serverEvents.close();
+  serverEvents = null;
+  serverHeartbeatAt = 0;
+  if (serverEventsWatchdog) clearInterval(serverEventsWatchdog);
+  serverEventsWatchdog = null;
+}
+
 // --- Auth ---
 $('#login-form').addEventListener('submit', async e => {
   e.preventDefault();
@@ -53,7 +782,10 @@ $('#login-form').addEventListener('submit', async e => {
   const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
   if (res) {
     $('#login-error').textContent = '';
+    cacheAppVersion(res);
     await loadPrefs();
+    await syncNow();
+    connectServerEvents();
     await loadDashboard();
   } else {
     $('#login-error').textContent = 'Wrong password';
@@ -61,7 +793,11 @@ $('#login-form').addEventListener('submit', async e => {
 });
 
 $('#logout-btn').addEventListener('click', async () => {
+  disconnectServerEvents();
   await api('/api/logout', {method:'POST'});
+  await clearOfflineData();
+  localStorage.removeItem('mdnotes-offline-ready');
+  localStorage.removeItem('mdnotes-prefs');
   show(screens.login);
   $('#login-form input').focus();
 });
@@ -69,12 +805,13 @@ $('#logout-btn').addEventListener('click', async () => {
 // --- Dashboard ---
 async function loadDashboard() {
   show(screens.dashboard);
+  await syncNow();
   await Promise.all([loadTags(), loadNotes()]);
 }
 
 async function loadTags() {
-  const tags = await api('/api/tags');
-  if (!tags) return;
+  const notes = await getLocalNotes();
+  const tags = [...new Set(notes.flatMap(note => (note.tags || '').split(',').map(tag => tag.trim()).filter(Boolean)))].sort((a, b) => a.localeCompare(b));
   const bar = $('#tag-bar');
   let html = '<span class="tag'+(currentTag?'':' active')+'" data-tag="">All</span>';
   tags.forEach(t => {
@@ -92,10 +829,13 @@ async function loadTags() {
   });
 }
 
+function noteHasTag(note, tag) {
+  return (note.tags || '').split(',').some(noteTag => noteTag.trim() === tag);
+}
+
 async function loadNotes() {
-  const url = currentTag ? `/api/notes?tag=${encodeURIComponent(currentTag)}` : '/api/notes';
-  const notes = await api(url);
-  if (!notes) return;
+  let notes = await getLocalNotes();
+  if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
     list.innerHTML = '<div class="note-empty">No notes yet</div>';
@@ -115,6 +855,7 @@ async function loadNotes() {
 
 function applyEditorPrefs() {
   $('.meta-pane').classList.toggle('collapsed', prefs.collapseDetails);
+  $('#editor').classList.toggle('header-hidden', prefs.hideHeaderOnFullscreen && panelState !== 'both');
   if (prefs.hideToolbar) {
     $('.fmt-bar').classList.add('hidden');
   } else {
@@ -125,16 +866,20 @@ function applyEditorPrefs() {
 // --- Editor ---
 $('#new-note-btn').addEventListener('click', () => {
   if (saveTimer) clearTimeout(saveTimer);
+  if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
   currentNoteId = null;
+  currentRevision = 0;
+  currentBaseRevision = null;
   isDirty = false;
   savedSnapshot = { title: '', tags: '', content: '' };
   $('#note-title').value = '';
   $('#note-tags').value = '';
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
-  $('#editor-status').textContent = '';
+  renderedPreviewSource = null;
+  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
   cachePreviewBlocks();
   applyEditorPrefs();
   show(screens.editor);
@@ -143,6 +888,7 @@ $('#new-note-btn').addEventListener('click', () => {
 
 $('#back-btn').addEventListener('click', async () => {
   if (saveTimer) clearTimeout(saveTimer);
+  if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   await saveCurrentNote();
   await loadDashboard();
@@ -152,29 +898,37 @@ async function openNote(id) {
   if (saveTimer) clearTimeout(saveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
-  const data = await api(`/api/notes/${id}`);
+  let data = await getLocalNote(id);
+  if (navigator.onLine && !data?.pending) {
+    const remote = await api(`/api/notes/${encodeURIComponent(id)}`);
+    if (remote) {
+      await cacheRemoteNote(remote);
+      data = remote;
+    }
+  }
   if (!data) return;
   currentNoteId = data.id;
+  currentRevision = data.revision || 0;
+  currentBaseRevision = data.base_revision ?? null;
   isDirty = false;
   savedSnapshot = { title: data.title || '', tags: data.tags || '', content: data.content || '' };
   $('#note-title').value = data.title || '';
   $('#note-tags').value = data.tags || '';
   $('#note-content').value = data.content || '';
-  $('#editor-status').textContent = '';
+  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
   applyEditorPrefs();
-  updatePreview();
   show(screens.editor);
+  updatePreview();
 }
 
 // --- Autosave ---
 function markDirty() {
   if (!isDirty) {
     isDirty = true;
-    $('#editor-status').textContent = 'Unsaved changes';
   }
 }
 
-async function saveCurrentNote() {
+async function saveCurrentNote(trySync = true) {
   const title = $('#note-title').value.trim() || 'Untitled';
   const tags = $('#note-tags').value.trim();
   const content = $('#note-content').value;
@@ -184,28 +938,53 @@ async function saveCurrentNote() {
 
   if (currentNoteId && data.title === savedSnapshot.title && data.tags === savedSnapshot.tags && data.content === savedSnapshot.content) {
     isDirty = false;
-    $('#editor-status').textContent = '';
+    if (trySync && navigator.onLine) await syncNow();
     return;
   }
-  $('#editor-status').textContent = 'Saving...';
-  const res = await api('/api/notes', {method:'POST', body:JSON.stringify(data)});
-  if (res) {
-    currentNoteId = res.id;
-    savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
-    isDirty = false;
-    $('#editor-status').textContent = 'Saved';
-    setTimeout(() => {
-      if (!isDirty) $('#editor-status').textContent = '';
-    }, 2000);
-  } else {
-    $('#editor-status').textContent = 'Save failed';
+  if (!currentNoteId) currentNoteId = newLocalNoteID();
+  const existing = await getLocalNote(currentNoteId);
+  const baseRevision = existing?.pending ? existing.base_revision : (currentBaseRevision ?? currentRevision ?? 0);
+  const baseContent = existing?.pending ? (existing.base_content ?? '') : (existing?.content || '');
+  const baseTitle = existing?.pending ? (existing.base_title ?? existing.title ?? '') : (existing?.title || '');
+  const baseTags = existing?.pending ? (existing.base_tags ?? existing.tags ?? '') : (existing?.tags || '');
+  const now = new Date().toISOString();
+  const local = {
+    ...existing,
+    ...data,
+    id: currentNoteId,
+    filename: existing?.filename || `${currentNoteId}.md`,
+    revision: existing?.revision ?? currentRevision ?? 0,
+    base_revision: baseRevision,
+    base_content: baseContent,
+    base_title: baseTitle,
+    base_tags: baseTags,
+    pending: true,
+    created_at: existing?.created_at || now,
+    updated_at: now,
+  };
+  try {
+    await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: currentNoteId, base_revision: baseRevision, note: local});
+  } catch (error) {
+    console.error('local save failed', error);
+    showToast('Could not save locally. Free browser storage and try again.', 'warning');
+    return false;
   }
+  currentBaseRevision = baseRevision;
+  savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
+  isDirty = false;
+  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
+  if (trySync && navigator.onLine) await syncNow();
 }
 
 let saveTimer = null;
+let localSaveTimer = null;
 let previewTimer = null;
 
 function scheduleSave() {
+  if (localSaveTimer) clearTimeout(localSaveTimer);
+  localSaveTimer = setTimeout(() => {
+    if (isDirty) saveCurrentNote(false);
+  }, 250);
   if (!prefs.autoSave) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
@@ -218,6 +997,105 @@ $('#note-title').addEventListener('input', () => { markDirty(); scheduleSave(); 
 $('#note-tags').addEventListener('input', () => { markDirty(); scheduleSave(); });
 
 // --- Formatting toolbar ---
+const tablePicker = document.createElement('div');
+tablePicker.id = 'table-picker';
+tablePicker.className = 'table-picker hidden';
+tablePicker.setAttribute('role', 'dialog');
+tablePicker.setAttribute('aria-label', 'Choose table size');
+tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="grid"></div>';
+document.body.append(tablePicker);
+
+const tableGrid = tablePicker.querySelector('.table-grid');
+const tablePickerLabel = tablePicker.querySelector('.table-picker-label');
+const tablePickerRows = 6;
+const tablePickerColumns = 8;
+
+for (let row = 1; row <= tablePickerRows; row++) {
+  for (let column = 1; column <= tablePickerColumns; column++) {
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'table-grid-cell';
+    cell.dataset.rows = String(row);
+    cell.dataset.columns = String(column);
+    cell.setAttribute('role', 'gridcell');
+    cell.setAttribute('aria-label', `${column} columns by ${row} rows`);
+    tableGrid.append(cell);
+  }
+}
+
+function setTableGridHighlight(rows = 0, columns = 0) {
+  tablePickerLabel.textContent = rows && columns ? `${columns} × ${rows} table` : 'Table';
+  tableGrid.querySelectorAll('.table-grid-cell').forEach(cell => {
+    cell.classList.toggle('active', Number(cell.dataset.rows) <= rows && Number(cell.dataset.columns) <= columns);
+  });
+}
+
+function hideTablePicker() {
+  tablePicker.classList.add('hidden');
+  $('.fmt-bar [data-fmt="table"]').setAttribute('aria-expanded', 'false');
+  setTableGridHighlight();
+}
+
+function showTablePicker(trigger) {
+  tablePicker.classList.remove('hidden');
+  trigger.setAttribute('aria-expanded', 'true');
+  const rect = trigger.getBoundingClientRect();
+  const gutter = 8;
+  const left = Math.min(Math.max(gutter, rect.left), window.innerWidth - tablePicker.offsetWidth - gutter);
+  const top = Math.min(rect.bottom + gutter, window.innerHeight - tablePicker.offsetHeight - gutter);
+  tablePicker.style.left = `${left}px`;
+  tablePicker.style.top = `${top}px`;
+}
+
+function insertTable(rows, columns) {
+  const ta = $('#note-content');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const header = Array.from({length: columns}, (_, index) => `Column ${index + 1}`);
+  const divider = Array.from({length: columns}, () => '---');
+  const body = Array.from({length: Math.max(0, rows - 1)}, () => Array(columns).fill(''));
+  const markdownRows = [header, divider, ...body].map(row => `| ${row.join(' | ')} |`);
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  const prefix = before && !before.endsWith('\n') ? '\n\n' : '';
+  const suffix = after && !after.startsWith('\n') ? '\n\n' : '';
+  const table = markdownRows.join('\n');
+  const insertion = prefix + table + suffix;
+  const firstCell = start + prefix.length + markdownRows[0].length + 1 + markdownRows[1].length + 3;
+
+  ta.setRangeText(insertion, start, end, 'end');
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = firstCell;
+  ta.dispatchEvent(new Event('input'));
+}
+
+tableGrid.addEventListener('pointerover', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (cell) setTableGridHighlight(Number(cell.dataset.rows), Number(cell.dataset.columns));
+});
+
+tableGrid.addEventListener('focusin', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (cell) setTableGridHighlight(Number(cell.dataset.rows), Number(cell.dataset.columns));
+});
+
+tableGrid.addEventListener('click', e => {
+  const cell = e.target.closest('.table-grid-cell');
+  if (!cell) return;
+  insertTable(Number(cell.dataset.rows), Number(cell.dataset.columns));
+  hideTablePicker();
+});
+
+document.addEventListener('pointerdown', e => {
+  if (!tablePicker.classList.contains('hidden') && !e.target.closest('#table-picker, [data-fmt="table"]')) hideTablePicker();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !tablePicker.classList.contains('hidden')) hideTablePicker();
+});
+
+window.addEventListener('resize', hideTablePicker);
+
 function insertFmt(type) {
   const ta = $('#note-content');
   const start = ta.selectionStart;
@@ -310,6 +1188,10 @@ function insertFmt(type) {
   ta.focus();
   ta.selectionStart = ta.selectionEnd = clean ? cursor : cursor;
   ta.dispatchEvent(new Event('input'));
+  if (previewTimer) {
+    clearTimeout(previewTimer);
+    previewTimer = null;
+  }
   updatePreview();
 }
 
@@ -317,6 +1199,11 @@ document.querySelector('.fmt-bar')?.addEventListener('click', e => {
   const btn = e.target.closest('[data-fmt]');
   if (btn) {
     e.preventDefault();
+    if (btn.dataset.fmt === 'table') {
+      if (tablePicker.classList.contains('hidden')) showTablePicker(btn);
+      else hideTablePicker();
+      return;
+    }
     insertFmt(btn.dataset.fmt);
   }
 });
@@ -337,6 +1224,7 @@ $('.meta-toggle')?.addEventListener('click', () => {
 // --- Panel toggle ---
 function setPanelState(state) {
   panelState = state;
+  if (state === 'both') panelWide = false;
   const wrap = $('#editor-panels');
   const ed = $('.panel-editor');
   const pv = $('.panel-preview');
@@ -350,13 +1238,36 @@ function setPanelState(state) {
     ed.classList.add('panel-hidden');
     wrap.classList.add('panels-single');
   }
-  document.querySelectorAll('.panel-toggle .material-symbols-outlined').forEach(el => {
-    el.textContent = state === 'both' ? 'add' : 'remove';
+  wrap.classList.toggle('panel-wide', panelWide && state !== 'both');
+  $('#editor').classList.toggle('header-hidden', prefs.hideHeaderOnFullscreen && state !== 'both');
+  document.querySelectorAll('.panel-layout').forEach(button => {
+    const focused = state === button.dataset.panel;
+    button.title = focused ? 'Show split view' : `Focus ${button.dataset.panel}`;
+    button.setAttribute('aria-label', button.title);
+    button.setAttribute('aria-pressed', String(focused));
+    button.querySelector('use').setAttribute('href', focused ? '#icon-minimize' : '#icon-maximize');
   });
+  document.querySelectorAll('.panel-width').forEach(button => {
+    const label = panelWide ? 'Use reading width' : 'Use full width';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-pressed', String(panelWide));
+    button.querySelector('use').setAttribute('href', panelWide ? '#icon-width-reading' : '#icon-width-full');
+  });
+  applyPanelRatio();
+  if (state !== 'editor') schedulePreviewCheck();
 }
 
 $('#editor-panels').addEventListener('click', e => {
-  const btn = e.target.closest('.panel-toggle');
+  const widthButton = e.target.closest('.panel-width');
+  if (widthButton) {
+    if (panelState !== 'both') {
+      panelWide = !panelWide;
+      setPanelState(panelState);
+    }
+    return;
+  }
+  const btn = e.target.closest('.panel-layout');
   if (!btn) return;
   if (panelState === 'both') {
     setPanelState(btn.dataset.panel);
@@ -365,30 +1276,68 @@ $('#editor-panels').addEventListener('click', e => {
   }
 });
 
-// --- Fullscreen toggle ---
-function toggleFullscreen(panel) {
-  const editor = $('#editor');
-  const cls = 'fs-' + panel;
-  if (editor.classList.contains(cls)) {
-    editor.classList.remove('fs-editor', 'fs-preview');
-  } else {
-    editor.classList.remove('fs-editor', 'fs-preview');
-    editor.classList.add(cls);
-  }
+function applyPanelRatio() {
+  $('#editor-panels').style.setProperty('--editor-panel-width', `${Math.round(panelRatio * 1000) / 10}%`);
+  $('#panel-resizer').setAttribute('aria-valuenow', String(Math.round(panelRatio * 100)));
 }
 
-$('#editor-panels').addEventListener('click', e => {
-  const btn = e.target.closest('.panel-fs');
-  if (btn) toggleFullscreen(btn.dataset.fs);
+function setPanelRatio(ratio) {
+  panelRatio = Math.min(.8, Math.max(.2, ratio));
+  localStorage.setItem('mdnotes-panel-ratio', String(panelRatio));
+  applyPanelRatio();
+}
+
+const panelResizer = $('#panel-resizer');
+panelResizer.addEventListener('pointerdown', event => {
+  if (panelState !== 'both' || window.matchMedia('(max-width: 640px)').matches) return;
+  event.preventDefault();
+  panelResizer.setPointerCapture(event.pointerId);
+  $('#editor-panels').classList.add('resizing');
 });
+panelResizer.addEventListener('pointermove', event => {
+  if (!panelResizer.hasPointerCapture(event.pointerId)) return;
+  const bounds = $('#editor-panels').getBoundingClientRect();
+  setPanelRatio((event.clientX - bounds.left) / bounds.width);
+});
+function finishPanelResize(event) {
+  if (panelResizer.hasPointerCapture(event.pointerId)) panelResizer.releasePointerCapture(event.pointerId);
+  $('#editor-panels').classList.remove('resizing');
+}
+panelResizer.addEventListener('pointerup', finishPanelResize);
+panelResizer.addEventListener('pointercancel', finishPanelResize);
+panelResizer.addEventListener('keydown', event => {
+  if (event.key === 'ArrowLeft') { event.preventDefault(); setPanelRatio(panelRatio - .05); }
+  if (event.key === 'ArrowRight') { event.preventDefault(); setPanelRatio(panelRatio + .05); }
+  if (event.key === 'Home') { event.preventDefault(); setPanelRatio(.2); }
+  if (event.key === 'End') { event.preventDefault(); setPanelRatio(.8); }
+});
+applyPanelRatio();
 
 // --- Cursor preview highlight ---
 let previewBlocks = [];
+function isPreviewVisible() {
+  return !screens.editor.classList.contains('hidden') && panelState !== 'editor';
+}
+function schedulePreviewCheck() {
+  if (previewCheckFrame !== null) return;
+  previewCheckFrame = requestAnimationFrame(() => {
+    previewCheckFrame = null;
+    updatePreview();
+  });
+}
+function scheduleHighlight() {
+  if (highlightFrame !== null) return;
+  highlightFrame = requestAnimationFrame(() => {
+    highlightFrame = null;
+    highlightBlock();
+  });
+}
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
 }
 function highlightBlock() {
+  if (!isPreviewVisible()) return;
   if (prefs.hideCursorHighlight) {
     const cur = $('#preview').querySelector('.highlight');
     if (cur) cur.classList.remove('highlight');
@@ -412,11 +1361,24 @@ function highlightBlock() {
 $('#delete-btn').addEventListener('click', async () => {
   if (!currentNoteId) return;
   if (!confirm('Delete this note?')) return;
-  const ok = await api(`/api/notes/${currentNoteId}`, {method:'DELETE'});
-  if (ok) {
-    currentNoteId = null;
-    await loadDashboard();
+  const local = await getLocalNote(currentNoteId);
+  if (!local) return;
+  const pending = await hasPendingOperation(currentNoteId);
+  if (pending && (local.base_revision || 0) === 0) {
+    await removeLocalNoteAndSupersede(currentNoteId, 0);
+  } else {
+    await removeLocalNoteAndQueue(currentNoteId, {type: 'note.delete', note_id: currentNoteId, base_revision: local.base_revision ?? local.revision});
   }
+  currentNoteId = null;
+  currentRevision = 0;
+  currentBaseRevision = null;
+  if (currentTag) {
+    const remainingNotes = await getLocalNotes();
+    if (!remainingNotes.some(note => noteHasTag(note, currentTag))) currentTag = null;
+  }
+  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
+  if (navigator.onLine) await syncNow();
+  await loadDashboard();
 });
 
 // --- Live Preview ---
@@ -426,19 +1388,24 @@ $('#note-content').addEventListener('input', () => {
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 500);
 });
-$('#note-content').addEventListener('click', highlightBlock);
-$('#note-content').addEventListener('keyup', highlightBlock);
+$('#note-content').addEventListener('click', scheduleHighlight);
+$('#note-content').addEventListener('keyup', scheduleHighlight);
 
 function updatePreview() {
-  if ($('.panel-preview').offsetParent === null) return;
+  if (!isPreviewVisible()) return;
   const md = $('#note-content').value;
+  if (md === renderedPreviewSource) {
+    scheduleHighlight();
+    return;
+  }
   if (typeof marked !== 'undefined' && marked.parse) {
     $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
   }
+  renderedPreviewSource = md;
   cachePreviewBlocks();
-  highlightBlock();
+  scheduleHighlight();
 }
 
 // --- Utils ---
@@ -458,8 +1425,7 @@ function formatDate(iso) {
 function setTheme(dark) {
   const root = document.documentElement;
   root.classList.toggle('dark', dark);
-  const icon = dark ? 'dark_mode' : 'light_mode';
-  $$('.theme-btn .material-symbols-outlined').forEach(el => el.textContent = icon);
+  $$('.theme-btn use').forEach(el => el.setAttribute('href', dark ? '#icon-moon' : '#icon-sun'));
   localStorage.setItem('theme', dark ? 'dark' : 'light');
 }
 
@@ -481,6 +1447,7 @@ function toggleTheme() {
 $('#prefs-btn').addEventListener('click', () => {
   $('#pref-autosave').checked = prefs.autoSave;
   $('#pref-hidepreview').checked = prefs.hidePreview;
+  $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
   $('#pref-hidetoolbar').checked = prefs.hideToolbar;
   $('#pref-collapse').checked = prefs.collapseDetails;
   $('#pref-hidecursor').checked = prefs.hideCursorHighlight;
@@ -498,8 +1465,10 @@ $('#prefs-modal .modal-backdrop').addEventListener('click', () => {
 
 async function savePref(key, value) {
   prefs[key] = value;
-  await api('/api/prefs', { method: 'PATCH', body: JSON.stringify(prefs) });
+  localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+  await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
   applyEditorPrefs();
+  if (navigator.onLine) syncNow();
 }
 
 $('#pref-autosave').addEventListener('change', function () {
@@ -507,6 +1476,9 @@ $('#pref-autosave').addEventListener('change', function () {
 });
 $('#pref-hidepreview').addEventListener('change', function () {
   savePref('hidePreview', this.checked);
+});
+$('#pref-hideheader').addEventListener('change', function () {
+  savePref('hideHeaderOnFullscreen', this.checked);
 });
 $('#pref-hidetoolbar').addEventListener('change', function () {
   savePref('hideToolbar', this.checked);
@@ -524,27 +1496,82 @@ $('#pref-theme').addEventListener('change', function () {
 
 async function loadPrefs() {
   const p = await api('/api/prefs');
-  if (p) prefs = p;
+  if (p && !await hasPendingOperation('__prefs__')) {
+    prefs = p;
+    localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    return;
+  }
+  try {
+    const cached = localStorage.getItem('mdnotes-prefs');
+    if (cached) prefs = {...prefs, ...JSON.parse(cached)};
+  } catch (_) {}
 }
 
 // --- Init ---
 async function init() {
-  const res = await api('/api/check');
-  if (res) {
-    await loadPrefs();
-    await loadDashboard();
-  } else {
+  try {
+    const res = await api('/api/check');
+    if (res) {
+      cacheAppVersion(res);
+      await loadPrefs();
+      await syncNow();
+      connectServerEvents();
+      await loadDashboard();
+    } else if (localStorage.getItem('mdnotes-offline-ready') === '1') {
+      cacheAppVersion();
+      await loadPrefs();
+      setSyncStatus('offline');
+      showOfflineNotice();
+      await loadDashboard();
+    } else {
+      show(screens.login);
+      $('#login-form input').focus();
+    }
+  } catch (error) {
+    console.error('initialization failed', error);
     show(screens.login);
+    $('#login-error').textContent = 'Could not start the app. Please reload.';
     $('#login-form input').focus();
+  } finally {
+    $('#app').classList.remove('booting');
   }
 }
 
 init();
 
+$$('.offline-retry').forEach(retry => retry.addEventListener('click', async () => {
+  showOfflineNotice(true);
+  const ok = await syncNow({force: true, preserveSnackbar: true});
+  if (ok) showSyncCompleteToast();
+}));
+
 // Service worker
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js');
+  navigator.serviceWorker.register('/sw.js').catch(error => console.warn('service worker registration failed', error));
 }
+
+window.addEventListener('online', async () => {
+  connectServerEvents();
+  if (await syncNow({force: true}) && !screens.dashboard.classList.contains('hidden')) {
+    await Promise.all([loadTags(), loadNotes()]);
+  }
+});
+
+window.addEventListener('offline', () => {
+  markServerOffline();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && isDirty) saveCurrentNote(false);
+  if (document.visibilityState === 'visible') {
+    connectServerEvents();
+    syncNow();
+  }
+});
+
+setInterval(() => {
+  if (document.visibilityState === 'visible') syncNow();
+}, 30000);
 
 // Keyboard shortcuts
 document.addEventListener('keydown', e => {
