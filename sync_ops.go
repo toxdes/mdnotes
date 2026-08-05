@@ -105,6 +105,9 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "could not apply sync operation", http.StatusInternalServerError)
 			return
 		}
+		if result.Status == "applied" && (operation.Type == "note.save" || operation.Type == "note.delete") {
+			a.publishChange()
+		}
 		response.Acknowledged = append(response.Acknowledged, result)
 		lastSequence = operation.ClientSequence
 		response.ExpectedSequence = lastSequence + 1

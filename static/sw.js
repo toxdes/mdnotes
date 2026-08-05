@@ -1,4 +1,4 @@
-const CACHE = 'mdnotes-v39';
+const CACHE = 'mdnotes-v45';
 const ASSETS = [
   '/', '/index.html', '/style.css', '/app.js', '/merge.js', '/marked.min.js',
   '/manifest.json', '/favicon.ico', '/favicon.svg',
@@ -7,7 +7,16 @@ const ASSETS = [
 
 self.addEventListener('install', e => {
   e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())
+    // Cache a freshly revalidated shell. `cache.addAll()` uses the browser's
+    // normal HTTP cache, which could otherwise copy a still-fresh older
+    // app.js into this brand-new worker cache.
+    caches.open(CACHE).then(async cache => {
+      await Promise.all(ASSETS.map(async asset => {
+        const response = await fetch(asset, {cache: 'no-cache'});
+        if (!response.ok) throw new Error(`could not cache ${asset}`);
+        await cache.put(asset, response);
+      }));
+    }).then(() => self.skipWaiting())
   );
 });
 
@@ -26,7 +35,9 @@ self.addEventListener('fetch', e => {
   // browser, rather than becoming part of our offline cache or fallback path.
   if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
   e.respondWith(
-    fetch(request).then(response => {
+    // The shell assets use stable filenames. Bypass a browser's still-fresh
+    // HTTP cache so a service-worker update cannot keep an older app.js alive.
+    fetch(request, {cache: 'no-cache'}).then(response => {
       if (response.ok) {
         const copy = response.clone();
         e.waitUntil(caches.open(CACHE).then(cache => cache.put(request, copy)).catch(() => {}));

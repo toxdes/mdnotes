@@ -76,6 +76,7 @@ type app struct {
 	encryption *encryptionConfig
 	noteCache  *noteCache
 	rl         *rateLimiter
+	events     *eventBroker
 }
 
 func (a *app) isSecureRequest(r *http.Request) bool {

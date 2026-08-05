@@ -40,6 +40,27 @@ const offlineDBName = 'mdnotes-offline';
 let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
+const noteRouteIDPattern = /^[A-Za-z0-9_-]{1,64}$/;
+
+function noteIDFromLocation() {
+  try {
+    const id = decodeURIComponent(window.location.pathname.slice(1));
+    return noteRouteIDPattern.test(id) ? id : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function setNoteRoute(noteID, {replace = false} = {}) {
+  const path = `/${encodeURIComponent(noteID)}`;
+  if (window.location.pathname === path && !window.location.search && !window.location.hash) return;
+  history[replace ? 'replaceState' : 'pushState']({noteID}, '', path);
+}
+
+function setDashboardRoute({replace = false} = {}) {
+  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) return;
+  history[replace ? 'replaceState' : 'pushState']({}, '', '/');
+}
 
 function openOfflineDB() {
   if (offlineDBPromise) return offlineDBPromise;
@@ -169,6 +190,18 @@ function setOfflineState(key, value) {
   return withOfflineStore(['state'], 'readwrite', stores => requestValue(stores.state.put({key, value})));
 }
 
+function unresolvedConflictKey(noteID) {
+  return `unresolvedConflict:${noteID}`;
+}
+
+function getUnresolvedConflict(noteID) {
+  return getOfflineState(unresolvedConflictKey(noteID));
+}
+
+function setUnresolvedConflict(conflict) {
+  return setOfflineState(unresolvedConflictKey(conflict.note_id), conflict);
+}
+
 async function queueOperationInStores(stores, operation) {
   if (operation.type === 'note.save' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
@@ -226,6 +259,29 @@ function pendingOperations() {
   return withOfflineStore(['queue'], 'readonly', async stores => {
     const items = await requestValue(stores.queue.getAll());
     return items.sort((a, b) => a.client_sequence - b.client_sequence);
+  });
+}
+
+async function repairSyncSequenceGap(expectedSequence) {
+  if (!Number.isSafeInteger(expectedSequence) || expectedSequence < 1) return false;
+  return withOfflineStore(['queue', 'state'], 'readwrite', async stores => {
+    const operations = (await requestValue(stores.queue.getAll()))
+      .sort((left, right) => left.client_sequence - right.client_sequence || left.id - right.id);
+    const unsent = operations.filter(operation => operation.client_sequence >= expectedSequence);
+    if (!unsent.length) return false;
+    let sequence = expectedSequence;
+    for (const operation of unsent) {
+      if (operation.client_sequence !== sequence) {
+        operation.client_sequence = sequence;
+        await requestValue(stores.queue.put(operation));
+      }
+      sequence++;
+    }
+    // These operations have not reached the server (it explicitly requested
+    // expectedSequence), so it is safe to close the local numbering gap and
+    // let future edits continue immediately after the repaired queue.
+    await requestValue(stores.state.put({key: 'clientSequence', value: sequence - 1}));
+    return true;
   });
 }
 
@@ -399,6 +455,13 @@ function show(screen) {
   screen.classList.remove('hidden');
 }
 
+function clearCurrentNote() {
+  currentNoteId = null;
+  currentRevision = 0;
+  currentBaseRevision = null;
+  isDirty = false;
+}
+
 async function api(path, opts) {
   try {
     const res = await fetch(path, {
@@ -439,7 +502,9 @@ async function syncFetch(path, options) {
 
 async function cacheRemoteNote(note) {
   const local = await getLocalNote(note.id);
-  if (local?.pending) return;
+  // A just-typed change may not have reached IndexedDB yet. Do not let a pull
+  // replace that base snapshot before syncNow has a chance to save it locally.
+  if (local?.pending || (currentNoteId === note.id && isDirty)) return;
   await putLocalNote({...local, ...note, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   if (currentNoteId === note.id && !isDirty) {
     currentRevision = note.revision || 0;
@@ -463,12 +528,13 @@ async function pullRemoteChanges() {
       return;
     }
     for (const change of page.changes) {
-      if (await hasPendingOperation(change.note_id)) continue;
+      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
       if (change.deleted) {
         await removeLocalNote(change.note_id);
         if (currentNoteId === change.note_id && !isDirty) {
           currentNoteId = null;
-          await loadDashboard();
+          await loadDashboard({sync: false});
+          setDashboardRoute({replace: true});
         }
         continue;
       }
@@ -487,7 +553,7 @@ async function resetLocalNotesFromRemote(sequence) {
   if (!Array.isArray(summaries)) throw new Error('could not refresh notes after sync compaction');
   const remoteIDs = new Set(summaries.map(note => note.id));
   for (const summary of summaries) {
-    if (await hasPendingOperation(summary.id)) continue;
+    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
     const remote = await api(`/api/notes/${encodeURIComponent(summary.id)}`);
     if (!remote) throw new Error('could not download refreshed note');
     await cacheRemoteNote(remote);
@@ -498,6 +564,29 @@ async function resetLocalNotesFromRemote(sequence) {
     }
   }
   await setOfflineState('syncSequence', sequence);
+}
+
+// A sync cursor records that this browser has observed the change feed, but a
+// browser can still lose individual IndexedDB records (for example after a
+// storage repair). Reconcile against note summaries at session start so a
+// valid-but-stale cursor cannot leave the dashboard incomplete forever.
+async function reconcileLocalNotes() {
+  const summaries = await api('/api/notes');
+  if (!Array.isArray(summaries)) throw new Error('could not reconcile local notes');
+  const remoteIDs = new Set(summaries.map(note => note.id));
+  for (const summary of summaries) {
+    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
+    const local = await getLocalNote(summary.id);
+    if (local && local.revision === summary.revision) continue;
+    const remote = await api(`/api/notes/${encodeURIComponent(summary.id)}`);
+    if (!remote) throw new Error('could not download reconciled note');
+    await cacheRemoteNote(remote);
+  }
+  for (const local of await getAllLocalNotes()) {
+    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id) && !await getUnresolvedConflict(local.id)) {
+      await removeLocalNote(local.id);
+    }
+  }
 }
 
 function updateOpenNote(note) {
@@ -522,7 +611,7 @@ async function mergeConflictedNote(operation) {
   const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
   if (!local || !remote) return false;
   // Queued edits created before three-way metadata existed cannot be merged
-  // safely for title/tags, so preserve them as a conflict copy instead.
+  // safely for title/tags; the durable resolver handles them instead.
   if (local.base_title === undefined || local.base_tags === undefined) return false;
 
   const base = {
@@ -555,9 +644,7 @@ async function mergeConflictedNote(operation) {
   return true;
 }
 
-async function preserveConflict(operation) {
-  const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+async function preserveConflictCopy(operation, local, remote) {
   if (remote) await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   else await removeLocalNote(operation.note_id);
   if (local && operation.type === 'note.save') {
@@ -588,6 +675,212 @@ async function preserveConflict(operation) {
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
   await removePendingOperation(operation.id);
 }
+
+function conflictBase(local, operation) {
+  return {
+    title: local.base_title ?? operation.note?.base_title ?? operation.note?.title ?? '',
+    tags: local.base_tags ?? operation.note?.base_tags ?? operation.note?.tags ?? '',
+    content: local.base_content ?? operation.note?.base_content ?? '',
+  };
+}
+
+function renderConflictDiff(target, base, version, changedClass) {
+  const baseLines = String(base || '').split('\n');
+  const versionLines = String(version || '').split('\n');
+  let prefix = 0;
+  while (prefix < baseLines.length && prefix < versionLines.length && baseLines[prefix] === versionLines[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < baseLines.length - prefix && suffix < versionLines.length - prefix && baseLines[baseLines.length - suffix - 1] === versionLines[versionLines.length - suffix - 1]) suffix++;
+  target.replaceChildren();
+  const append = (text, changed) => {
+    const node = document.createElement(changed ? 'mark' : 'span');
+    if (changed) node.className = `conflict-line ${changedClass}`;
+    node.textContent = text;
+    target.append(node);
+  };
+  if (prefix) append(`${versionLines.slice(0, prefix).join('\n')}\n`, false);
+  const changed = versionLines.slice(prefix, versionLines.length - suffix).join('\n');
+  if (changed || versionLines.length !== baseLines.length) append(`${changed || '∅'}\n`, true);
+  if (suffix) append(versionLines.slice(versionLines.length - suffix).join('\n'), false);
+}
+
+let activeConflictID = null;
+let activeConflictSelection = 'local';
+
+function closeConflictResolver() {
+  activeConflictID = null;
+  activeConflictSelection = 'local';
+  $('#conflict-modal').classList.add('hidden');
+}
+
+function setConflictSelection(selection) {
+  activeConflictSelection = selection;
+  const localSelected = selection === 'local';
+  const remoteSelected = selection === 'remote';
+  $('.conflict-version-local').classList.toggle('is-selected', localSelected);
+  $('.conflict-version-remote').classList.toggle('is-selected', remoteSelected);
+  $('#conflict-use-local').setAttribute('aria-pressed', String(localSelected));
+  $('#conflict-use-remote').setAttribute('aria-pressed', String(remoteSelected));
+  $('#conflict-selection-status').textContent = selection === 'local'
+    ? 'Selected: this device. You can edit the result below.'
+    : selection === 'remote'
+      ? 'Selected: other device. You can edit the result below.'
+      : 'Custom result. You can continue editing it below.';
+}
+
+function showConflictResolver(conflict) {
+  activeConflictID = conflict.note_id;
+  $('#conflict-note-title').value = conflict.local.title || '';
+  $('#conflict-note-tags').value = conflict.local.tags || '';
+  $('#conflict-note-content').value = conflict.local.content || '';
+  $('#conflict-local-metadata').textContent = `Title: ${conflict.local.title || 'Untitled'}\nTags: ${conflict.local.tags || 'None'}`;
+  $('#conflict-remote-metadata').textContent = `Title: ${conflict.remote.title || 'Untitled'}\nTags: ${conflict.remote.tags || 'None'}`;
+  renderConflictDiff($('#conflict-local-diff'), conflict.base.content, conflict.local.content, 'conflict-line-local');
+  renderConflictDiff($('#conflict-remote-diff'), conflict.base.content, conflict.remote.content, 'conflict-line-remote');
+  $('#conflict-base-content').textContent = conflict.base.content || '(empty note)';
+  setConflictSelection('local');
+  $('#conflict-modal').classList.remove('hidden');
+  $('#conflict-note-content').focus();
+}
+
+async function showConflictResolverFor(noteID) {
+  const conflict = await getUnresolvedConflict(noteID);
+  if (!conflict) return false;
+  showConflictResolver(conflict);
+  return true;
+}
+
+function fillConflictResolution(version, selection) {
+  $('#conflict-note-title').value = version.title || '';
+  $('#conflict-note-tags').value = version.tags || '';
+  $('#conflict-note-content').value = version.content || '';
+  setConflictSelection(selection);
+}
+
+async function createConflictResolution(operation) {
+  // Always capture fresh keystrokes before replacing the cached note. This is
+  // especially important for notification-driven sync, which can arrive while
+  // the 250ms local-save timer is still pending.
+  if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
+  const local = await getLocalNote(operation.note_id);
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  if (!local || !remote || operation.type !== 'note.save') {
+    await preserveConflictCopy(operation, local, remote);
+    return false;
+  }
+
+  const conflict = {
+    note_id: operation.note_id,
+    created_at: new Date().toISOString(),
+    base: conflictBase(local, operation),
+    local: {title: local.title || '', tags: local.tags || '', content: local.content || ''},
+    remote: {...remote, title: remote.title || '', tags: remote.tags || '', content: remote.content || '', revision: remote.revision || 0, filename: remote.filename || ''},
+  };
+  // Persist the user's version before acknowledging the conflict locally. If
+  // the browser closes now, reopening the note resumes this resolver.
+  await setUnresolvedConflict(conflict);
+  await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+  await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
+  await removePendingOperation(operation.id);
+  // Bring the authoritative version into the normal editor before opening the
+  // resolver, even if the conflict was discovered after navigating away. Any
+  // note the user began editing during the request is saved locally first.
+  if (isDirty) await saveCurrentNote(false);
+  showNoteInEditor(remote);
+  setNoteRoute(remote.id);
+  showConflictResolver(conflict);
+  if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+  return true;
+}
+
+async function saveConflictResolution() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict) return;
+  const now = new Date().toISOString();
+  const resolved = {
+    ...conflict.remote,
+    id: noteID,
+    title: $('#conflict-note-title').value.trim() || 'Untitled',
+    tags: $('#conflict-note-tags').value.trim(),
+    content: $('#conflict-note-content').value,
+    updated_at: now,
+    pending: true,
+    base_revision: conflict.remote.revision,
+    base_title: conflict.remote.title || '',
+    base_tags: conflict.remote.tags || '',
+    base_content: conflict.remote.content || '',
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.put(resolved));
+    await queueOperationInStores(stores, {type: 'note.save', note_id: noteID, base_revision: resolved.base_revision, note: resolved});
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  currentNoteId = noteID;
+  isDirty = false;
+  updateOpenNote(resolved);
+  closeConflictResolver();
+  showToast('Conflict resolution saved.', 'success');
+  if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+  void syncNow();
+}
+
+async function keepConflictAsCopy() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict) return;
+  const conflictID = newLocalNoteID();
+  const now = new Date().toISOString();
+  const copy = {
+    id: conflictID,
+    title: `${conflict.local.title || 'Untitled'} (conflict copy)`,
+    filename: `${conflictID}.md`,
+    tags: conflict.local.tags || '',
+    content: conflict.local.content || '',
+    created_at: now,
+    updated_at: now,
+    revision: 0,
+    base_revision: 0,
+    base_title: '',
+    base_tags: '',
+    base_content: '',
+    pending: true,
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.put(copy));
+    await queueOperationInStores(stores, {type: 'note.save', note_id: copy.id, base_revision: 0, note: copy});
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  currentNoteId = copy.id;
+  isDirty = false;
+  updateOpenNote(copy);
+  setNoteRoute(copy.id);
+  closeConflictResolver();
+  showToast('Your version was saved as a separate note.', 'success');
+  if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+  void syncNow();
+}
+
+$('#conflict-use-local').addEventListener('click', async () => {
+  const conflict = activeConflictID && await getUnresolvedConflict(activeConflictID);
+  if (conflict) fillConflictResolution(conflict.local, 'local');
+});
+
+$('#conflict-use-remote').addEventListener('click', async () => {
+  const conflict = activeConflictID && await getUnresolvedConflict(activeConflictID);
+  if (conflict) fillConflictResolution(conflict.remote, 'remote');
+});
+
+['#conflict-note-title', '#conflict-note-tags', '#conflict-note-content'].forEach(selector => {
+  $(selector).addEventListener('input', () => {
+    if (activeConflictID && activeConflictSelection !== 'custom') setConflictSelection('custom');
+  });
+});
+
+$('#conflict-save').addEventListener('click', () => { void saveConflictResolution(); });
+$('#conflict-copy').addEventListener('click', () => { void keepConflictAsCopy(); });
+$('#conflict-later').addEventListener('click', closeConflictResolver);
+$('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
 
 async function acknowledgeCompactedOperation(operation) {
   await removePendingOperation(operation.id);
@@ -640,7 +933,11 @@ async function flushPendingChanges() {
     }
     if (result.response.status === 401) throw new Error('sign in required to sync');
     if (result.response.status === 409) {
-      const expected = result.data?.expected_sequence;
+      const expected = Number(result.data?.expected_sequence);
+      if (await repairSyncSequenceGap(expected)) {
+        showToast('Recovered a local sync gap. Retrying your changes.', 'warning');
+        continue;
+      }
       throw new Error(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict');
     }
     if (!result.response.ok) {
@@ -658,8 +955,9 @@ async function flushPendingChanges() {
       if (await mergeConflictedNote(operation)) {
         showToast('Merged your non-overlapping changes.', 'success');
       } else {
-        await preserveConflict(operation);
-        showToast('A conflict copy was created so your changes are safe.', 'warning');
+        const resolverReady = await createConflictResolution(operation);
+        if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
+        else showToast('A conflict copy was created so your changes are safe.', 'warning');
       }
       continue;
     }
@@ -679,13 +977,18 @@ async function flushPendingChanges() {
   }
 }
 
-async function syncNow({force = false, preserveSnackbar = false} = {}) {
+async function syncNow({force = false, preserveSnackbar = false, reconcile = false} = {}) {
   if ((!navigator.onLine && !force) || syncInFlight) return false;
   syncInFlight = true;
   setSyncStatus('syncing');
   const wasOffline = syncFailed;
   try {
+    // Save the visible editor locally before pulling. This never waits on the
+    // network, but ensures a remote notification cannot overwrite the common
+    // base needed to merge the user's newest keystrokes.
+    if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
     await pullRemoteChanges();
+    if (reconcile) await reconcileLocalNotes();
     await flushPendingChanges();
     await pullRemoteChanges();
     localStorage.setItem('mdnotes-offline-ready', '1');
@@ -722,6 +1025,8 @@ const sseStaleAfterMs = 70000;
 let serverEvents = null;
 let serverHeartbeatAt = 0;
 let serverEventsWatchdog = null;
+let serverChangeTimer = null;
+let serverChangePending = false;
 
 function markServerOffline() {
   const shouldToast = !syncFailed;
@@ -737,10 +1042,26 @@ async function handleServerHeartbeat() {
     if (!syncInFlight) setSyncStatus('online');
     return;
   }
-  const synced = await syncNow({force: true});
+  const synced = await syncNow({force: true, reconcile: true});
   if (synced && !screens.dashboard.classList.contains('hidden')) {
-    await Promise.all([loadTags(), loadNotes()]);
+    await refreshDashboard();
   }
+}
+
+function scheduleServerChangeSync() {
+  serverChangePending = true;
+  if (serverChangeTimer) return;
+  serverChangeTimer = setTimeout(async () => {
+    serverChangeTimer = null;
+    if (syncInFlight) {
+      scheduleServerChangeSync();
+      return;
+    }
+    serverChangePending = false;
+    const synced = await syncNow({force: true});
+    if (synced && !screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    if (serverChangePending) scheduleServerChangeSync();
+  }, 75);
 }
 
 function connectServerEvents() {
@@ -750,6 +1071,10 @@ function connectServerEvents() {
   serverEvents = events;
   events.addEventListener('server', event => {
     try { cacheAppVersion(JSON.parse(event.data)); } catch (_) {}
+  });
+  events.addEventListener('change', () => {
+    serverHeartbeatAt = Date.now();
+    scheduleServerChangeSync();
   });
   events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
   events.onopen = () => { void handleServerHeartbeat(); };
@@ -773,6 +1098,9 @@ function disconnectServerEvents() {
   serverHeartbeatAt = 0;
   if (serverEventsWatchdog) clearInterval(serverEventsWatchdog);
   serverEventsWatchdog = null;
+  if (serverChangeTimer) clearTimeout(serverChangeTimer);
+  serverChangeTimer = null;
+  serverChangePending = false;
 }
 
 // --- Auth ---
@@ -784,9 +1112,9 @@ $('#login-form').addEventListener('submit', async e => {
     $('#login-error').textContent = '';
     cacheAppVersion(res);
     await loadPrefs();
-    await syncNow();
+    await syncNow({reconcile: true});
     connectServerEvents();
-    await loadDashboard();
+    await restoreRoute();
   } else {
     $('#login-error').textContent = 'Wrong password';
   }
@@ -803,15 +1131,19 @@ $('#logout-btn').addEventListener('click', async () => {
 });
 
 // --- Dashboard ---
-async function loadDashboard() {
-  show(screens.dashboard);
-  await syncNow();
-  await Promise.all([loadTags(), loadNotes()]);
+let dashboardNotes = [];
+let dashboardRenderGeneration = 0;
+
+async function unresolvedConflictIDs() {
+  const records = await withOfflineStore(['state'], 'readonly', stores => requestValue(stores.state.getAll()));
+  return new Set(records
+    .filter(record => record.key.startsWith('unresolvedConflict:') && record.value?.note_id)
+    .map(record => record.value.note_id));
 }
 
-async function loadTags() {
-  const notes = await getLocalNotes();
+function renderDashboard(notes, conflicts) {
   const tags = [...new Set(notes.flatMap(note => (note.tags || '').split(',').map(tag => tag.trim()).filter(Boolean)))].sort((a, b) => a.localeCompare(b));
+  if (currentTag && !tags.includes(currentTag)) currentTag = null;
   const bar = $('#tag-bar');
   let html = '<span class="tag'+(currentTag?'':' active')+'" data-tag="">All</span>';
   tags.forEach(t => {
@@ -821,20 +1153,10 @@ async function loadTags() {
   bar.innerHTML = html;
   bar.querySelectorAll('.tag').forEach(el => {
     el.addEventListener('click', () => {
-      const tag = el.dataset.tag;
-      currentTag = tag;
-      loadTags();
-      loadNotes();
+      currentTag = el.dataset.tag;
+      renderDashboard(dashboardNotes, conflicts);
     });
   });
-}
-
-function noteHasTag(note, tag) {
-  return (note.tags || '').split(',').some(noteTag => noteTag.trim() === tag);
-}
-
-async function loadNotes() {
-  let notes = await getLocalNotes();
   if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
@@ -843,7 +1165,7 @@ async function loadNotes() {
   }
   list.innerHTML = notes.map(n => `
     <div class="note-item" data-id="${esc(n.id)}">
-      <div class="note-title">${esc(n.title || 'Untitled')}</div>
+      <div class="note-title">${esc(n.title || 'Untitled')}${conflicts.has(n.id) ? '<span class="note-conflict">Conflict</span>' : ''}</div>
       <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
       ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
     </div>
@@ -851,6 +1173,29 @@ async function loadNotes() {
   list.querySelectorAll('.note-item').forEach(el => {
     el.addEventListener('click', () => openNote(el.dataset.id));
   });
+}
+
+function noteHasTag(note, tag) {
+  return (note.tags || '').split(',').some(noteTag => noteTag.trim() === tag);
+}
+
+async function refreshDashboard() {
+  const generation = ++dashboardRenderGeneration;
+  const [notes, conflicts] = await Promise.all([getLocalNotes(), unresolvedConflictIDs()]);
+  if (generation !== dashboardRenderGeneration) return;
+  dashboardNotes = notes;
+  renderDashboard(notes, conflicts);
+}
+
+async function syncDashboardInBackground() {
+  const synced = await syncNow();
+  if (synced && !screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+}
+
+async function loadDashboard({sync = true} = {}) {
+  show(screens.dashboard);
+  await refreshDashboard();
+  if (sync) void syncDashboardInBackground();
 }
 
 function applyEditorPrefs() {
@@ -864,17 +1209,17 @@ function applyEditorPrefs() {
 }
 
 // --- Editor ---
-$('#new-note-btn').addEventListener('click', () => {
+function startNewNote(title = '') {
   if (saveTimer) clearTimeout(saveTimer);
   if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
-  currentNoteId = null;
+  currentNoteId = newLocalNoteID();
   currentRevision = 0;
   currentBaseRevision = null;
   isDirty = false;
   savedSnapshot = { title: '', tags: '', content: '' };
-  $('#note-title').value = '';
+  $('#note-title').value = title;
   $('#note-tags').value = '';
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
@@ -884,29 +1229,24 @@ $('#new-note-btn').addEventListener('click', () => {
   applyEditorPrefs();
   show(screens.editor);
   $('#note-title').focus();
-});
+}
+
+$('#new-note-btn').addEventListener('click', () => startNewNote());
 
 $('#back-btn').addEventListener('click', async () => {
   if (saveTimer) clearTimeout(saveTimer);
   if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
-  await saveCurrentNote();
+  // Navigation waits only for the durable local save. Network replay then runs
+  // after the cached dashboard is visible, rather than making Back feel slow.
+  await saveCurrentNote(false);
+  clearCurrentNote();
   await loadDashboard();
+  setDashboardRoute();
 });
 
-async function openNote(id) {
-  if (saveTimer) clearTimeout(saveTimer);
-  if (previewTimer) clearTimeout(previewTimer);
+function showNoteInEditor(data) {
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
-  let data = await getLocalNote(id);
-  if (navigator.onLine && !data?.pending) {
-    const remote = await api(`/api/notes/${encodeURIComponent(id)}`);
-    if (remote) {
-      await cacheRemoteNote(remote);
-      data = remote;
-    }
-  }
-  if (!data) return;
   currentNoteId = data.id;
   currentRevision = data.revision || 0;
   currentBaseRevision = data.base_revision ?? null;
@@ -919,6 +1259,53 @@ async function openNote(id) {
   applyEditorPrefs();
   show(screens.editor);
   updatePreview();
+}
+
+async function openNote(id, {route = 'push'} = {}) {
+  if (saveTimer) clearTimeout(saveTimer);
+  if (previewTimer) clearTimeout(previewTimer);
+  const data = await getLocalNote(id);
+  if (!data) return;
+  showNoteInEditor(data);
+  if (route === 'push') setNoteRoute(id);
+  await showConflictResolverFor(id);
+  // The note is already usable from IndexedDB. Refreshing it is deliberately
+  // background work so opening a note never waits on a round trip.
+  if (navigator.onLine) void syncNow();
+}
+
+function normalizeWikiTitle(title) {
+  return title.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+async function followWikiLink(title) {
+  title = title.trim().replace(/\s+/g, ' ');
+  if (!title) return;
+  if (isDirty) await saveCurrentNote(false);
+  const existing = (await getLocalNotes()).find(note => normalizeWikiTitle(note.title || '') === normalizeWikiTitle(title));
+  if (existing) {
+    await openNote(existing.id);
+    return;
+  }
+  startNewNote(title);
+  await saveCurrentNote(false);
+  showToast(`Created “${title}”.`, 'success');
+  if (navigator.onLine) void syncNow();
+}
+
+async function restoreRoute() {
+  const noteID = noteIDFromLocation();
+  if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
+  if (noteID && await getLocalNote(noteID)) {
+    await openNote(noteID, {route: 'none'});
+    return;
+  }
+  if (noteID) {
+    setDashboardRoute({replace: true});
+    showToast('That note is no longer available.', 'warning');
+  }
+  clearCurrentNote();
+  await loadDashboard({sync: false});
 }
 
 // --- Autosave ---
@@ -972,6 +1359,7 @@ async function saveCurrentNote(trySync = true) {
   currentBaseRevision = baseRevision;
   savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
   isDirty = false;
+  if (noteIDFromLocation() !== currentNoteId) setNoteRoute(currentNoteId);
   setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
   if (trySync && navigator.onLine) await syncNow();
 }
@@ -988,8 +1376,11 @@ function scheduleSave() {
   if (!prefs.autoSave) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    if (isDirty) saveCurrentNote();
-  }, 5000);
+    // The 250ms timer may already have durably saved this edit to IndexedDB
+    // and cleared isDirty. Still call saveCurrentNote: its unchanged-note path
+    // replays the queued operation, which is the intended 2s idle sync.
+    if (!screens.editor.classList.contains('hidden')) void saveCurrentNote();
+  }, 2000);
 }
 
 $('#save-btn').addEventListener('click', () => { if (saveTimer) clearTimeout(saveTimer); saveCurrentNote(); });
@@ -1377,8 +1768,9 @@ $('#delete-btn').addEventListener('click', async () => {
     if (!remainingNotes.some(note => noteHasTag(note, currentTag))) currentTag = null;
   }
   setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
-  if (navigator.onLine) await syncNow();
+  if (navigator.onLine) void syncNow();
   await loadDashboard();
+  setDashboardRoute({replace: true});
 });
 
 // --- Live Preview ---
@@ -1391,6 +1783,48 @@ $('#note-content').addEventListener('input', () => {
 $('#note-content').addEventListener('click', scheduleHighlight);
 $('#note-content').addEventListener('keyup', scheduleHighlight);
 
+function linkifyWikiLinks(container) {
+  const matcher = /\[\[([^\[\]\n]+)\]\]/g;
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!matcher.test(node.nodeValue || '')) return NodeFilter.FILTER_REJECT;
+      matcher.lastIndex = 0;
+      return node.parentElement?.closest('a, code, pre, script, style')
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const text = node.nodeValue || '';
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    matcher.lastIndex = 0;
+    for (let match; (match = matcher.exec(text));) {
+      const title = match[1].trim().replace(/\s+/g, ' ');
+      if (!title) continue;
+      fragment.append(document.createTextNode(text.slice(cursor, match.index)));
+      const link = document.createElement('a');
+      link.className = 'wiki-link';
+      link.href = '/';
+      link.dataset.wikiTitle = title;
+      link.textContent = title;
+      fragment.append(link);
+      cursor = match.index + match[0].length;
+    }
+    fragment.append(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }
+}
+
+$('#preview').addEventListener('click', event => {
+  const link = event.target.closest('a[data-wiki-title]');
+  if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  void followWikiLink(link.dataset.wikiTitle);
+});
+
 function updatePreview() {
   if (!isPreviewVisible()) return;
   const md = $('#note-content').value;
@@ -1400,6 +1834,7 @@ function updatePreview() {
   }
   if (typeof marked !== 'undefined' && marked.parse) {
     $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
+    linkifyWikiLinks($('#preview'));
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
   }
@@ -1514,15 +1949,15 @@ async function init() {
     if (res) {
       cacheAppVersion(res);
       await loadPrefs();
-      await syncNow();
+      await syncNow({reconcile: true});
       connectServerEvents();
-      await loadDashboard();
+      await restoreRoute();
     } else if (localStorage.getItem('mdnotes-offline-ready') === '1') {
       cacheAppVersion();
       await loadPrefs();
       setSyncStatus('offline');
       showOfflineNotice();
-      await loadDashboard();
+      await restoreRoute();
     } else {
       show(screens.login);
       $('#login-form input').focus();
@@ -1550,10 +1985,12 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(error => console.warn('service worker registration failed', error));
 }
 
+window.addEventListener('popstate', () => { void restoreRoute(); });
+
 window.addEventListener('online', async () => {
   connectServerEvents();
-  if (await syncNow({force: true}) && !screens.dashboard.classList.contains('hidden')) {
-    await Promise.all([loadTags(), loadNotes()]);
+  if (await syncNow({force: true, reconcile: true}) && !screens.dashboard.classList.contains('hidden')) {
+    await refreshDashboard();
   }
 });
 
