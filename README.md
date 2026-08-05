@@ -9,7 +9,7 @@ Lightweight, low-resources single-binary markdown files editor with SQLite metad
 - Fullscreen mode for editor or preview panel
 - Tags support with filtering
 - Mobile-friendly responsive layout with dark theme
-- Autosave (5s debounce) with manual save
+- Autosave (2s debounce) with manual save
 - Versioned AES-256-GCM encryption on disk with Argon2id password mode or a random 32-byte key
 - Session-based authentication (MDNOTES_PASSWORD)
 - PWA-ready (manifest, service worker, installable app)
@@ -53,11 +53,15 @@ Before applying pending database migrations, mdnotes creates a consistent SQLite
 
 After signing in online once, mdnotes caches its application shell and notes on the device. You can then reopen the installed PWA without a connection, edit or delete notes, and continue working normally. Changes are stored in the browser's IndexedDB and automatically synchronize whenever connectivity returns, while the app is visible.
 
-While the signed-in app is open, it keeps an authenticated SSE reachability stream to the server. A 25-second heartbeat drives the Online/Offline indicator; a missing heartbeat for 70 seconds is treated as offline, and reconnection immediately runs normal HTTP sync.
+Open notes use their note ID as the route (`/<note-id>`), so browser navigation and bookmarks return to the same note. The server serves the application shell for valid note routes; access still requires the usual session.
+
+The preview recognizes `[[Wiki Links]]`: clicking a matching note title opens that note, while an unmatched title creates and opens a new note with that title.
+
+While the signed-in app is open, it keeps an authenticated SSE stream to the server. A 25-second heartbeat drives the Online/Offline indicator, and content-free change hints trigger normal HTTP sync promptly on other open devices. A missing heartbeat for 70 seconds is treated as offline, and reconnection runs a full cache reconciliation before replaying local work.
 
 Sync history is bounded for small deployments: the server retains up to 100,000 change records and acknowledgements, and caps stored full operation payloads at 32 MiB. A device older than the retained change feed performs a full server refresh before replaying any local work; old acknowledged retries receive a safe compacted acknowledgement and rebase from the server state.
 
-If the same note changed on another device while you were offline, mdnotes first performs a three-way merge using the shared base version, your local version, and the server version. Non-overlapping line edits and one-sided title/tag changes are merged and synchronized automatically. Ambiguous overlapping edits remain safe: mdnotes keeps the server version and creates a separately titled `conflict copy` for your local edits. Signing out removes the locally cached notes and queued changes from that browser. Offline copies are plaintext in the browser profile, so use a protected device and sign out on shared devices.
+If the same note changed on another device while you were offline, mdnotes first performs a three-way merge using the shared base version, your local version, and the server version. Non-overlapping line edits and one-sided title/tag changes are merged and synchronized automatically. For ambiguous overlapping edits, mdnotes preserves both versions and opens a conflict resolver with the common original, highlighted device versions, and an editable result; you can also explicitly keep your version as a separately titled `conflict copy`. Signing out removes the locally cached notes and queued changes from that browser. Offline copies are plaintext in the browser profile, so use a protected device and sign out on shared devices.
 
 ## Build
 

@@ -75,11 +75,15 @@ func gzipMiddleware(next http.Handler) http.Handler {
 func staticCacheMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/", "/index.html", "/sw.js", "/manifest.json":
+		case "/", "/index.html", "/sw.js", "/manifest.json", "/app.js", "/style.css", "/merge.js", "/marked.min.js":
 			// Cloudflare respects no-transform and therefore cannot inject its
 			// Web Analytics script into our strictly CSP-protected app shell.
 			w.Header().Set("Cache-Control", "no-cache, no-transform")
 		default:
+			if noteIDPattern.MatchString(strings.TrimPrefix(r.URL.Path, "/")) {
+				w.Header().Set("Cache-Control", "no-cache, no-transform")
+				break
+			}
 			w.Header().Set("Cache-Control", "public, max-age=86400, no-transform")
 		}
 		next.ServeHTTP(w, r)
@@ -188,6 +192,7 @@ func main() {
 		encryption: encryption,
 		noteCache:  newNoteCache(),
 		rl:         rl,
+		events:     newEventBroker(),
 	}
 	if err := app.recoverFileOperations(); err != nil {
 		log.Fatalf("recover pending file operations: %v", err)
@@ -224,7 +229,22 @@ func main() {
 		log.Fatalf("static fs: %v", err)
 	}
 	fileServer := staticCacheMiddleware(http.FileServer(http.FS(sub)))
-	mux.Handle("GET /", fileServer)
+	appShell := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve the SPA shell for validated note URLs so a bookmarked /<id>
+		// route survives refresh, while unknown paths still behave like static
+		// file requests and return 404.
+		if r.URL.Path != "/" && noteIDPattern.MatchString(strings.TrimPrefix(r.URL.Path, "/")) {
+			request := r.Clone(r.Context())
+			url := *r.URL
+			url.Path = "/"
+			url.RawPath = ""
+			request.URL = &url
+			fileServer.ServeHTTP(w, request)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+	mux.Handle("GET /", appShell)
 
 	srv := &http.Server{
 		Addr:         ":" + port,
