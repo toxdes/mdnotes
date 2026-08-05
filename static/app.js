@@ -1104,15 +1104,21 @@ function connectServerEvents() {
   events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
   events.onopen = () => { void handleServerHeartbeat(); };
   events.onerror = () => {
-    if (serverEvents === events) markServerOffline();
+    // EventSource emits error for its normal reconnect cycle too, especially
+    // when Android briefly backgrounds a tab. It is not enough evidence to
+    // label the whole app offline; regular HTTP sync remains authoritative.
+    if (serverEvents === events) serverHeartbeatAt = 0;
   };
   if (!serverEventsWatchdog) {
     serverEventsWatchdog = setInterval(() => {
       if (!serverEvents || Date.now() - serverHeartbeatAt <= sseStaleAfterMs) return;
       serverEvents.close();
       serverEvents = null;
-      markServerOffline();
-      connectServerEvents();
+      // A missing heartbeat is a prompt to verify with real authenticated
+      // HTTP, not an offline verdict by itself.
+      void syncNow({reconcile: true}).then(synced => {
+        if (synced) connectServerEvents();
+      });
     }, 5000);
   }
 }
