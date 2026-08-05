@@ -145,6 +145,55 @@ SOFTWARE.
     </div>
   </div>
 
+  <div id="conflict-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+    <div class="modal-backdrop"></div>
+    <div class="modal-body conflict-modal-body">
+      <h3 id="conflict-title">Resolve conflicting edits</h3>
+      <p class="conflict-intro">This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.</p>
+      <div class="conflict-fields">
+        <label class="meta-field">
+          <span class="input-label">Title to save</span>
+          <input type="text" id="conflict-note-title" autocomplete="off">
+        </label>
+        <label class="meta-field">
+          <span class="input-label">Tags to save</span>
+          <input type="text" id="conflict-note-tags" autocomplete="off">
+        </label>
+      </div>
+      <div class="conflict-metadata-compare" aria-label="Conflicting title and tags">
+        <section><strong>This device</strong><span id="conflict-local-metadata"></span></section>
+        <section><strong>Other device</strong><span id="conflict-remote-metadata"></span></section>
+      </div>
+      <div class="conflict-compare" aria-label="Conflicting note content">
+        <section class="conflict-version conflict-version-local">
+          <h4>This device</h4>
+          <pre id="conflict-local-diff"></pre>
+          <button id="conflict-use-local" class="btn-text conflict-select" type="button" aria-pressed="true">Use this device</button>
+        </section>
+        <section class="conflict-version conflict-version-remote">
+          <h4>Other device</h4>
+          <pre id="conflict-remote-diff"></pre>
+          <button id="conflict-use-remote" class="btn-text conflict-select" type="button" aria-pressed="false">Use other device</button>
+        </section>
+      </div>
+      <p id="conflict-selection-status" class="conflict-selection-status" aria-live="polite">Selected: this device. You can edit the result below.</p>
+      <label class="meta-field conflict-result">
+        <span class="input-label">Merged note to save</span>
+        <textarea id="conflict-note-content" spellcheck="true"></textarea>
+      </label>
+      <details class="conflict-base">
+        <summary>Show the common original</summary>
+        <pre id="conflict-base-content"></pre>
+      </details>
+      <div class="conflict-actions">
+        <button id="conflict-copy" class="btn-text" type="button">Keep as copy</button>
+        <span class="conflict-actions-spacer"></span>
+        <button id="conflict-later" class="btn-text" type="button">Resolve later</button>
+        <button id="conflict-save" class="btn-primary" type="button">Save resolution</button>
+      </div>
+    </div>
+  </div>
+
   <div id="editor" class="hidden">
     <header>
       <button id="back-btn" class="btn-text"><svg class="icon" aria-hidden="true"><use href="#icon-arrow-left"></use></svg>Back</button>

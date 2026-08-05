@@ -6,8 +6,8 @@
   'use strict';
 
   // A quadratic line diff is a deliberately conservative trade-off here. Large
-  // notes fall back to a conflict copy instead of tying up the browser trying
-  // to guess at a merge.
+  // notes fall back to the durable conflict resolver instead of tying up the
+  // browser trying to guess at a merge.
   const maxDiffCells = 1000000;
 
   function equalArrays(left, right) {
