@@ -27,6 +27,8 @@ let currentBaseRevision = null;
 let syncInFlight = false;
 let syncingQueueOperationID = null;
 let lastSyncProblem = '';
+let lastSyncDiagnostic = '';
+let lastSyncResponseStatus = 0;
 let authenticationRequired = false;
 let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
 let panelWide = false;
@@ -416,10 +418,21 @@ function showUpdateAvailable() {
   updateToast = toast;
 }
 
+function setSyncDiagnostic(detail, responseStatus = 0) {
+  lastSyncDiagnostic = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+  lastSyncResponseStatus = Number.isInteger(responseStatus) ? responseStatus : 0;
+}
+
+function clearSyncDiagnostic() {
+  lastSyncDiagnostic = '';
+  lastSyncResponseStatus = 0;
+}
+
 function showOfflineNotice(checking = false) {
   $$('.offline-notice').forEach(notice => {
     notice.classList.remove('hidden');
-    notice.querySelector('.offline-notice-message').textContent = checking ? 'Checking…' : "You're offline. Your changes are saved on this device.";
+    const detail = lastSyncDiagnostic ? `Sync failed: ${lastSyncDiagnostic}. ` : '';
+    notice.querySelector('.offline-notice-message').textContent = checking ? 'Checking…' : `${detail}Your changes are saved on this device.`;
     const retry = notice.querySelector('.offline-retry');
     retry.classList.toggle('hidden', checking);
     retry.disabled = checking;
@@ -470,6 +483,7 @@ function requireAuthentication() {
 }
 
 async function api(path, opts) {
+  const method = opts?.method || 'GET';
   try {
     const res = await fetch(path, {
       credentials: 'same-origin',
@@ -477,33 +491,44 @@ async function api(path, opts) {
       ...opts,
     });
     if (res.status === 401) {
+      setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
       requireAuthentication();
       return null;
     }
     if (res.status === 204) return true;
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(text || res.statusText);
+      const error = new Error(text || res.statusText);
+      error.responseStatus = res.status;
+      throw error;
     }
     return await res.json();
   } catch(e) {
+    setSyncDiagnostic(`${method} ${path} ${e?.responseStatus ? `returned HTTP ${e.responseStatus}` : 'failed'}: ${e?.message || 'unknown error'}`, e?.responseStatus);
     console.error(e);
     return null;
   }
 }
 
 async function syncFetch(path, options) {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    headers: options?.body ? {'Content-Type': 'application/json'} : {},
-    ...options,
-  });
-  const body = response.status === 204 ? null : await response.text();
-  let data = null;
-  if (body) {
-    try { data = JSON.parse(body); } catch (_) { data = body; }
+  const method = options?.method || 'GET';
+  try {
+    const response = await fetch(path, {
+      credentials: 'same-origin',
+      headers: options?.body ? {'Content-Type': 'application/json'} : {},
+      ...options,
+    });
+    const body = response.status === 204 ? null : await response.text();
+    let data = null;
+    if (body) {
+      try { data = JSON.parse(body); } catch (_) { data = body; }
+    }
+    if (!response.ok) setSyncDiagnostic(`${method} ${path} returned HTTP ${response.status}: ${typeof data === 'string' ? data : response.statusText}`, response.status);
+    return {response, data};
+  } catch (error) {
+    setSyncDiagnostic(`${method} ${path} failed: ${error?.message || 'unknown error'}`);
+    throw error;
   }
-  return {response, data};
 }
 
 async function cacheRemoteNote(note) {
@@ -524,6 +549,15 @@ async function cacheRemoteNote(note) {
   }
 }
 
+async function applyRemoteDeletion(noteID) {
+  await removeLocalNote(noteID);
+  if (currentNoteId === noteID && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
 async function pullRemoteChanges() {
   let since = Number(await getOfflineState('syncSequence') || 0);
   for (;;) {
@@ -536,16 +570,20 @@ async function pullRemoteChanges() {
     for (const change of page.changes) {
       if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
       if (change.deleted) {
-        await removeLocalNote(change.note_id);
-        if (currentNoteId === change.note_id && !isDirty) {
-          currentNoteId = null;
-          await loadDashboard({sync: false});
-          setDashboardRoute({replace: true});
-        }
+        await applyRemoteDeletion(change.note_id);
         continue;
       }
       const remote = await api(`/api/notes/${encodeURIComponent(change.note_id)}`);
-      if (!remote) throw new Error('could not download changed note');
+      if (!remote) {
+        // The feed records history. A save entry can therefore be followed by
+        // a later deletion before this device asks for the current note. A
+        // 404 is the authoritative final state, not a sync failure.
+        if (lastSyncResponseStatus === 404) {
+          await applyRemoteDeletion(change.note_id);
+          continue;
+        }
+        throw new Error('could not download changed note');
+      }
       await cacheRemoteNote(remote);
     }
     since = Number(page.nextSequence || since);
@@ -1006,6 +1044,7 @@ async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
     await flushPendingChanges();
     await pullRemoteChanges();
     localStorage.setItem('mdnotes-offline-ready', '1');
+    clearSyncDiagnostic();
     syncFailed = false;
     setSyncStatus('online');
     if (!preserveSnackbar) hideOfflineNotice();
@@ -1013,6 +1052,7 @@ async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
     return true;
   } catch (error) {
     console.warn('sync failed', error);
+    if (!lastSyncDiagnostic) setSyncDiagnostic(error?.message || 'unknown sync error', error?.responseStatus);
     if (authenticationRequired) {
       // An expired or unavailable session is actionable, and is distinct from
       // losing network access. In particular, do not mask it with an offline
@@ -1027,7 +1067,8 @@ async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
     // A 4xx response proves that this server is reachable. Keeping the UI in
     // Offline in that case hides the actionable problem and makes retrying
     // misleading. Network failures and unavailable servers still use Offline.
-    if (error?.responseStatus >= 400 && error.responseStatus < 500) {
+    const responseStatus = error?.responseStatus || lastSyncResponseStatus;
+    if (responseStatus >= 400 && responseStatus < 500) {
       syncFailed = false;
       setSyncStatus('online');
       hideOfflineNotice();
@@ -1138,6 +1179,7 @@ function disconnectServerEvents() {
 $('#login-form').addEventListener('submit', async e => {
   e.preventDefault();
   authenticationRequired = false;
+  clearSyncDiagnostic();
   const pw = e.target.password.value;
   const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
   if (res) {
