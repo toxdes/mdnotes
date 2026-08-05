@@ -86,6 +86,7 @@ var migrations = []migration{
 	{version: 8, up: migrateSyncOperationsSchema},
 	{version: 9, up: migrateSyncOperationPayloadSchema},
 	{version: 10, up: migrateFileOperationSchema},
+	{version: 11, up: migrateClearLegacyIPBans},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -289,6 +290,14 @@ func migrateRateLimitSchema(tx *sql.Tx) error {
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY (ip, typ)
 		);`)
+	return err
+}
+
+// Earlier releases made both failed-login and missing-asset bans permanent.
+// A stale service-worker request could therefore lock a legitimate user out.
+// Rate limiting is now in-memory and temporary, so clear the legacy state.
+func migrateClearLegacyIPBans(tx *sql.Tx) error {
+	_, err := tx.Exec("DELETE FROM ip_bans; DELETE FROM rate_limits")
 	return err
 }
 

@@ -6,8 +6,52 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
+
+// eventBroker fans out small, content-free change hints. The durable sync API
+// remains authoritative, so a dropped hint is harmless and the client can
+// always catch up on its next normal sync.
+type eventBroker struct {
+	mu          sync.Mutex
+	subscribers map[chan struct{}]struct{}
+}
+
+func newEventBroker() *eventBroker {
+	return &eventBroker{subscribers: make(map[chan struct{}]struct{})}
+}
+
+func (b *eventBroker) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	b.mu.Lock()
+	b.subscribers[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *eventBroker) unsubscribe(ch chan struct{}) {
+	b.mu.Lock()
+	delete(b.subscribers, ch)
+	b.mu.Unlock()
+}
+
+func (b *eventBroker) publish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.subscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (a *app) publishChange() {
+	if a.events != nil {
+		a.events.publish()
+	}
+}
 
 const (
 	sseHeartbeatInterval = 25 * time.Second
@@ -17,6 +61,11 @@ const (
 
 func writeSSEHeartbeat(w io.Writer) error {
 	_, err := io.WriteString(w, "event: heartbeat\ndata: {}\n\n")
+	return err
+}
+
+func writeSSEChange(w io.Writer) error {
+	_, err := io.WriteString(w, "event: change\ndata: {}\n\n")
 	return err
 }
 
@@ -37,9 +86,8 @@ func setSSEWriteDeadline(w http.ResponseWriter) error {
 	return err
 }
 
-// handleEvents keeps a lightweight authenticated stream open solely to report
-// server reachability. Mutations continue to use the regular replayable HTTP
-// sync API; no note content travels through this endpoint.
+// handleEvents keeps an authenticated stream open for reachability and tiny
+// change hints. Mutations and note content continue to use normal HTTP sync.
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -57,6 +105,11 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	var changes chan struct{}
+	if a.events != nil {
+		changes = a.events.subscribe()
+		defer a.events.unsubscribe(changes)
+	}
 	if _, err := io.WriteString(w, "retry: 3000\n\n"); err != nil {
 		return
 	}
@@ -79,6 +132,14 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := writeSSEHeartbeat(w); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-changes:
+			if err := setSSEWriteDeadline(w); err != nil {
+				return
+			}
+			if err := writeSSEChange(w); err != nil {
 				return
 			}
 			flusher.Flush()
