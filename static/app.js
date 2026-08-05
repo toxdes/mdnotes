@@ -27,6 +27,7 @@ let currentBaseRevision = null;
 let syncInFlight = false;
 let syncingQueueOperationID = null;
 let lastSyncProblem = '';
+let authenticationRequired = false;
 let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
 let panelWide = false;
 let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
@@ -462,6 +463,12 @@ function clearCurrentNote() {
   isDirty = false;
 }
 
+function requireAuthentication() {
+  authenticationRequired = true;
+  show(screens.login);
+  $('#login-form input').focus();
+}
+
 async function api(path, opts) {
   try {
     const res = await fetch(path, {
@@ -470,8 +477,7 @@ async function api(path, opts) {
       ...opts,
     });
     if (res.status === 401) {
-      show(screens.login);
-      $('#login-form input').focus();
+      requireAuthentication();
       return null;
     }
     if (res.status === 204) return true;
@@ -931,7 +937,12 @@ async function flushPendingChanges() {
     } finally {
       syncingQueueOperationID = null;
     }
-    if (result.response.status === 401) throw new Error('sign in required to sync');
+    if (result.response.status === 401) {
+      requireAuthentication();
+      const error = new Error('sign in required to sync');
+      error.responseStatus = 401;
+      throw error;
+    }
     if (result.response.status === 409) {
       const expected = Number(result.data?.expected_sequence);
       if (await repairSyncSequenceGap(expected)) {
@@ -977,8 +988,11 @@ async function flushPendingChanges() {
   }
 }
 
-async function syncNow({force = false, preserveSnackbar = false, reconcile = false} = {}) {
-  if ((!navigator.onLine && !force) || syncInFlight) return false;
+async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
+  // Network requests and the authenticated SSE heartbeat are authoritative.
+  // navigator.onLine is only an unreliable browser hint, particularly in an
+  // installed mobile PWA, so it must never prevent a requested sync.
+  if (syncInFlight) return false;
   syncInFlight = true;
   setSyncStatus('syncing');
   const wasOffline = syncFailed;
@@ -999,6 +1013,17 @@ async function syncNow({force = false, preserveSnackbar = false, reconcile = fal
     return true;
   } catch (error) {
     console.warn('sync failed', error);
+    if (authenticationRequired) {
+      // An expired or unavailable session is actionable, and is distinct from
+      // losing network access. In particular, do not mask it with an offline
+      // screen just because this browser has an offline cache.
+      syncFailed = false;
+      setSyncStatus('online');
+      hideOfflineNotice();
+      requireAuthentication();
+      $('#login-error').textContent = 'Your session expired. Sign in again.';
+      return false;
+    }
     // A 4xx response proves that this server is reachable. Keeping the UI in
     // Offline in that case hides the actionable problem and makes retrying
     // misleading. Network failures and unavailable servers still use Offline.
@@ -1042,7 +1067,7 @@ async function handleServerHeartbeat() {
     if (!syncInFlight) setSyncStatus('online');
     return;
   }
-  const synced = await syncNow({force: true, reconcile: true});
+  const synced = await syncNow({reconcile: true});
   if (synced && !screens.dashboard.classList.contains('hidden')) {
     await refreshDashboard();
   }
@@ -1058,7 +1083,7 @@ function scheduleServerChangeSync() {
       return;
     }
     serverChangePending = false;
-    const synced = await syncNow({force: true});
+    const synced = await syncNow();
     if (synced && !screens.dashboard.classList.contains('hidden')) await refreshDashboard();
     if (serverChangePending) scheduleServerChangeSync();
   }, 75);
@@ -1106,6 +1131,7 @@ function disconnectServerEvents() {
 // --- Auth ---
 $('#login-form').addEventListener('submit', async e => {
   e.preventDefault();
+  authenticationRequired = false;
   const pw = e.target.password.value;
   const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
   if (res) {
@@ -1224,7 +1250,7 @@ function startNewNote(title = '') {
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
   renderedPreviewSource = null;
-  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
+  setSyncStatus(syncFailed ? 'offline' : 'online');
   cachePreviewBlocks();
   applyEditorPrefs();
   show(screens.editor);
@@ -1255,7 +1281,7 @@ function showNoteInEditor(data) {
   $('#note-title').value = data.title || '';
   $('#note-tags').value = data.tags || '';
   $('#note-content').value = data.content || '';
-  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
+  setSyncStatus(syncFailed ? 'offline' : 'online');
   applyEditorPrefs();
   show(screens.editor);
   updatePreview();
@@ -1271,7 +1297,7 @@ async function openNote(id, {route = 'push'} = {}) {
   await showConflictResolverFor(id);
   // The note is already usable from IndexedDB. Refreshing it is deliberately
   // background work so opening a note never waits on a round trip.
-  if (navigator.onLine) void syncNow();
+  void syncNow();
 }
 
 function normalizeWikiTitle(title) {
@@ -1290,7 +1316,7 @@ async function followWikiLink(title) {
   startNewNote(title);
   await saveCurrentNote(false);
   showToast(`Created “${title}”.`, 'success');
-  if (navigator.onLine) void syncNow();
+  void syncNow();
 }
 
 async function restoreRoute() {
@@ -1325,7 +1351,7 @@ async function saveCurrentNote(trySync = true) {
 
   if (currentNoteId && data.title === savedSnapshot.title && data.tags === savedSnapshot.tags && data.content === savedSnapshot.content) {
     isDirty = false;
-    if (trySync && navigator.onLine) await syncNow();
+    if (trySync) await syncNow();
     return;
   }
   if (!currentNoteId) currentNoteId = newLocalNoteID();
@@ -1360,8 +1386,8 @@ async function saveCurrentNote(trySync = true) {
   savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
   isDirty = false;
   if (noteIDFromLocation() !== currentNoteId) setNoteRoute(currentNoteId);
-  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
-  if (trySync && navigator.onLine) await syncNow();
+  setSyncStatus(syncFailed ? 'offline' : 'online');
+  if (trySync) await syncNow();
 }
 
 let saveTimer = null;
@@ -1767,8 +1793,8 @@ $('#delete-btn').addEventListener('click', async () => {
     const remainingNotes = await getLocalNotes();
     if (!remainingNotes.some(note => noteHasTag(note, currentTag))) currentTag = null;
   }
-  setSyncStatus(syncFailed || !navigator.onLine ? 'offline' : 'online');
-  if (navigator.onLine) void syncNow();
+  setSyncStatus(syncFailed ? 'offline' : 'online');
+  void syncNow();
   await loadDashboard();
   setDashboardRoute({replace: true});
 });
@@ -1903,7 +1929,7 @@ async function savePref(key, value) {
   localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
   await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
   applyEditorPrefs();
-  if (navigator.onLine) syncNow();
+  void syncNow();
 }
 
 $('#pref-autosave').addEventListener('change', function () {
@@ -1952,6 +1978,9 @@ async function init() {
       await syncNow({reconcile: true});
       connectServerEvents();
       await restoreRoute();
+    } else if (authenticationRequired) {
+      // api() has already displayed the sign-in screen. A cached offline copy
+      // must never override that when the server explicitly returned 401.
     } else if (localStorage.getItem('mdnotes-offline-ready') === '1') {
       cacheAppVersion();
       await loadPrefs();
@@ -1976,7 +2005,7 @@ init();
 
 $$('.offline-retry').forEach(retry => retry.addEventListener('click', async () => {
   showOfflineNotice(true);
-  const ok = await syncNow({force: true, preserveSnackbar: true});
+  const ok = await syncNow({preserveSnackbar: true});
   if (ok) showSyncCompleteToast();
 }));
 
@@ -1989,13 +2018,9 @@ window.addEventListener('popstate', () => { void restoreRoute(); });
 
 window.addEventListener('online', async () => {
   connectServerEvents();
-  if (await syncNow({force: true, reconcile: true}) && !screens.dashboard.classList.contains('hidden')) {
+  if (await syncNow({reconcile: true}) && !screens.dashboard.classList.contains('hidden')) {
     await refreshDashboard();
   }
-});
-
-window.addEventListener('offline', () => {
-  markServerOffline();
 });
 
 document.addEventListener('visibilitychange', () => {
