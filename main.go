@@ -32,6 +32,7 @@ var frontendRevisionFiles = []string{
 	"static/index.html",
 	"static/style.css",
 	"static/app.js",
+	"static/themes.js",
 	"static/merge.js",
 	"static/marked.min.js",
 	"static/manifest.json",
@@ -83,7 +84,7 @@ func gzipMiddleware(next http.Handler) http.Handler {
 func staticCacheMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/", "/index.html", "/sw.js", "/manifest.json", "/app.js", "/style.css", "/merge.js", "/marked.min.js":
+		case "/", "/index.html", "/sw.js", "/manifest.json", "/app.js", "/style.css", "/themes.js", "/merge.js", "/marked.min.js":
 			// Cloudflare respects no-transform and therefore cannot inject its
 			// Web Analytics script into our strictly CSP-protected app shell.
 			w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -102,7 +103,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; font-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; img-src 'self' https: data:; connect-src 'self' https://fonts.googleapis.com; worker-src 'self'; manifest-src 'self'; font-src 'self' https://fonts.gstatic.com")
 		next.ServeHTTP(w, r)
 	})
 }
