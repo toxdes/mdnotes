@@ -15,41 +15,41 @@ import (
 // always catch up on its next normal sync.
 type eventBroker struct {
 	mu          sync.Mutex
-	subscribers map[chan struct{}]struct{}
+	subscribers map[chan string]struct{}
 }
 
 func newEventBroker() *eventBroker {
-	return &eventBroker{subscribers: make(map[chan struct{}]struct{})}
+	return &eventBroker{subscribers: make(map[chan string]struct{})}
 }
 
-func (b *eventBroker) subscribe() chan struct{} {
-	ch := make(chan struct{}, 1)
+func (b *eventBroker) subscribe() chan string {
+	ch := make(chan string, 1)
 	b.mu.Lock()
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
 	return ch
 }
 
-func (b *eventBroker) unsubscribe(ch chan struct{}) {
+func (b *eventBroker) unsubscribe(ch chan string) {
 	b.mu.Lock()
 	delete(b.subscribers, ch)
 	b.mu.Unlock()
 }
 
-func (b *eventBroker) publish() {
+func (b *eventBroker) publish(kind string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for ch := range b.subscribers {
 		select {
-		case ch <- struct{}{}:
+		case ch <- kind:
 		default:
 		}
 	}
 }
 
-func (a *app) publishChange() {
+func (a *app) publishChange(kind string) {
 	if a.events != nil {
-		a.events.publish()
+		a.events.publish(kind)
 	}
 }
 
@@ -64,8 +64,12 @@ func writeSSEHeartbeat(w io.Writer) error {
 	return err
 }
 
-func writeSSEChange(w io.Writer) error {
-	_, err := io.WriteString(w, "event: change\ndata: {}\n\n")
+func writeSSEChange(w io.Writer, kind string) error {
+	data, err := json.Marshal(map[string]string{"type": kind})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "event: change\ndata: %s\n\n", data)
 	return err
 }
 
@@ -105,7 +109,7 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	var changes chan struct{}
+	var changes chan string
 	if a.events != nil {
 		changes = a.events.subscribe()
 		defer a.events.unsubscribe(changes)
@@ -135,11 +139,11 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
-		case <-changes:
+		case kind := <-changes:
 			if err := setSSEWriteDeadline(w); err != nil {
 				return
 			}
-			if err := writeSSEChange(w); err != nil {
+			if err := writeSSEChange(w, kind); err != nil {
 				return
 			}
 			flusher.Flush()

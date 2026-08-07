@@ -345,7 +345,7 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write failed", http.StatusInternalServerError)
 		return
 	}
-	a.publishChange()
+	a.publishChange("notes")
 	writeJSON(w, n)
 }
 
@@ -379,7 +379,7 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	a.publishChange()
+	a.publishChange("notes")
 	w.WriteHeader(http.StatusNoContent)
 }
 

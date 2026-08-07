@@ -18,7 +18,17 @@ let currentTag = null;
 let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
-let prefs = { autoSave: true, hidePreview: false, hideHeaderOnFullscreen: false, hideToolbar: false, collapseDetails: false, hideCursorHighlight: false };
+const DEFAULT_PREFS = {autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
+const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
+const FONT_CACHE_NAME = 'mdnotes-fonts';
+const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+const SYSTEM_SERIF_STACK = 'ui-serif,Georgia,Cambria,"Times New Roman",Times,serif';
+const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace';
+const SYSTEM_FONT_OPTIONS = [{value:'system-sans',label:'System (Sans)'}, {value:'system-serif',label:'System (Serif)'}, {value:'system-monospace',label:'System (Monospace)'}];
+let prefs = {...DEFAULT_PREFS};
+let fontAvailability = 'checking';
+let fontLoadGeneration = 0;
+let fontApplyQueue = Promise.resolve();
 let renderedPreviewSource = null;
 let previewCheckFrame = null;
 let highlightFrame = null;
@@ -902,7 +912,25 @@ let activeConflictSelection = 'local';
 function closeConflictResolver() {
   activeConflictID = null;
   activeConflictSelection = 'local';
-  $('#conflict-modal').classList.add('hidden');
+  closeModal($('#conflict-modal'));
+}
+
+function openModal(modal) {
+  modal.classList.remove('hidden', 'is-closing');
+}
+
+function closeModal(modal) {
+  if (modal.classList.contains('hidden') || modal.classList.contains('is-closing')) return;
+  modal.classList.add('is-closing');
+  const finish = () => {
+    modal.classList.remove('is-closing');
+    modal.classList.add('hidden');
+  };
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    finish();
+  } else {
+    window.setTimeout(finish, 170);
+  }
 }
 
 function setConflictSelection(selection) {
@@ -931,7 +959,7 @@ function showConflictResolver(conflict) {
   renderConflictDiff($('#conflict-remote-diff'), conflict.base.content, conflict.remote.content, 'conflict-line-remote');
   $('#conflict-base-content').textContent = conflict.base.content || '(empty note)';
   setConflictSelection('local');
-  $('#conflict-modal').classList.remove('hidden');
+  openModal($('#conflict-modal'));
   $('#conflict-note-content').focus();
 }
 
@@ -1072,6 +1100,7 @@ $('#conflict-use-remote').addEventListener('click', async () => {
 $('#conflict-save').addEventListener('click', () => { void saveConflictResolution(); });
 $('#conflict-copy').addEventListener('click', () => { void keepConflictAsCopy(); });
 $('#conflict-later').addEventListener('click', closeConflictResolver);
+$('#conflict-close').addEventListener('click', closeConflictResolver);
 $('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
 
 async function acknowledgeCompactedOperation(operation) {
@@ -1336,8 +1365,11 @@ function connectServerEvents() {
   events.addEventListener('server', event => {
     try { cacheAppVersion(JSON.parse(event.data)); } catch (_) {}
   });
-  events.addEventListener('change', () => {
+  events.addEventListener('change', event => {
     serverHeartbeatAt = Date.now();
+    try {
+      if (JSON.parse(event.data).type === 'preferences') void loadPrefs();
+    } catch (_) {}
     scheduleServerChangeSync();
   });
   events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
@@ -1922,6 +1954,11 @@ function setPanelState(state) {
 }
 
 $('#editor-panels').addEventListener('click', e => {
+  const switchButton = e.target.closest('.panel-switch');
+  if (switchButton) {
+    setPanelState(switchButton.dataset.panelSwitch);
+    return;
+  }
   const widthButton = e.target.closest('.panel-width');
   if (widthButton) {
     if (panelState !== 'both') {
@@ -2128,29 +2165,156 @@ function formatDate(iso) {
   return d.toLocaleDateString(undefined, {month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'});
 }
 
-// --- Theme ---
-function setTheme(dark) {
-  const root = document.documentElement;
-  root.classList.toggle('dark', dark);
-  $$('.theme-btn use').forEach(el => el.setAttribute('href', dark ? '#icon-moon' : '#icon-sun'));
-  localStorage.setItem('theme', dark ? 'dark' : 'light');
+// --- Theme and appearance ---
+const themeDefinitions = Array.isArray(window.MDNotesThemes) ? window.MDNotesThemes : [];
+const themeByID = new Map(themeDefinitions.map(theme => [theme.id, theme]));
+
+function kebabCase(value) {
+  return value.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
 }
 
-function toggleTheme() {
-  setTheme(!document.documentElement.classList.contains('dark'));
+function validAccentColor(value) {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '';
 }
 
-// Apply saved or system theme
-(function initTheme() {
+function legacyThemeID() {
   const saved = localStorage.getItem('theme');
-  if (saved) {
-    setTheme(saved === 'dark');
-  } else {
-    setTheme(window.matchMedia('(prefers-color-scheme:dark)').matches);
-  }
-})();
+  if (saved === 'dark') return 'default-dark';
+  if (saved === 'light') return 'default-light';
+  return window.matchMedia('(prefers-color-scheme:dark)').matches ? 'default-dark' : 'default-light';
+}
 
-// --- Preferences ---
+function normalizePrefs(value = {}, fallback = {}) {
+  const merged = {...DEFAULT_PREFS, ...fallback, ...value};
+  if (!value.theme && !fallback.theme) merged.theme = legacyThemeID();
+  if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
+  if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
+  ['fontFamily', 'editorFontFamily', 'previewFontFamily'].forEach(key => {
+    if (merged[key] === 'system') merged[key] = key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
+    if (!['system-sans', 'system-serif', 'system-monospace', ...FONT_OPTIONS].includes(merged[key])) merged[key] = DEFAULT_PREFS[key];
+  });
+  return merged;
+}
+
+function applyTheme(themeID = prefs.theme) {
+  const theme = themeByID.get(themeID) || themeByID.get('default-light');
+  const root = document.documentElement;
+  root.dataset.theme = theme.id;
+  root.classList.toggle('dark', Boolean(theme.dark));
+  Object.entries(theme.vars).forEach(([name, value]) => root.style.setProperty(`--${kebabCase(name)}`, value));
+  if (prefs.accentColor) {
+    root.style.setProperty('--accent', prefs.accentColor);
+    root.style.setProperty('--accent-hover', 'color-mix(in srgb,var(--accent) 82%,#000)');
+  }
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme.vars.bg);
+}
+
+function fontCSSURL(fontFamily) {
+  const family = encodeURIComponent(fontFamily).replace(/%20/g, '+');
+  return `https://fonts.googleapis.com/css2?family=${family}:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600;1,700&display=swap`;
+}
+
+function isSystemFont(fontFamily) {
+  return ['system-sans', 'system-serif', 'system-monospace'].includes(fontFamily);
+}
+
+function systemFontStack(fontFamily) {
+  if (fontFamily === 'system-serif') return SYSTEM_SERIF_STACK;
+  if (fontFamily === 'system-monospace') return SYSTEM_MONO_STACK;
+  return SYSTEM_FONT_STACK;
+}
+
+async function clearFontCache() {
+  if ('caches' in window) await caches.delete(FONT_CACHE_NAME).catch(() => {});
+}
+
+const FONT_SLOTS = [
+  {preference:'fontFamily', variable:'--font'},
+  {preference:'editorFontFamily', variable:'--editor-font'},
+  {preference:'previewFontFamily', variable:'--preview-font'},
+];
+
+function removeLoadedFonts() {
+  document.querySelectorAll('[data-mdnotes-font]').forEach(link => link.remove());
+  FONT_SLOTS.forEach(slot => document.documentElement.style.setProperty(slot.variable, systemFontStack(prefs[slot.preference])));
+}
+
+async function applyFontsNow(clearCache = false) {
+  const generation = ++fontLoadGeneration;
+  if (clearCache) await clearFontCache();
+  removeLoadedFonts();
+  const families = [...new Set(FONT_SLOTS.map(slot => prefs[slot.preference]).filter(font => font && !isSystemFont(font)))];
+  const loaded = new Map();
+  await Promise.all(families.map(async fontFamily => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.dataset.mdnotesFont = fontFamily;
+    link.href = fontCSSURL(fontFamily);
+    document.head.append(link);
+    try {
+      await new Promise((resolve, reject) => {
+        link.addEventListener('load', resolve, {once:true});
+        link.addEventListener('error', reject, {once:true});
+        setTimeout(() => reject(new Error('font load timed out')), 5000);
+      });
+      await document.fonts.load(`1rem "${fontFamily}"`);
+      loaded.set(fontFamily, true);
+    } catch (error) {
+      link.remove();
+      console.warn(`font unavailable: ${fontFamily}`, error);
+    }
+  }));
+  if (generation !== fontLoadGeneration) return;
+  FONT_SLOTS.forEach(slot => {
+    const fontFamily = prefs[slot.preference];
+    if (!isSystemFont(fontFamily) && loaded.has(fontFamily)) document.documentElement.style.setProperty(slot.variable, `"${fontFamily}",${SYSTEM_FONT_STACK}`);
+  });
+}
+
+function applyFonts(clearCache = false) {
+  const run = fontApplyQueue.then(() => applyFontsNow(clearCache));
+  fontApplyQueue = run.catch(() => {});
+  return run;
+}
+
+function renderThemeOptions() {
+  const select = $('#pref-theme');
+  select.innerHTML = themeDefinitions.map(theme => `<option value="${esc(theme.id)}">${esc(theme.name)}</option>`).join('');
+}
+
+function renderFontOptions() {
+  const localOptions = SYSTEM_FONT_OPTIONS.map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
+  const downloadableOptions = FONT_OPTIONS.map(font => `<option value="${esc(font)}"${fontAvailability === 'available' ? '' : ' disabled'}>${esc(font)}</option>`).join('');
+  ['#pref-font', '#pref-editor-font', '#pref-preview-font'].forEach(selector => {
+    const target = $(selector);
+    target.disabled = false;
+    target.innerHTML = localOptions + downloadableOptions;
+  });
+  $('#pref-font').value = prefs.fontFamily;
+  $('#pref-editor-font').value = prefs.editorFontFamily;
+  $('#pref-preview-font').value = prefs.previewFontFamily;
+}
+
+function applyPrefs() {
+  applyTheme(prefs.theme);
+  void applyFonts();
+  applyEditorPrefs();
+}
+
+renderThemeOptions();
+renderFontOptions();
+applyPrefs();
+
+// Apply cached preferences immediately, then the server's preferences later.
+try {
+  const cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}');
+  prefs = normalizePrefs(cached);
+  applyPrefs();
+} catch (_) {
+  prefs = normalizePrefs();
+  applyPrefs();
+}
+
 $('#prefs-btn').addEventListener('click', () => {
   $('#pref-autosave').checked = prefs.autoSave;
   $('#pref-hidepreview').checked = prefs.hidePreview;
@@ -2158,22 +2322,28 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-hidetoolbar').checked = prefs.hideToolbar;
   $('#pref-collapse').checked = prefs.collapseDetails;
   $('#pref-hidecursor').checked = prefs.hideCursorHighlight;
-  $('#pref-theme').checked = document.documentElement.classList.contains('dark');
-  $('#prefs-modal').classList.remove('hidden');
+  $('#pref-theme').value = prefs.theme;
+  $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
+  $('#pref-font').value = prefs.fontFamily;
+  $('#pref-editor-font').value = prefs.editorFontFamily;
+  $('#pref-preview-font').value = prefs.previewFontFamily;
+  openModal($('#prefs-modal'));
 });
 
 $('#prefs-close').addEventListener('click', () => {
-  $('#prefs-modal').classList.add('hidden');
+  closeModal($('#prefs-modal'));
 });
 
 $('#prefs-modal .modal-backdrop').addEventListener('click', () => {
-  $('#prefs-modal').classList.add('hidden');
+  closeModal($('#prefs-modal'));
 });
 
 async function savePref(key, value) {
-  prefs[key] = value;
+  prefs = normalizePrefs({...prefs, [key]: value});
   localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
   await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
+  if (key === 'theme' || key === 'accentColor') applyTheme(prefs.theme);
+  if (['fontFamily', 'editorFontFamily', 'previewFontFamily'].includes(key)) void applyFonts(true);
   applyEditorPrefs();
   scheduleSync();
 }
@@ -2196,22 +2366,72 @@ $('#pref-collapse').addEventListener('change', function () {
 $('#pref-hidecursor').addEventListener('change', function () {
   savePref('hideCursorHighlight', this.checked);
 });
-$('#pref-theme').addEventListener('change', function () {
-  setTheme(this.checked);
-  localStorage.setItem('theme', this.checked ? 'dark' : 'light');
-});
+$('#pref-theme').addEventListener('change', function () { void savePref('theme', this.value); });
+$('#pref-accent').addEventListener('change', function () { void savePref('accentColor', this.value); });
+$('#pref-font').addEventListener('change', function () { void savePref('fontFamily', this.value); });
+$('#pref-editor-font').addEventListener('change', function () { void savePref('editorFontFamily', this.value); });
+$('#pref-preview-font').addEventListener('change', function () { void savePref('previewFontFamily', this.value); });
+
+$$('.prefs-nav').forEach(button => button.addEventListener('click', () => {
+  const section = button.dataset.prefSection;
+  $$('.prefs-nav').forEach(item => {
+    const active = item === button;
+    item.classList.toggle('active', active);
+    item.setAttribute('aria-selected', active ? 'true' : 'false');
+    item.tabIndex = active ? 0 : -1;
+  });
+  $$('.prefs-section').forEach(panel => {
+    const active = panel.dataset.prefPanel === section;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  });
+  $('#prefs-title').textContent = button.textContent;
+}));
+
+$$('.prefs-nav').forEach(button => button.addEventListener('keydown', event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  const tabs = [...$$('.prefs-nav')];
+  const current = tabs.indexOf(button);
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  event.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+}));
+
+async function checkFontAvailability() {
+  const probe = document.createElement('link');
+  probe.rel = 'stylesheet';
+  probe.href = fontCSSURL('Inter');
+  const loaded = await new Promise(resolve => {
+    const timeout = setTimeout(() => resolve(false), 5000);
+    probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
+    probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
+    document.head.append(probe);
+  });
+  probe.remove();
+  fontAvailability = loaded ? 'available' : 'unavailable';
+  $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
+  renderFontOptions();
+  if (fontAvailability === 'available') void applyFonts();
+}
 
 async function loadPrefs() {
   const p = await api('/api/prefs');
   if (p && !await hasPendingOperation('__prefs__')) {
-    prefs = p;
+    let cached = {};
+    try { cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}'); } catch (_) {}
+    prefs = normalizePrefs(p, cached);
     localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    applyPrefs();
+    void checkFontAvailability();
     return;
   }
   try {
     const cached = localStorage.getItem('mdnotes-prefs');
-    if (cached) prefs = {...prefs, ...JSON.parse(cached)};
+    if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
+  applyPrefs();
+  void checkFontAvailability();
 }
 
 // --- Init ---
