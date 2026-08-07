@@ -1,4 +1,4 @@
-const CACHE = 'mdnotes-v45';
+const CACHE = 'mdnotes-shell';
 const ASSETS = [
   '/', '/index.html', '/style.css', '/app.js', '/merge.js', '/marked.min.js',
   '/manifest.json', '/favicon.ico', '/favicon.svg',
