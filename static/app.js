@@ -560,6 +560,7 @@ async function applyRemoteDeletion(noteID) {
 
 async function pullRemoteChanges() {
   let since = Number(await getOfflineState('syncSequence') || 0);
+  const fetchedNotes = new Map();
   for (;;) {
     const page = await api(`/api/sync?since=${since}&limit=100`);
     if (!page) throw new Error('could not fetch sync changes');
@@ -573,7 +574,13 @@ async function pullRemoteChanges() {
         await applyRemoteDeletion(change.note_id);
         continue;
       }
-      const remote = await api(`/api/notes/${encodeURIComponent(change.note_id)}`);
+      let remote;
+      if (fetchedNotes.has(change.note_id)) {
+        remote = fetchedNotes.get(change.note_id);
+      } else {
+        remote = await api(`/api/notes/${encodeURIComponent(change.note_id)}`);
+        fetchedNotes.set(change.note_id, remote || null);
+      }
       if (!remote) {
         // The feed records history. A save entry can therefore be followed by
         // a later deletion before this device asks for the current note. A
@@ -586,7 +593,11 @@ async function pullRemoteChanges() {
       }
       await cacheRemoteNote(remote);
     }
-    since = Number(page.nextSequence || since);
+    const nextSince = Number(page.nextSequence || since);
+    if (page.hasMore && nextSince <= since) {
+      throw new Error(`sync cursor did not advance (since ${since}, next ${nextSince})`);
+    }
+    since = nextSince;
     await setOfflineState('syncSequence', since);
     if (!page.hasMore) return;
   }
@@ -1186,9 +1197,11 @@ $('#login-form').addEventListener('submit', async e => {
     $('#login-error').textContent = '';
     cacheAppVersion(res);
     await loadPrefs();
-    await syncNow({reconcile: true});
-    connectServerEvents();
     await restoreRoute();
+    connectServerEvents();
+    void syncNow({reconcile: true}).then(synced => {
+      if (synced && !screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+    });
   } else {
     $('#login-error').textContent = 'Wrong password';
   }
@@ -2023,9 +2036,11 @@ async function init() {
     if (res) {
       cacheAppVersion(res);
       await loadPrefs();
-      await syncNow({reconcile: true});
-      connectServerEvents();
       await restoreRoute();
+      connectServerEvents();
+      void syncNow({reconcile: true}).then(synced => {
+        if (synced && !screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+      });
     } else if (authenticationRequired) {
       // api() has already displayed the sign-in screen. A cached offline copy
       // must never override that when the server explicitly returned 401.
