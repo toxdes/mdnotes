@@ -447,7 +447,7 @@ func listNotes(db *sql.DB, tag string) ([]note, error) {
 	}
 	defer rows.Close()
 
-	var notes []note
+	notes := make([]note, 0)
 	for rows.Next() {
 		var n note
 		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
