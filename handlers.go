@@ -186,7 +186,7 @@ func (a *app) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	n, err := getNote(a.db, id)
+	data, err := a.loadNoteWithContent(id)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "could not load note", http.StatusInternalServerError)
@@ -195,42 +195,85 @@ func (a *app) handleGetNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	writeJSON(w, data)
+}
+
+type noteWithContent struct {
+	note
+	Content string `json:"content"`
+}
+
+func (a *app) loadNoteWithContent(id string) (noteWithContent, error) {
+	n, err := getNote(a.db, id)
+	if err != nil {
+		return noteWithContent{}, err
+	}
 	if cached, ok := a.noteCache.get(id); ok {
-		resp := struct {
-			note
-			Content string `json:"content"`
-		}{
+		return noteWithContent{
 			note:    *n,
 			Content: cached,
-		}
-		writeJSON(w, resp)
-		return
+		}, nil
 	}
 	path, err := sanitizePath(a.notesDir, n.Filename)
 	if err != nil {
-		http.Error(w, "invalid path", http.StatusInternalServerError)
-		return
+		return noteWithContent{}, err
 	}
 	enc, err := os.ReadFile(path)
 	if err != nil {
-		http.Error(w, "file not found", http.StatusNotFound)
-		return
+		return noteWithContent{}, sql.ErrNoRows
 	}
 	plain, err := a.encryption.decryptNote(enc, id)
 	if err != nil {
-		http.Error(w, "decryption failed", http.StatusInternalServerError)
-		return
+		return noteWithContent{}, err
 	}
 	content := string(plain)
 	a.noteCache.set(id, content)
-	resp := struct {
-		note
-		Content string `json:"content"`
-	}{
+	return noteWithContent{
 		note:    *n,
 		Content: content,
+	}, nil
+}
+
+func (a *app) handleBulkGetNotes(w http.ResponseWriter, r *http.Request) {
+	const maxBulkNotes = 25
+	rawIDs := strings.Split(r.URL.Query().Get("ids"), ",")
+	if len(rawIDs) == 1 && rawIDs[0] == "" {
+		writeJSON(w, map[string]any{"notes": []noteWithContent{}, "missing": []string{}})
+		return
 	}
-	writeJSON(w, resp)
+	if len(rawIDs) > maxBulkNotes {
+		http.Error(w, "too many note ids", http.StatusBadRequest)
+		return
+	}
+	ids := make([]string, 0, len(rawIDs))
+	seen := make(map[string]struct{}, len(rawIDs))
+	for _, id := range rawIDs {
+		if !noteIDPattern.MatchString(id) {
+			http.Error(w, "invalid note id", http.StatusBadRequest)
+			return
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	notes := make([]noteWithContent, 0, len(ids))
+	missing := make([]string, 0)
+	for _, id := range ids {
+		data, err := a.loadNoteWithContent(id)
+		if errors.Is(err, sql.ErrNoRows) {
+			missing = append(missing, id)
+			continue
+		}
+		if err != nil {
+			http.Error(w, "could not load notes", http.StatusInternalServerError)
+			return
+		}
+		notes = append(notes, data)
+	}
+	writeJSON(w, map[string]any{"notes": notes, "missing": missing})
 }
 
 type saveRequest struct {
