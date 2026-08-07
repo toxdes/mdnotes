@@ -25,7 +25,15 @@ let highlightFrame = null;
 let currentRevision = 0;
 let currentBaseRevision = null;
 let syncInFlight = false;
+let syncScheduleTimer = null;
+let syncScheduleOptions = {};
+let syncRetryDelayMs = 0;
+let activeSyncControllers = new Set();
+let syncCancellationRequested = false;
+let lastSuccessfulSyncAt = 0;
+let syncNetworkRequestsInFlight = 0;
 let syncingQueueOperationID = null;
+let offlineStorageFailureReported = false;
 let lastSyncProblem = '';
 let lastSyncDiagnostic = '';
 let lastSyncResponseStatus = 0;
@@ -35,6 +43,12 @@ let panelWide = false;
 let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
 let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
 let updateToast = null;
+
+const httpRequestTimeoutMs = 15000;
+const syncRetryDelaysMs = [1000, 5000, 15000, 60000, 300000];
+const bulkNoteBatchSize = 25;
+const healthySseFallbackSyncAgeMs = 5 * 60 * 1000;
+const unhealthySseFallbackSyncAgeMs = 30 * 1000;
 
 // Notes are stored locally before any network request. The service worker keeps
 // the app shell available, while IndexedDB holds the user's working set and a
@@ -88,12 +102,24 @@ function openOfflineDB() {
       } catch (error) {
         request.result.close();
         offlineDBPromise = undefined;
+        reportOfflineStorageFailure(error);
         reject(error);
       }
     };
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      offlineDBPromise = undefined;
+      reportOfflineStorageFailure(request.error);
+      reject(request.error);
+    };
   });
   return offlineDBPromise;
+}
+
+function reportOfflineStorageFailure(error) {
+  setSyncDiagnostic(`local storage unavailable: ${error?.message || 'unknown error'}`);
+  if (offlineStorageFailureReported) return;
+  offlineStorageFailureReported = true;
+  showToast('Local storage is unavailable. Your changes may not be saved.', 'warning');
 }
 
 // A previous development build could leave an operation without the replay
@@ -104,36 +130,66 @@ async function repairOfflineQueue(db) {
   if (!db.objectStoreNames.contains('queue') || !db.objectStoreNames.contains('state')) {
     throw new Error('offline database is missing required stores');
   }
+
+  // Repair in two cursor passes instead of loading the complete queue into
+  // memory. The queue can contain a large backlog after a long offline period.
+  let largestSequence = 0;
+  await withQueueCursor(db, 'readonly', operation => {
+    if (Number.isSafeInteger(operation.client_sequence) && operation.client_sequence > largestSequence) {
+      largestSequence = operation.client_sequence;
+    }
+  });
+
   const transaction = db.transaction(['queue', 'state'], 'readwrite');
   const queue = transaction.objectStore('queue');
   const state = transaction.objectStore('state');
   const complete = transactionComplete(transaction);
-  const records = await requestValue(queue.getAll());
-  let largestSequence = 0;
-  records.sort((left, right) => left.id - right.id);
-  for (const operation of records) {
-    if (Number.isSafeInteger(operation.client_sequence) && operation.client_sequence > largestSequence) {
-      largestSequence = operation.client_sequence;
-    }
-  }
-  for (const operation of records) {
-    if (!Number.isSafeInteger(operation.client_sequence) || operation.client_sequence < 1) {
-      operation.client_sequence = ++largestSequence;
-    }
-    if (!syncOperationIDPattern.test(operation.op_id || '')) operation.op_id = `legacy-${operation.id}`;
-    if (operation.type === 'save') operation.type = 'note.save';
-    if (operation.type === 'delete') operation.type = 'note.delete';
-    if (operation.type === 'preferences') operation.type = 'prefs.save';
-    if (!operation.type) operation.type = operation.kind === 'save' ? 'note.save' : operation.kind === 'delete' ? 'note.delete' : 'prefs.save';
-    if (operation.type === 'note.save' && !operation.note) operation.note = operation.data;
-    if (operation.type === 'note.save' && !operation.note_id) operation.note_id = operation.note?.id;
-    if (operation.type === 'prefs.save') operation.note_id = '__prefs__';
-    queue.put(operation);
-  }
-  const savedSequence = await requestValue(state.get('clientSequence'));
-  const previousSequence = Number(savedSequence?.value || 0);
-  state.put({key: 'clientSequence', value: Math.max(previousSequence, largestSequence)});
+  const savedSequenceRequest = state.get('clientSequence');
+  savedSequenceRequest.onsuccess = () => {
+    const previousSequence = Number(savedSequenceRequest.result?.value || 0);
+    largestSequence = Math.max(largestSequence, previousSequence);
+    const cursorRequest = queue.openCursor();
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (cursor) {
+        const operation = cursor.value;
+        if (!Number.isSafeInteger(operation.client_sequence) || operation.client_sequence < 1) {
+          operation.client_sequence = ++largestSequence;
+        }
+        if (!syncOperationIDPattern.test(operation.op_id || '')) operation.op_id = `legacy-${operation.id}`;
+        if (operation.type === 'save') operation.type = 'note.save';
+        if (operation.type === 'delete') operation.type = 'note.delete';
+        if (operation.type === 'preferences') operation.type = 'prefs.save';
+        if (!operation.type) operation.type = operation.kind === 'save' ? 'note.save' : operation.kind === 'delete' ? 'note.delete' : 'prefs.save';
+        if (operation.type === 'note.save' && !operation.note) operation.note = operation.data;
+        if (operation.type === 'note.save' && !operation.note_id) operation.note_id = operation.note?.id;
+        if (operation.type === 'prefs.save') operation.note_id = '__prefs__';
+        queue.put(operation);
+        cursor.continue();
+        return;
+      }
+      state.put({key: 'clientSequence', value: Math.max(previousSequence, largestSequence)});
+    };
+  };
   await complete;
+}
+
+function withQueueCursor(db, mode, visit) {
+  const transaction = db.transaction(['queue'], mode);
+  const cursorRequest = transaction.objectStore('queue').openCursor();
+  const complete = transactionComplete(transaction);
+  return new Promise((resolve, reject) => {
+    cursorRequest.onerror = () => reject(cursorRequest.error);
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) {
+        complete.then(resolve, reject);
+        return;
+      }
+      visit(cursor.value, cursor);
+      cursor.continue();
+    };
+  });
 }
 
 function requestValue(request) {
@@ -152,13 +208,20 @@ function transactionComplete(transaction) {
 }
 
 async function withOfflineStore(names, mode, work) {
-  const db = await openOfflineDB();
-  const tx = db.transaction(names, mode);
-  const stores = Object.fromEntries(names.map(name => [name, tx.objectStore(name)]));
-  const complete = transactionComplete(tx);
-  const result = await work(stores);
-  await complete;
-  return result;
+  try {
+    const db = await openOfflineDB();
+    const tx = db.transaction(names, mode);
+    const stores = Object.fromEntries(names.map(name => [name, tx.objectStore(name)]));
+    const complete = transactionComplete(tx);
+    const result = await work(stores);
+    await complete;
+    return result;
+  } catch (error) {
+    if (error?.name === 'QuotaExceededError' || error?.name === 'InvalidStateError' || error?.name === 'TransactionInactiveError') {
+      reportOfflineStorageFailure(error);
+    }
+    throw error;
+  }
 }
 
 function getLocalNote(id) {
@@ -431,8 +494,7 @@ function clearSyncDiagnostic() {
 function showOfflineNotice(checking = false) {
   $$('.offline-notice').forEach(notice => {
     notice.classList.remove('hidden');
-    const detail = lastSyncDiagnostic ? `Sync failed: ${lastSyncDiagnostic}. ` : '';
-    notice.querySelector('.offline-notice-message').textContent = checking ? 'Checking…' : `${detail}Your changes are saved on this device.`;
+    notice.querySelector('.offline-notice-message').textContent = checking ? 'Checking…' : "You're offline. Changes are saved on this device.";
     const retry = notice.querySelector('.offline-retry');
     retry.classList.toggle('hidden', checking);
     retry.disabled = checking;
@@ -482,13 +544,53 @@ function requireAuthentication() {
   $('#login-form input').focus();
 }
 
+async function fetchWithTimeout(path, options = {}, {group = null, timeoutMs = httpRequestTimeoutMs} = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('request timed out', 'TimeoutError')), timeoutMs);
+  if (group) group.add(controller);
+  try {
+    return await fetch(path, {...options, signal: controller.signal});
+  } finally {
+    clearTimeout(timer);
+    if (group) group.delete(controller);
+  }
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
+}
+
+function cancelActiveSyncRequests() {
+  if (!activeSyncControllers.size) return;
+  syncCancellationRequested = true;
+  activeSyncControllers.forEach(controller => controller.abort());
+}
+
+function beginSyncNetworkRequest() {
+  syncNetworkRequestsInFlight++;
+  setSyncStatus('syncing');
+}
+
+function endSyncNetworkRequest() {
+  syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
+}
+
+function setIdleSyncStatus() {
+  if (syncNetworkRequestsInFlight > 0) return;
+  setSyncStatus(syncFailed ? 'offline' : 'online');
+}
+
 async function api(path, opts) {
   const method = opts?.method || 'GET';
+  const syncRequest = opts?.syncRequest === true;
+  const requestOpts = {...opts};
+  delete requestOpts.syncRequest;
+  if (syncRequest) beginSyncNetworkRequest();
   try {
-    const res = await fetch(path, {
+    const res = await fetchWithTimeout(path, {
       credentials: 'same-origin',
-      headers: opts?.body ? {'Content-Type':'application/json'} : {},
-      ...opts,
+      headers: requestOpts?.body ? {'Content-Type':'application/json'} : {},
+      ...requestOpts,
     });
     if (res.status === 401) {
       setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
@@ -507,17 +609,20 @@ async function api(path, opts) {
     setSyncDiagnostic(`${method} ${path} ${e?.responseStatus ? `returned HTTP ${e.responseStatus}` : 'failed'}: ${e?.message || 'unknown error'}`, e?.responseStatus);
     console.error(e);
     return null;
+  } finally {
+    if (syncRequest) endSyncNetworkRequest();
   }
 }
 
 async function syncFetch(path, options) {
   const method = options?.method || 'GET';
+  beginSyncNetworkRequest();
   try {
-    const response = await fetch(path, {
+    const response = await fetchWithTimeout(path, {
       credentials: 'same-origin',
       headers: options?.body ? {'Content-Type': 'application/json'} : {},
       ...options,
-    });
+    }, {group: activeSyncControllers});
     const body = response.status === 204 ? null : await response.text();
     let data = null;
     if (body) {
@@ -528,6 +633,8 @@ async function syncFetch(path, options) {
   } catch (error) {
     setSyncDiagnostic(`${method} ${path} failed: ${error?.message || 'unknown error'}`);
     throw error;
+  } finally {
+    endSyncNetworkRequest();
   }
 }
 
@@ -558,6 +665,21 @@ async function applyRemoteDeletion(noteID) {
   }
 }
 
+async function bulkRemoteNotes(noteIDs) {
+  if (!noteIDs.length) return new Map();
+  const notes = new Map();
+  for (let index = 0; index < noteIDs.length; index += bulkNoteBatchSize) {
+    const batch = noteIDs.slice(index, index + bulkNoteBatchSize);
+    const response = await api(`/api/sync/notes?ids=${encodeURIComponent(batch.join(','))}`);
+    if (!response || !Array.isArray(response.notes) || !Array.isArray(response.missing)) {
+      throw new Error('could not download changed notes');
+    }
+    response.notes.forEach(note => notes.set(note.id, note));
+    response.missing.forEach(id => notes.set(id, null));
+  }
+  return notes;
+}
+
 async function pullRemoteChanges() {
   let since = Number(await getOfflineState('syncSequence') || 0);
   const fetchedNotes = new Map();
@@ -568,28 +690,28 @@ async function pullRemoteChanges() {
       await resetLocalNotesFromRemote(Number(page.nextSequence || 0));
       return;
     }
+    const downloadIDs = [];
+    for (const change of page.changes) {
+      if (change.deleted || fetchedNotes.has(change.note_id)) continue;
+      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
+      downloadIDs.push(change.note_id);
+    }
+    const downloaded = await bulkRemoteNotes([...new Set(downloadIDs)]);
+    downloaded.forEach((remote, id) => fetchedNotes.set(id, remote));
+
     for (const change of page.changes) {
       if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
       if (change.deleted) {
         await applyRemoteDeletion(change.note_id);
         continue;
       }
-      let remote;
-      if (fetchedNotes.has(change.note_id)) {
-        remote = fetchedNotes.get(change.note_id);
-      } else {
-        remote = await api(`/api/notes/${encodeURIComponent(change.note_id)}`);
-        fetchedNotes.set(change.note_id, remote || null);
-      }
+      const remote = fetchedNotes.get(change.note_id);
       if (!remote) {
         // The feed records history. A save entry can therefore be followed by
         // a later deletion before this device asks for the current note. A
-        // 404 is the authoritative final state, not a sync failure.
-        if (lastSyncResponseStatus === 404) {
-          await applyRemoteDeletion(change.note_id);
-          continue;
-        }
-        throw new Error('could not download changed note');
+        // missing entry is the authoritative final state, not a sync failure.
+        await applyRemoteDeletion(change.note_id);
+        continue;
       }
       await cacheRemoteNote(remote);
     }
@@ -607,9 +729,18 @@ async function resetLocalNotesFromRemote(sequence) {
   const summaries = await api('/api/notes');
   if (!Array.isArray(summaries)) throw new Error('could not refresh notes after sync compaction');
   const remoteIDs = new Set(summaries.map(note => note.id));
+  const remoteNotes = new Map();
+  const downloadIDs = [];
   for (const summary of summaries) {
     if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
-    const remote = await api(`/api/notes/${encodeURIComponent(summary.id)}`);
+    downloadIDs.push(summary.id);
+  }
+  for (let index = 0; index < downloadIDs.length; index += 100) {
+    const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
+    page.forEach((remote, id) => remoteNotes.set(id, remote));
+  }
+  for (const id of downloadIDs) {
+    const remote = remoteNotes.get(id);
     if (!remote) throw new Error('could not download refreshed note');
     await cacheRemoteNote(remote);
   }
@@ -629,13 +760,19 @@ async function reconcileLocalNotes() {
   const summaries = await api('/api/notes');
   if (!Array.isArray(summaries)) throw new Error('could not reconcile local notes');
   const remoteIDs = new Set(summaries.map(note => note.id));
+  const downloadIDs = [];
   for (const summary of summaries) {
     if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
     const local = await getLocalNote(summary.id);
     if (local && local.revision === summary.revision) continue;
-    const remote = await api(`/api/notes/${encodeURIComponent(summary.id)}`);
-    if (!remote) throw new Error('could not download reconciled note');
-    await cacheRemoteNote(remote);
+    downloadIDs.push(summary.id);
+  }
+  for (let index = 0; index < downloadIDs.length; index += 100) {
+    const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
+    for (const [id, remote] of page) {
+      if (!remote) throw new Error('could not download reconciled note');
+      await cacheRemoteNote(remote);
+    }
   }
   for (const local of await getAllLocalNotes()) {
     if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id) && !await getUnresolvedConflict(local.id)) {
@@ -877,7 +1014,7 @@ async function saveConflictResolution() {
   closeConflictResolver();
   showToast('Conflict resolution saved.', 'success');
   if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
-  void syncNow();
+  scheduleSync();
 }
 
 async function keepConflictAsCopy() {
@@ -913,7 +1050,7 @@ async function keepConflictAsCopy() {
   closeConflictResolver();
   showToast('Your version was saved as a separate note.', 'success');
   if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
-  void syncNow();
+  scheduleSync();
 }
 
 $('#conflict-use-local').addEventListener('click', async () => {
@@ -957,9 +1094,10 @@ async function acknowledgeCompactedOperation(operation) {
 }
 
 async function flushPendingChanges() {
+  let pushed = false;
   for (;;) {
     const operations = await pendingOperations();
-    if (!operations.length) return;
+    if (!operations.length) return pushed;
     const operation = operations[0];
     const outgoing = {
       client_sequence: operation.client_sequence,
@@ -986,6 +1124,7 @@ async function flushPendingChanges() {
     } finally {
       syncingQueueOperationID = null;
     }
+    pushed = true;
     if (result.response.status === 401) {
       requireAuthentication();
       const error = new Error('sign in required to sync');
@@ -1037,13 +1176,58 @@ async function flushPendingChanges() {
   }
 }
 
-async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
+function mergeSyncScheduleOptions(options = {}) {
+  syncScheduleOptions = {
+    ...syncScheduleOptions,
+    ...options,
+    reconcile: Boolean(syncScheduleOptions.reconcile || options.reconcile),
+  };
+}
+
+function scheduleSync(options = {}, delayMs = 75) {
+  mergeSyncScheduleOptions(options);
+  if (syncScheduleTimer) return;
+  const delay = Math.max(delayMs, syncRetryDelayMs);
+  syncScheduleTimer = setTimeout(async () => {
+    syncScheduleTimer = null;
+    const requested = syncScheduleOptions;
+    syncScheduleOptions = {};
+    if (document.visibilityState === 'hidden') {
+      scheduleSync(requested, 1000);
+      return;
+    }
+    if (syncInFlight) {
+      scheduleSync(requested, 100);
+      return;
+    }
+    const synced = await syncNow(requested);
+    if (synced) {
+      syncRetryDelayMs = 0;
+      if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+      return;
+    }
+    if (syncFailed) {
+      const index = syncRetryDelaysMs.indexOf(syncRetryDelayMs);
+      syncRetryDelayMs = syncRetryDelaysMs[index + 1] || syncRetryDelaysMs[syncRetryDelaysMs.length - 1];
+      scheduleSync(requested, syncRetryDelayMs);
+    }
+  }, delay);
+}
+
+async function syncNow(options = {}) {
+  const preserveSnackbar = Boolean(options.preserveSnackbar);
+  let reconcile = Boolean(options.reconcile);
+  if (syncScheduleTimer) {
+    clearTimeout(syncScheduleTimer);
+    syncScheduleTimer = null;
+    reconcile = Boolean(reconcile || syncScheduleOptions.reconcile);
+    syncScheduleOptions = {};
+  }
   // Network requests and the authenticated SSE heartbeat are authoritative.
   // navigator.onLine is only an unreliable browser hint, particularly in an
   // installed mobile PWA, so it must never prevent a requested sync.
   if (syncInFlight) return false;
   syncInFlight = true;
-  setSyncStatus('syncing');
   const wasOffline = syncFailed;
   try {
     // Save the visible editor locally before pulling. This never waits on the
@@ -1052,17 +1236,24 @@ async function syncNow({preserveSnackbar = false, reconcile = false} = {}) {
     if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
     await pullRemoteChanges();
     if (reconcile) await reconcileLocalNotes();
-    await flushPendingChanges();
-    await pullRemoteChanges();
+    const pushed = await flushPendingChanges();
+    if (pushed) await pullRemoteChanges();
     localStorage.setItem('mdnotes-offline-ready', '1');
     clearSyncDiagnostic();
     syncFailed = false;
+    lastSuccessfulSyncAt = Date.now();
+    syncRetryDelayMs = 0;
     setSyncStatus('online');
+    if (!serverEvents) connectServerEvents();
     if (!preserveSnackbar) hideOfflineNotice();
     if (wasOffline && !preserveSnackbar) showToast('Back online. Changes synced.');
     return true;
   } catch (error) {
     console.warn('sync failed', error);
+    if (isAbortError(error) && syncCancellationRequested) {
+      syncCancellationRequested = false;
+      return false;
+    }
     if (!lastSyncDiagnostic) setSyncDiagnostic(error?.message || 'unknown sync error', error?.responseStatus);
     if (authenticationRequired) {
       // An expired or unavailable session is actionable, and is distinct from
@@ -1105,6 +1296,10 @@ let serverEventsWatchdog = null;
 let serverChangeTimer = null;
 let serverChangePending = false;
 
+function isServerEventsHealthy() {
+  return Boolean(serverEvents && serverHeartbeatAt > 0 && Date.now() - serverHeartbeatAt <= sseStaleAfterMs);
+}
+
 function markServerOffline() {
   const shouldToast = !syncFailed;
   syncFailed = true;
@@ -1119,10 +1314,7 @@ async function handleServerHeartbeat() {
     if (!syncInFlight) setSyncStatus('online');
     return;
   }
-  const synced = await syncNow({reconcile: true});
-  if (synced && !screens.dashboard.classList.contains('hidden')) {
-    await refreshDashboard();
-  }
+  scheduleSync({reconcile: true});
 }
 
 function scheduleServerChangeSync() {
@@ -1130,13 +1322,8 @@ function scheduleServerChangeSync() {
   if (serverChangeTimer) return;
   serverChangeTimer = setTimeout(async () => {
     serverChangeTimer = null;
-    if (syncInFlight) {
-      scheduleServerChangeSync();
-      return;
-    }
     serverChangePending = false;
-    const synced = await syncNow();
-    if (synced && !screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    scheduleSync();
     if (serverChangePending) scheduleServerChangeSync();
   }, 75);
 }
@@ -1199,15 +1386,14 @@ $('#login-form').addEventListener('submit', async e => {
     await loadPrefs();
     await restoreRoute();
     connectServerEvents();
-    void syncNow({reconcile: true}).then(synced => {
-      if (synced && !screens.dashboard.classList.contains('hidden')) void refreshDashboard();
-    });
+    scheduleSync({reconcile: true});
   } else {
     $('#login-error').textContent = 'Wrong password';
   }
 });
 
 $('#logout-btn').addEventListener('click', async () => {
+  cancelActiveSyncRequests();
   disconnectServerEvents();
   await api('/api/logout', {method:'POST'});
   await clearOfflineData();
@@ -1275,8 +1461,7 @@ async function refreshDashboard() {
 }
 
 async function syncDashboardInBackground() {
-  const synced = await syncNow();
-  if (synced && !screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+  scheduleSync();
 }
 
 async function loadDashboard({sync = true} = {}) {
@@ -1311,7 +1496,7 @@ function startNewNote(title = '') {
   $('#note-content').value = '';
   $('#preview').innerHTML = '';
   renderedPreviewSource = null;
-  setSyncStatus(syncFailed ? 'offline' : 'online');
+  setIdleSyncStatus();
   cachePreviewBlocks();
   applyEditorPrefs();
   show(screens.editor);
@@ -1328,7 +1513,8 @@ $('#back-btn').addEventListener('click', async () => {
   // after the cached dashboard is visible, rather than making Back feel slow.
   await saveCurrentNote(false);
   clearCurrentNote();
-  await loadDashboard();
+  await loadDashboard({sync: false});
+  if ((await pendingOperations()).length) scheduleSync();
   setDashboardRoute();
 });
 
@@ -1342,7 +1528,7 @@ function showNoteInEditor(data) {
   $('#note-title').value = data.title || '';
   $('#note-tags').value = data.tags || '';
   $('#note-content').value = data.content || '';
-  setSyncStatus(syncFailed ? 'offline' : 'online');
+  setIdleSyncStatus();
   applyEditorPrefs();
   show(screens.editor);
   updatePreview();
@@ -1356,9 +1542,8 @@ async function openNote(id, {route = 'push'} = {}) {
   showNoteInEditor(data);
   if (route === 'push') setNoteRoute(id);
   await showConflictResolverFor(id);
-  // The note is already usable from IndexedDB. Refreshing it is deliberately
-  // background work so opening a note never waits on a round trip.
-  void syncNow();
+  // The note is already usable from IndexedDB. Sync is driven by the central
+  // scheduler, server events, and pending local work rather than navigation.
 }
 
 function normalizeWikiTitle(title) {
@@ -1377,7 +1562,7 @@ async function followWikiLink(title) {
   startNewNote(title);
   await saveCurrentNote(false);
   showToast(`Created “${title}”.`, 'success');
-  void syncNow();
+  scheduleSync();
 }
 
 async function restoreRoute() {
@@ -1447,7 +1632,7 @@ async function saveCurrentNote(trySync = true) {
   savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
   isDirty = false;
   if (noteIDFromLocation() !== currentNoteId) setNoteRoute(currentNoteId);
-  setSyncStatus(syncFailed ? 'offline' : 'online');
+  setIdleSyncStatus();
   if (trySync) await syncNow();
 }
 
@@ -1854,9 +2039,9 @@ $('#delete-btn').addEventListener('click', async () => {
     const remainingNotes = await getLocalNotes();
     if (!remainingNotes.some(note => noteHasTag(note, currentTag))) currentTag = null;
   }
-  setSyncStatus(syncFailed ? 'offline' : 'online');
-  void syncNow();
-  await loadDashboard();
+  setIdleSyncStatus();
+  scheduleSync();
+  await loadDashboard({sync: false});
   setDashboardRoute({replace: true});
 });
 
@@ -1990,7 +2175,7 @@ async function savePref(key, value) {
   localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
   await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
   applyEditorPrefs();
-  void syncNow();
+  scheduleSync();
 }
 
 $('#pref-autosave').addEventListener('change', function () {
@@ -2038,9 +2223,7 @@ async function init() {
       await loadPrefs();
       await restoreRoute();
       connectServerEvents();
-      void syncNow({reconcile: true}).then(synced => {
-        if (synced && !screens.dashboard.classList.contains('hidden')) void refreshDashboard();
-      });
+      scheduleSync({reconcile: true});
     } else if (authenticationRequired) {
       // api() has already displayed the sign-in screen. A cached offline copy
       // must never override that when the server explicitly returned 401.
@@ -2081,21 +2264,31 @@ window.addEventListener('popstate', () => { void restoreRoute(); });
 
 window.addEventListener('online', async () => {
   connectServerEvents();
-  if (await syncNow({reconcile: true}) && !screens.dashboard.classList.contains('hidden')) {
-    await refreshDashboard();
-  }
+  scheduleSync({reconcile: true});
 });
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden' && isDirty) saveCurrentNote(false);
+  if (document.visibilityState === 'hidden') {
+    if (isDirty) saveCurrentNote(false);
+    cancelActiveSyncRequests();
+  }
   if (document.visibilityState === 'visible') {
     connectServerEvents();
-    syncNow();
+    scheduleSync();
   }
 });
 
-setInterval(() => {
-  if (document.visibilityState === 'visible') syncNow();
+setInterval(async () => {
+  if (document.visibilityState !== 'visible' || syncInFlight) return;
+  try {
+    const pending = (await pendingOperations()).length > 0;
+    const sseHealthy = isServerEventsHealthy();
+    const fallbackAge = sseHealthy ? healthySseFallbackSyncAgeMs : unhealthySseFallbackSyncAgeMs;
+    const stale = !lastSuccessfulSyncAt || Date.now() - lastSuccessfulSyncAt >= fallbackAge;
+    if (pending || stale) scheduleSync({reconcile: !sseHealthy});
+  } catch (error) {
+    console.warn('periodic sync check failed', error);
+  }
 }, 30000);
 
 // Keyboard shortcuts

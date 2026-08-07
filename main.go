@@ -25,25 +25,33 @@ var staticFS embed.FS
 
 var appRevision = embeddedAppRevision()
 
+// frontendRevisionFiles is the production frontend surface. Keep test and
+// development-only files out of the update fingerprint so changing them does
+// not make every running client report a new app version.
+var frontendRevisionFiles = []string{
+	"static/index.html",
+	"static/style.css",
+	"static/app.js",
+	"static/merge.js",
+	"static/marked.min.js",
+	"static/manifest.json",
+	"static/favicon.ico",
+	"static/favicon.svg",
+	"static/icon-192.png",
+	"static/icon-512.png",
+	"static/logo.svg",
+	"static/sw.js",
+}
+
 func embeddedAppRevision() string {
 	hash := sha256.New()
-	err := fs.WalkDir(staticFS, "static", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
+	for _, path := range frontendRevisionFiles {
 		data, err := staticFS.ReadFile(path)
 		if err != nil {
-			return err
+			return "unknown"
 		}
 		_, _ = hash.Write([]byte(path))
 		_, _ = hash.Write(data)
-		return nil
-	})
-	if err != nil {
-		return "unknown"
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)[:8])
 }
@@ -215,6 +223,7 @@ func main() {
 	mux.HandleFunc("GET /api/notes", app.auth(app.handleListNotes))
 	mux.HandleFunc("GET /api/search", app.auth(app.handleSearchNotes))
 	mux.HandleFunc("GET /api/sync", app.auth(app.handleSyncChanges))
+	mux.HandleFunc("GET /api/sync/notes", app.auth(app.handleBulkGetNotes))
 	mux.HandleFunc("POST /api/sync/push", app.auth(app.handleSyncPush))
 	mux.HandleFunc("GET /api/events", app.auth(app.handleEvents))
 	mux.HandleFunc("GET /api/notes/{id}", app.auth(app.handleGetNote))
