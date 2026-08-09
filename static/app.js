@@ -666,11 +666,22 @@ function setIdleSyncStatus() {
   setSyncStatus(syncFailed ? 'offline' : 'online');
 }
 
+class APIError extends Error {
+  constructor(message, status = 0) {
+    super(message);
+    this.name = 'APIError';
+    this.responseStatus = status;
+    this.retryable = !status || status === 408 || status === 429 || status >= 500;
+  }
+}
+
 async function api(path, opts) {
   const method = opts?.method || 'GET';
   const syncRequest = opts?.syncRequest === true;
+  const throwOnError = opts?.throwOnError === true;
   const requestOpts = {...opts};
   delete requestOpts.syncRequest;
+  delete requestOpts.throwOnError;
   if (syncRequest) beginSyncNetworkRequest();
   try {
     const res = await fetchWithTimeout(path, {
@@ -681,19 +692,20 @@ async function api(path, opts) {
     if (res.status === 401) {
       setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
       requireAuthentication();
+      if (throwOnError) throw new APIError('authentication required', 401);
       return null;
     }
     if (res.status === 204) return true;
     if (!res.ok) {
       const text = await res.text();
-      const error = new Error(text || res.statusText);
-      error.responseStatus = res.status;
-      throw error;
+      throw new APIError(text || res.statusText, res.status);
     }
     return await res.json();
   } catch(e) {
-    setSyncDiagnostic(`${method} ${path} ${e?.responseStatus ? `returned HTTP ${e.responseStatus}` : 'failed'}: ${e?.message || 'unknown error'}`, e?.responseStatus);
-    console.error(e);
+    const error = e instanceof APIError ? e : Object.assign(e, {retryable: true});
+    setSyncDiagnostic(`${method} ${path} ${error?.responseStatus ? `returned HTTP ${error.responseStatus}` : 'failed'}: ${error?.message || 'unknown error'}`, error?.responseStatus);
+    console.error(error);
+    if (throwOnError) throw error;
     return null;
   } finally {
     if (syncRequest) endSyncNetworkRequest();
@@ -1179,22 +1191,67 @@ $('#conflict-later').addEventListener('click', closeConflictResolver);
 $('#conflict-close').addEventListener('click', closeConflictResolver);
 $('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
 
+async function reconcileCompactedOperationLocally(operation, remote) {
+  return withOfflineStore(['notes', 'queue'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('compacted sync operation changed before local reconciliation');
+    }
+
+    const operations = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    let hasLater = false;
+    for (const later of operations) {
+      if (later.id === operation.id || later.client_sequence < 1 || later.attempted_at) continue;
+      if (later.type !== 'note.save' && later.type !== 'note.delete') continue;
+      if (remote) {
+        later.base_revision = remote.revision;
+        if (later.note) {
+          later.note.base_revision = remote.revision;
+          later.note.base_content = remote.content;
+          later.note.base_title = remote.title;
+          later.note.base_tags = remote.tags;
+        }
+        await requestValue(stores.queue.put(later));
+      }
+      hasLater = true;
+    }
+
+    const local = await requestValue(stores.notes.get(operation.note_id));
+    if (remote && !hasLater) {
+      await requestValue(stores.notes.put({...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null}));
+    } else if (remote && hasLater) {
+      await requestValue(stores.notes.put({...remote, ...local, revision: remote.revision, pending: true, base_revision: remote.revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags}));
+    } else if (!remote && !hasLater) {
+      await requestValue(stores.notes.delete(operation.note_id));
+    }
+    await requestValue(stores.queue.delete(operation.id));
+    return hasLater;
+  });
+}
+
 async function acknowledgeCompactedOperation(operation) {
-  await removePendingOperationIfIdentityMatches(operation.id, operation);
-  if (operation.type !== 'note.save' && operation.type !== 'note.delete') return;
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
-  if (!remote) {
-    if (!await hasPendingOperation(operation.note_id)) await removeLocalNote(operation.note_id);
+  if (operation.type !== 'note.save' && operation.type !== 'note.delete') {
+    const removed = await removePendingOperationIfIdentityMatches(operation.id, operation);
+    if (!removed) throw new Error('compacted sync operation changed before acknowledgement');
     return;
   }
-  const hasLater = await rebaseQueuedNoteOperations(operation.note_id, -1, remote.revision, remote);
-  const local = await getLocalNote(operation.note_id);
-  if (!hasLater) {
-    await cacheRemoteNote(remote);
-    return;
+
+  let remote = null;
+  try {
+    remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true, throwOnError: true});
+  } catch (error) {
+    // Only an explicit 404 proves that the note is absent. Timeouts, server
+    // errors, authentication failures, and other errors must leave the queue
+    // entry intact so the next sync can retry reconciliation.
+    if (error?.responseStatus !== 404) throw error;
   }
-  if (local) {
-    await putLocalNote({...local, revision: remote.revision, pending: true, base_revision: remote.revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags});
+
+  const hasLater = await reconcileCompactedOperationLocally(operation, remote);
+  if (!hasLater && remote) updateOpenNote(remote);
+  if (!hasLater && !remote && currentNoteId === operation.note_id && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
   }
 }
 
