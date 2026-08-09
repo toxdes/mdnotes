@@ -1,0 +1,12 @@
+{
+  "name": "mdnotes-frontend-tests",
+  "private": true,
+  "scripts": {
+    "test:frontend": "vitest run test && node --test static/merge.test.js"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.4",
+    "jsdom": "^26.1.0",
+    "vitest": "^3.2.4"
+  }
+}
