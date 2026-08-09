@@ -57,6 +57,7 @@ let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-
 let panelWide = false;
 let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
 let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
+let registeredServiceWorkerRevision = null;
 let updateToast = null;
 
 const httpRequestTimeoutMs = 15000;
@@ -606,6 +607,7 @@ function cacheAppVersion(response) {
   if (response?.revision) {
     if (!appRevisionAtLoad) appRevisionAtLoad = response.revision;
     localStorage.setItem('mdnotes-revision', response.revision);
+    registerServiceWorker(response.revision);
   }
   const version = response?.version || localStorage.getItem('mdnotes-version') || 'dev';
   $('#app-version').textContent = `v${version}`;
@@ -2750,9 +2752,17 @@ $$('.offline-retry').forEach(retry => retry.addEventListener('click', async () =
 }));
 
 // Service worker
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(error => console.warn('service worker registration failed', error));
+function registerServiceWorker(revision = appRevisionAtLoad) {
+  if (!('serviceWorker' in navigator)) return;
+  const requestedRevision = /^[A-Za-z0-9._-]{1,128}$/.test(revision || '') ? revision : 'legacy';
+  if (registeredServiceWorkerRevision === requestedRevision) return;
+  registeredServiceWorkerRevision = requestedRevision;
+  navigator.serviceWorker.register(`/sw.js?revision=${encodeURIComponent(requestedRevision)}`, {updateViaCache: 'none'}).catch(error => {
+    registeredServiceWorkerRevision = null;
+    console.warn('service worker registration failed', error);
+  });
 }
+registerServiceWorker();
 
 window.addEventListener('popstate', () => { void restoreRoute(); });
 

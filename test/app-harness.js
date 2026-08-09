@@ -18,6 +18,7 @@ globalThis.__mdnotesTestHooks = {
   claimQueueOperation,
   removePendingOperationIfIdentityMatches,
   withSyncLeadership,
+  registerServiceWorker,
   acknowledgeCompactedOperation,
   getLocalNote,
   getState: () => ({
@@ -75,7 +76,7 @@ export async function deleteOfflineDatabase() {
   });
 }
 
-export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}')} = {}) {
+export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null} = {}) {
   const dom = new JSDOM(fs.readFileSync(path.join(testDirectory, '..', 'static', 'index.html'), 'utf8'), {
     url: 'http://localhost:8080/',
     pretendToBeVisual: true,
@@ -85,6 +86,7 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
   window.indexedDB = indexedDB;
   window.IDBKeyRange = IDBKeyRange;
   window.fetch = fetchImpl;
+  if (serviceWorker) Object.defineProperty(window.navigator, 'serviceWorker', {value: serviceWorker, configurable: true});
   window.eval(themesSource);
   window.marked = {parse: () => ''};
   window.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});

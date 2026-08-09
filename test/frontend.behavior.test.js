@@ -1,4 +1,4 @@
-import {afterEach, beforeEach, describe, expect, test} from 'vitest';
+import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
 import {
   createApp,
   deleteOfflineDatabase,
@@ -184,5 +184,18 @@ describe('F-03 compacted acknowledgement recovery', () => {
     await app.hooks.acknowledgeCompactedOperation(operation);
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
     expect(await app.hooks.getLocalNote('note-a')).toMatchObject({...remote, pending: false, base_revision: null});
+  });
+});
+
+describe('F-04 service worker revisions', () => {
+  test('registers the worker with the server-provided frontend revision', async () => {
+    const register = vi.fn(async () => {});
+    const app = track(await createApp({serviceWorker: {register}}));
+    register.mockClear();
+
+    app.hooks.registerServiceWorker('frontend-hash-123');
+    await Promise.resolve();
+
+    expect(register).toHaveBeenCalledWith('/sw.js?revision=frontend-hash-123', {updateViaCache: 'none'});
   });
 });
