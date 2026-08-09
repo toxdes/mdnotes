@@ -239,3 +239,14 @@ describe('startup responsiveness', () => {
     await startup;
   });
 });
+
+describe('remote deletion coordination', () => {
+  test('preserves a note while a local operation is pending', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Local edit', content: 'Keep me', pending: true});
+    await app.hooks.queueOperation({type: 'note.save', note_id: 'note-a', base_revision: 1, note: {id: 'note-a', content: 'Keep me'}});
+
+    expect(await app.hooks.applyRemoteDeletion('note-a')).toBe(false);
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({title: 'Local edit', content: 'Keep me'});
+  });
+});

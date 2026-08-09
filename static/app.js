@@ -757,12 +757,19 @@ async function cacheRemoteNote(note) {
 }
 
 async function applyRemoteDeletion(noteID) {
-  await removeLocalNote(noteID);
-  if (currentNoteId === noteID && !isDirty) {
+  const removed = await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const pending = await requestValue(stores.queue.index('note_id').getAll(noteID));
+    const conflict = await requestValue(stores.state.get(unresolvedConflictKey(noteID)));
+    if (pending.length || conflict) return false;
+    await requestValue(stores.notes.delete(noteID));
+    return true;
+  });
+  if (removed && currentNoteId === noteID && !isDirty) {
     clearCurrentNote();
     await loadDashboard({sync: false});
     setDashboardRoute({replace: true});
   }
+  return removed;
 }
 
 async function bulkRemoteNotes(noteIDs) {
