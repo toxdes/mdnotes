@@ -483,6 +483,62 @@ func TestSaveRejectsStaleOfflineRevisionBeforeReplacingFile(t *testing.T) {
 	}
 }
 
+func TestNoteContentReadWaitsForNoteWriteLock(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(filepath.Join(dir, "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	config, err := newEncryptionConfig(dir, "test password", "")
+	if err != nil {
+		t.Fatalf("create encryption config: %v", err)
+	}
+	if err := upsertNote(db, "read-lock-note", "Read lock", "read-lock-note.md", ""); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	ciphertext, err := config.encryptNote([]byte("consistent content"), "read-lock-note")
+	if err != nil {
+		t.Fatalf("encrypt note: %v", err)
+	}
+	if err := writeNoteFile(filepath.Join(dir, "read-lock-note.md"), ciphertext); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	a := &app{db: db, notesDir: dir, encryption: config, noteCache: newNoteCache()}
+
+	a.noteMu.Lock()
+	result := make(chan struct {
+		data noteWithContent
+		err  error
+	}, 1)
+	go func() {
+		data, err := a.loadNoteWithContent("read-lock-note")
+		result <- struct {
+			data noteWithContent
+			err  error
+		}{data: data, err: err}
+	}()
+
+	select {
+	case <-result:
+		t.Fatal("note content read passed through the write lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	a.noteMu.Unlock()
+
+	select {
+	case read := <-result:
+		if read.err != nil || read.data.Revision != 1 || read.data.Content != "consistent content" {
+			t.Fatalf("note read = %#v, %v", read.data, read.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("note content read did not complete after releasing the lock")
+	}
+}
+
 func TestSessionsPersistAcrossStoreRestart(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {

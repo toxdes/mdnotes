@@ -204,6 +204,9 @@ type noteWithContent struct {
 }
 
 func (a *app) loadNoteWithContent(id string) (noteWithContent, error) {
+	a.noteMu.Lock()
+	defer a.noteMu.Unlock()
+
 	n, err := getNote(a.db, id)
 	if err != nil {
 		return noteWithContent{}, err
