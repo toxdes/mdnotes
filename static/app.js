@@ -43,12 +43,16 @@ let activeSyncControllers = new Set();
 let syncCancellationRequested = false;
 let lastSuccessfulSyncAt = 0;
 let syncNetworkRequestsInFlight = 0;
-let syncingQueueOperationID = null;
 let offlineStorageFailureReported = false;
 let lastSyncProblem = '';
 let lastSyncDiagnostic = '';
 let lastSyncResponseStatus = 0;
 let authenticationRequired = false;
+const syncTabID = `tab_${newLocalNoteID()}`;
+const syncLeaseKey = 'syncLease';
+const syncLeaseDurationMs = 60000;
+let syncCoordinationChannel = null;
+let syncLeaseRenewTimer = null;
 let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
 let panelWide = false;
 let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
@@ -283,7 +287,10 @@ async function queueOperationInStores(stores, operation) {
   if (operation.type === 'note.save' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
     const existing = queued
-      .filter(item => item.id !== syncingQueueOperationID && item.type === operation.type)
+      // Once a request has been attempted, its op_id/client_sequence and
+      // payload are immutable. A later edit must get a new queue identity so
+      // an acknowledgement for the old payload cannot remove the new edit.
+      .filter(item => !item.attempted_at && item.type === operation.type)
       .sort((left, right) => right.client_sequence - left.client_sequence)[0];
     if (existing) {
       existing.base_revision = operation.base_revision;
@@ -302,21 +309,26 @@ async function queueOperationInStores(stores, operation) {
 }
 
 function queueOperation(operation) {
-  return withOfflineStore(['queue', 'state'], 'readwrite', stores => queueOperationInStores(stores, operation));
+  return withOfflineStore(['queue', 'state'], 'readwrite', stores => queueOperationInStores(stores, operation)).then(result => {
+    notifySyncRequested();
+    return result;
+  });
 }
 
-function saveLocalNoteAndQueue(note, operation) {
-  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+async function saveLocalNoteAndQueue(note, operation) {
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
     await requestValue(stores.notes.put(note));
     await queueOperationInStores(stores, operation);
   });
+  notifySyncRequested();
 }
 
-function removeLocalNoteAndQueue(id, operation) {
-  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+async function removeLocalNoteAndQueue(id, operation) {
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
     await requestValue(stores.notes.delete(id));
     await queueOperationInStores(stores, operation);
   });
+  notifySyncRequested();
 }
 
 function removeLocalNoteAndSupersede(id, afterSequence) {
@@ -324,7 +336,7 @@ function removeLocalNoteAndSupersede(id, afterSequence) {
     await requestValue(stores.notes.delete(id));
     const operations = await requestValue(stores.queue.index('note_id').getAll(id));
     operations.forEach(operation => {
-      if (operation.client_sequence > afterSequence) {
+      if (operation.client_sequence > afterSequence && !operation.attempted_at) {
         operation.type = 'noop';
         stores.queue.put(operation);
       }
@@ -348,8 +360,12 @@ async function repairSyncSequenceGap(expectedSequence) {
     if (!unsent.length) return false;
     let sequence = expectedSequence;
     for (const operation of unsent) {
-      if (operation.client_sequence !== sequence) {
+      // The server returned 409 before applying this request, so these rows
+      // are safe to re-arm and close the local sequence gap. A normal
+      // acknowledgement never changes an attempted row.
+      if (operation.client_sequence !== sequence || operation.attempted_at) {
         operation.client_sequence = sequence;
+        delete operation.attempted_at;
         await requestValue(stores.queue.put(operation));
       }
       sequence++;
@@ -369,8 +385,48 @@ async function hasPendingOperation(noteID) {
   });
 }
 
-function removePendingOperation(id) {
-  return withOfflineStore(['queue'], 'readwrite', stores => requestValue(stores.queue.delete(id)));
+function pendingOperationsForNote(noteID) {
+  return withOfflineStore(['queue'], 'readonly', stores => requestValue(stores.queue.index('note_id').getAll(noteID)));
+}
+
+async function claimQueueOperation(id) {
+  return withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operation = await requestValue(stores.queue.get(id));
+    if (!operation) return null;
+    if (!operation.attempted_at) {
+      operation.attempted_at = new Date().toISOString();
+      await requestValue(stores.queue.put(operation));
+    }
+    return operation;
+  });
+}
+
+function queueOperationPayload(operation) {
+  return JSON.stringify({
+    type: operation.type,
+    note_id: operation.note_id,
+    base_revision: operation.base_revision,
+    note: operation.note && {
+      id: operation.note.id,
+      title: operation.note.title,
+      tags: operation.note.tags,
+      content: operation.note.content,
+      base_revision: operation.note.base_revision,
+      base_content: operation.note.base_content,
+      base_title: operation.note.base_title,
+      base_tags: operation.note.base_tags,
+    },
+    prefs: operation.prefs || null,
+  });
+}
+
+function removePendingOperationIfIdentityMatches(id, expectedOperation) {
+  return withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operation = await requestValue(stores.queue.get(id));
+    if (!operation || operation.op_id !== expectedOperation.op_id || operation.client_sequence !== expectedOperation.client_sequence || queueOperationPayload(operation) !== queueOperationPayload(expectedOperation)) return false;
+    await requestValue(stores.queue.delete(id));
+    return true;
+  });
 }
 
 async function syncDeviceID() {
@@ -387,7 +443,7 @@ async function rebaseQueuedNoteOperations(noteID, acknowledgedID, revision, base
     const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
     let hasLater = false;
     operations.forEach(operation => {
-      if (operation.id === acknowledgedID || operation.client_sequence < 1) return;
+      if (operation.id === acknowledgedID || operation.client_sequence < 1 || operation.attempted_at) return;
       if (operation.type === 'note.save' || operation.type === 'note.delete') {
         operation.base_revision = revision;
         if (operation.note) {
@@ -408,7 +464,7 @@ async function supersedeQueuedNoteOperations(noteID, afterSequence) {
   await withOfflineStore(['queue'], 'readwrite', async stores => {
     const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
     operations.forEach(operation => {
-      if (operation.client_sequence > afterSequence) {
+      if (operation.client_sequence > afterSequence && !operation.attempted_at) {
         operation.type = 'noop';
         stores.queue.put(operation);
       }
@@ -432,6 +488,24 @@ function newLocalNoteID() {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+try {
+  if (typeof BroadcastChannel !== 'undefined') {
+    syncCoordinationChannel = new BroadcastChannel('mdnotes-sync');
+    syncCoordinationChannel.addEventListener('message', event => {
+      if (!event.data || event.data.sender === syncTabID) return;
+      if (event.data.type === 'sync-request') scheduleSync({}, 0);
+    });
+  }
+} catch (_) {
+  syncCoordinationChannel = null;
+}
+
+function notifySyncRequested() {
+  try {
+    syncCoordinationChannel?.postMessage({type: 'sync-request', sender: syncTabID});
+  } catch (_) {}
 }
 
 const syncStates = {
@@ -842,7 +916,7 @@ async function mergeConflictedNote(operation) {
   // snapshots have the old base, so replace them with ordered no-ops and a
   // single merged save after them; that preserves the device event sequence.
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
   await queueOperation({type: 'note.save', note_id: mergedLocal.id, base_revision: remote.revision, note: mergedLocal});
   updateOpenNote(mergedLocal);
   return true;
@@ -877,7 +951,7 @@ async function preserveConflictCopy(operation, local, remote) {
     }
   }
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
 }
 
 function conflictBase(local, operation) {
@@ -1003,7 +1077,7 @@ async function createConflictResolution(operation) {
   await setUnresolvedConflict(conflict);
   await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
   // Bring the authoritative version into the normal editor before opening the
   // resolver, even if the conflict was discovered after navigating away. Any
   // note the user began editing during the request is saved locally first.
@@ -1106,7 +1180,7 @@ $('#conflict-close').addEventListener('click', closeConflictResolver);
 $('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
 
 async function acknowledgeCompactedOperation(operation) {
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
   if (operation.type !== 'note.save' && operation.type !== 'note.delete') return;
   const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
   if (!remote) {
@@ -1129,7 +1203,8 @@ async function flushPendingChanges() {
   for (;;) {
     const operations = await pendingOperations();
     if (!operations.length) return pushed;
-    const operation = operations[0];
+    const operation = await claimQueueOperation(operations[0].id);
+    if (!operation) continue;
     const outgoing = {
       client_sequence: operation.client_sequence,
       op_id: operation.op_id,
@@ -1145,16 +1220,11 @@ async function flushPendingChanges() {
     } else if (operation.type === 'prefs.save') {
       outgoing.prefs = operation.prefs;
     }
-    syncingQueueOperationID = operation.id;
     let result;
-    try {
-      result = await syncFetch('/api/sync/push', {
-        method: 'POST',
-        body: JSON.stringify({device_id: await syncDeviceID(), operations: [outgoing]}),
-      });
-    } finally {
-      syncingQueueOperationID = null;
-    }
+    result = await syncFetch('/api/sync/push', {
+      method: 'POST',
+      body: JSON.stringify({device_id: await syncDeviceID(), operations: [outgoing]}),
+    });
     pushed = true;
     if (result.response.status === 401) {
       requireAuthentication();
@@ -1203,7 +1273,7 @@ async function flushPendingChanges() {
         currentBaseRevision = hasLater ? acknowledgement.revision : null;
       }
     }
-    await removePendingOperation(operation.id);
+    await removePendingOperationIfIdentityMatches(operation.id, operation);
   }
 }
 
@@ -1213,6 +1283,76 @@ function mergeSyncScheduleOptions(options = {}) {
     ...options,
     reconcile: Boolean(syncScheduleOptions.reconcile || options.reconcile),
   };
+}
+
+async function acquireSyncLease() {
+  const now = Date.now();
+  return withOfflineStore(['state'], 'readwrite', async stores => {
+    const current = await requestValue(stores.state.get(syncLeaseKey));
+    const lease = current?.value;
+    if (lease && lease.owner !== syncTabID && Number(lease.expiresAt) > now) return false;
+    await requestValue(stores.state.put({
+      key: syncLeaseKey,
+      value: {owner: syncTabID, expiresAt: now + syncLeaseDurationMs},
+    }));
+    return true;
+  });
+}
+
+async function renewSyncLease() {
+  const now = Date.now();
+  try {
+    await withOfflineStore(['state'], 'readwrite', async stores => {
+      const current = await requestValue(stores.state.get(syncLeaseKey));
+      if (current?.value?.owner !== syncTabID) return;
+      await requestValue(stores.state.put({
+        key: syncLeaseKey,
+        value: {owner: syncTabID, expiresAt: now + syncLeaseDurationMs},
+      }));
+    });
+  } catch (error) {
+    console.warn('could not renew sync lease', error);
+  }
+}
+
+async function releaseSyncLease() {
+  if (syncLeaseRenewTimer) {
+    clearInterval(syncLeaseRenewTimer);
+    syncLeaseRenewTimer = null;
+  }
+  await withOfflineStore(['state'], 'readwrite', async stores => {
+    const current = await requestValue(stores.state.get(syncLeaseKey));
+    if (current?.value?.owner === syncTabID) await requestValue(stores.state.delete(syncLeaseKey));
+  });
+}
+
+async function withSyncLeadership(work) {
+  if (navigator.locks && typeof navigator.locks.request === 'function') {
+    let acquired = false;
+    let result;
+    try {
+      await navigator.locks.request('mdnotes-sync', {ifAvailable: true}, async lock => {
+        if (!lock) return;
+        acquired = true;
+        result = await work();
+      });
+      if (acquired) return result;
+    } catch (error) {
+      if (acquired) throw error;
+      console.warn('Web Locks unavailable; using IndexedDB sync lease', error);
+    }
+  }
+
+  if (!await acquireSyncLease()) {
+    scheduleSync({}, 500);
+    return false;
+  }
+  syncLeaseRenewTimer = setInterval(() => { void renewSyncLease(); }, syncLeaseDurationMs / 3);
+  try {
+    return await work();
+  } finally {
+    await releaseSyncLease();
+  }
 }
 
 function scheduleSync(options = {}, delayMs = 75) {
@@ -1245,7 +1385,7 @@ function scheduleSync(options = {}, delayMs = 75) {
   }, delay);
 }
 
-async function syncNow(options = {}) {
+async function performSync(options = {}) {
   const preserveSnackbar = Boolean(options.preserveSnackbar);
   let reconcile = Boolean(options.reconcile);
   if (syncScheduleTimer) {
@@ -1318,6 +1458,11 @@ async function syncNow(options = {}) {
   } finally {
     syncInFlight = false;
   }
+}
+
+async function syncNow(options = {}) {
+  if (syncInFlight) return false;
+  return withSyncLeadership(() => performSync(options));
 }
 
 const sseStaleAfterMs = 70000;
@@ -2133,8 +2278,9 @@ $('#delete-btn').addEventListener('click', async () => {
   }
   const local = await getLocalNote(noteID);
   if (!local) return;
-  const pending = await hasPendingOperation(noteID);
-  if (pending && (local.base_revision || 0) === 0) {
+  const pending = await pendingOperationsForNote(noteID);
+  const hasAttemptedOperation = pending.some(operation => Boolean(operation.attempted_at));
+  if (pending.length && !hasAttemptedOperation && (local.base_revision || 0) === 0) {
     await removeLocalNoteAndSupersede(noteID, 0);
   } else {
     await removeLocalNoteAndQueue(noteID, {type: 'note.delete', note_id: noteID, base_revision: local.base_revision ?? local.revision});
