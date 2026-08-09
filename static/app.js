@@ -18,6 +18,7 @@ let currentTag = null;
 let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
+let editorSessionGeneration = 0;
 const DEFAULT_PREFS = {autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
 const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
 const FONT_CACHE_NAME = 'mdnotes-fonts';
@@ -542,6 +543,7 @@ function show(screen) {
 }
 
 function clearCurrentNote() {
+  editorSessionGeneration++;
   currentNoteId = null;
   currentRevision = 0;
   currentBaseRevision = null;
@@ -1518,6 +1520,7 @@ function startNewNote(title = '') {
   if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
+  editorSessionGeneration++;
   currentNoteId = newLocalNoteID();
   currentRevision = 0;
   currentBaseRevision = null;
@@ -1552,6 +1555,7 @@ $('#back-btn').addEventListener('click', async () => {
 
 function showNoteInEditor(data) {
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
+  editorSessionGeneration++;
   currentNoteId = data.id;
   currentRevision = data.revision || 0;
   currentBaseRevision = data.base_revision ?? null;
@@ -1568,7 +1572,12 @@ function showNoteInEditor(data) {
 
 async function openNote(id, {route = 'push'} = {}) {
   if (saveTimer) clearTimeout(saveTimer);
+  if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
+  if (!screens.editor.classList.contains('hidden') && currentNoteId !== id && (isDirty || localSavePromise)) {
+    const saved = await saveCurrentNote(false);
+    if (saved === false) return;
+  }
   const data = await getLocalNote(id);
   if (!data) return;
   showNoteInEditor(data);
@@ -1619,32 +1628,46 @@ function markDirty() {
   }
 }
 
-async function saveCurrentNote(trySync = true) {
-  const title = $('#note-title').value.trim() || 'Untitled';
-  const tags = $('#note-tags').value.trim();
-  const content = $('#note-content').value;
+function readEditorSnapshot() {
+  return {
+    title: $('#note-title').value.trim() || 'Untitled',
+    tags: $('#note-tags').value.trim(),
+    content: $('#note-content').value,
+  };
+}
 
-  const data = {title, tags, content};
-  if (currentNoteId) data.id = currentNoteId;
+function editorSnapshotIsCurrent(snapshot) {
+  return editorSessionGeneration === snapshot.sessionGeneration &&
+    currentNoteId === snapshot.noteID &&
+    readEditorSnapshot().title === snapshot.title &&
+    readEditorSnapshot().tags === snapshot.tags &&
+    readEditorSnapshot().content === snapshot.content;
+}
 
-  if (currentNoteId && data.title === savedSnapshot.title && data.tags === savedSnapshot.tags && data.content === savedSnapshot.content) {
+async function persistEditorSnapshot(snapshot, trySync) {
+  if (editorSnapshotIsCurrent(snapshot) &&
+      snapshot.title === savedSnapshot.title &&
+      snapshot.tags === savedSnapshot.tags &&
+      snapshot.content === savedSnapshot.content) {
     isDirty = false;
     if (trySync) await syncNow();
-    return;
+    return true;
   }
-  if (!currentNoteId) currentNoteId = newLocalNoteID();
-  const existing = await getLocalNote(currentNoteId);
-  const baseRevision = existing?.pending ? existing.base_revision : (currentBaseRevision ?? currentRevision ?? 0);
+
+  const existing = await getLocalNote(snapshot.noteID);
+  const baseRevision = existing?.pending ? existing.base_revision : (snapshot.baseRevision ?? 0);
   const baseContent = existing?.pending ? (existing.base_content ?? '') : (existing?.content || '');
   const baseTitle = existing?.pending ? (existing.base_title ?? existing.title ?? '') : (existing?.title || '');
   const baseTags = existing?.pending ? (existing.base_tags ?? existing.tags ?? '') : (existing?.tags || '');
   const now = new Date().toISOString();
   const local = {
     ...existing,
-    ...data,
-    id: currentNoteId,
-    filename: existing?.filename || `${currentNoteId}.md`,
-    revision: existing?.revision ?? currentRevision ?? 0,
+    title: snapshot.title,
+    tags: snapshot.tags,
+    content: snapshot.content,
+    id: snapshot.noteID,
+    filename: existing?.filename || `${snapshot.noteID}.md`,
+    revision: existing?.revision ?? snapshot.revision ?? 0,
     base_revision: baseRevision,
     base_content: baseContent,
     base_title: baseTitle,
@@ -1654,32 +1677,74 @@ async function saveCurrentNote(trySync = true) {
     updated_at: now,
   };
   try {
-    await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: currentNoteId, base_revision: baseRevision, note: local});
+    await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});
   } catch (error) {
     console.error('local save failed', error);
     showToast('Could not save locally. Free browser storage and try again.', 'warning');
     return false;
   }
-  currentBaseRevision = baseRevision;
-  savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
-  isDirty = false;
-  if (noteIDFromLocation() !== currentNoteId) setNoteRoute(currentNoteId);
-  setIdleSyncStatus();
+
+  // The IndexedDB write may have completed after another editor session was
+  // opened or after more text was entered. Only this exact session/snapshot
+  // may update the live editor state.
+  if (editorSnapshotIsCurrent(snapshot)) {
+    currentBaseRevision = baseRevision;
+    savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
+    isDirty = false;
+    if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+    setIdleSyncStatus();
+  }
   if (trySync) await syncNow();
+  return true;
+}
+
+function saveCurrentNote(trySync = true) {
+  localSaveRequested = true;
+  localSaveTrySync = localSaveTrySync || trySync;
+  if (localSavePromise) return localSavePromise;
+
+  localSavePromise = (async () => {
+    let result = true;
+    while (localSaveRequested) {
+      localSaveRequested = false;
+      const requestedTrySync = localSaveTrySync;
+      localSaveTrySync = false;
+      const noteID = currentNoteId || newLocalNoteID();
+      if (!currentNoteId) currentNoteId = noteID;
+      const data = readEditorSnapshot();
+      const snapshot = {
+        ...data,
+        noteID,
+        revision: currentRevision,
+        baseRevision: currentBaseRevision ?? currentRevision ?? 0,
+        sessionGeneration: editorSessionGeneration,
+      };
+      result = await persistEditorSnapshot(snapshot, requestedTrySync);
+    }
+    return result;
+  })().finally(() => {
+    localSavePromise = null;
+  });
+  return localSavePromise;
 }
 
 let saveTimer = null;
 let localSaveTimer = null;
 let previewTimer = null;
+let localSavePromise = null;
+let localSaveRequested = false;
+let localSaveTrySync = false;
 
 function scheduleSave() {
   if (localSaveTimer) clearTimeout(localSaveTimer);
   localSaveTimer = setTimeout(() => {
-    if (isDirty) saveCurrentNote(false);
+    localSaveTimer = null;
+    if (isDirty) void saveCurrentNote(false);
   }, 250);
   if (!prefs.autoSave) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    saveTimer = null;
     // The 250ms timer may already have durably saved this edit to IndexedDB
     // and cleared isDirty. Still call saveCurrentNote: its unchanged-note path
     // replays the queued operation, which is the intended 2s idle sync.
@@ -1687,7 +1752,7 @@ function scheduleSave() {
   }, 2000);
 }
 
-$('#save-btn').addEventListener('click', () => { if (saveTimer) clearTimeout(saveTimer); saveCurrentNote(); });
+$('#save-btn').addEventListener('click', () => { if (saveTimer) clearTimeout(saveTimer); void saveCurrentNote(); });
 $('#note-title').addEventListener('input', () => { markDirty(); scheduleSave(); });
 $('#note-tags').addEventListener('input', () => { markDirty(); scheduleSave(); });
 
@@ -2061,14 +2126,20 @@ function highlightBlock() {
 $('#delete-btn').addEventListener('click', async () => {
   if (!currentNoteId) return;
   if (!confirm('Delete this note?')) return;
-  const local = await getLocalNote(currentNoteId);
-  if (!local) return;
-  const pending = await hasPendingOperation(currentNoteId);
-  if (pending && (local.base_revision || 0) === 0) {
-    await removeLocalNoteAndSupersede(currentNoteId, 0);
-  } else {
-    await removeLocalNoteAndQueue(currentNoteId, {type: 'note.delete', note_id: currentNoteId, base_revision: local.base_revision ?? local.revision});
+  const noteID = currentNoteId;
+  if (isDirty || localSavePromise) {
+    const saved = await saveCurrentNote(false);
+    if (saved === false || currentNoteId !== noteID) return;
   }
+  const local = await getLocalNote(noteID);
+  if (!local) return;
+  const pending = await hasPendingOperation(noteID);
+  if (pending && (local.base_revision || 0) === 0) {
+    await removeLocalNoteAndSupersede(noteID, 0);
+  } else {
+    await removeLocalNoteAndQueue(noteID, {type: 'note.delete', note_id: noteID, base_revision: local.base_revision ?? local.revision});
+  }
+  editorSessionGeneration++;
   currentNoteId = null;
   currentRevision = 0;
   currentBaseRevision = null;
