@@ -1825,6 +1825,15 @@ async function restoreRoute() {
   await loadDashboard({sync: false});
 }
 
+async function restoreCachedStartup() {
+  const noteID = noteIDFromLocation();
+  if (noteID && await getLocalNote(noteID)) {
+    await openNote(noteID, {route: 'none'});
+    return;
+  }
+  await loadDashboard({sync: false});
+}
+
 // --- Autosave ---
 function markDirty() {
   if (!isDirty) {
@@ -2712,32 +2721,36 @@ async function loadPrefs() {
 
 // --- Init ---
 async function init() {
+  let localStartupReady = false;
   try {
+    await restoreCachedStartup();
+    localStartupReady = true;
+    $('#app').classList.remove('booting');
+
     const res = await api('/api/check');
     if (res) {
       cacheAppVersion(res);
-      await loadPrefs();
+      void loadPrefs();
       await restoreRoute();
       connectServerEvents();
       scheduleSync({reconcile: true});
     } else if (authenticationRequired) {
       // api() has already displayed the sign-in screen. A cached offline copy
       // must never override that when the server explicitly returned 401.
-    } else if (localStorage.getItem('mdnotes-offline-ready') === '1') {
+    } else {
       cacheAppVersion();
-      await loadPrefs();
       setSyncStatus('offline');
       showOfflineNotice();
-      await restoreRoute();
-    } else {
-      show(screens.login);
-      $('#login-form input').focus();
     }
   } catch (error) {
     console.error('initialization failed', error);
-    show(screens.login);
-    $('#login-error').textContent = 'Could not start the app. Please reload.';
-    $('#login-form input').focus();
+    if (localStartupReady) {
+      markServerOffline();
+    } else {
+      show(screens.login);
+      $('#login-error').textContent = 'Could not start the app. Please reload.';
+      $('#login-form input').focus();
+    }
   } finally {
     $('#app').classList.remove('booting');
   }

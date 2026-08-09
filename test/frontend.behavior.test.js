@@ -199,3 +199,43 @@ describe('F-04 service worker revisions', () => {
     expect(register).toHaveBeenCalledWith('/sw.js?revision=frontend-hash-123', {updateViaCache: 'none'});
   });
 });
+
+describe('startup responsiveness', () => {
+  test('shows a cached note before a slow server check completes', async () => {
+    let markCheckStarted;
+    let releaseCheck;
+    const checkStarted = new Promise(resolve => { markCheckStarted = resolve; });
+    const checkGate = new Promise(resolve => { releaseCheck = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/check') {
+          markCheckStarted();
+          await checkGate;
+          return response(503, 'offline');
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+    await app.hooks.putLocalNote({
+      id: 'note-a',
+      filename: 'note-a.md',
+      title: 'Cached note',
+      tags: '',
+      content: 'Available immediately',
+      revision: 1,
+      pending: false,
+    });
+    app.window.history.replaceState({}, '', '/note-a');
+
+    const startup = app.hooks.init();
+    await checkStarted;
+
+    expect(app.window.document.querySelector('#app').classList.contains('booting')).toBe(false);
+    expect(app.window.document.querySelector('#editor').classList.contains('hidden')).toBe(false);
+    expect(app.window.document.querySelector('#note-title').value).toBe('Cached note');
+
+    releaseCheck();
+    await startup;
+  });
+});

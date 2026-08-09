@@ -21,6 +21,8 @@ globalThis.__mdnotesTestHooks = {
   registerServiceWorker,
   acknowledgeCompactedOperation,
   getLocalNote,
+  putLocalNote,
+  init,
   getState: () => ({
     currentNoteId,
     currentRevision,
