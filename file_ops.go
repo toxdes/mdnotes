@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,10 +19,24 @@ const (
 )
 
 type fileOperation struct {
-	ID        string
-	Action    string
-	NoteID    string
-	StageName string
+	ID           string
+	Action       string
+	NoteID       string
+	StageName    string
+	ExpectedHash string
+}
+
+func fileContentHash(content []byte) string {
+	hash := sha256.Sum256(content)
+	return hex.EncodeToString(hash[:])
+}
+
+func fileMatchesHash(path, expected string) (bool, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return fileContentHash(content) == expected, nil
 }
 
 func stageNoteFile(notesDir string, content []byte) (string, error) {
@@ -55,19 +71,19 @@ func stageNoteFile(notesDir string, content []byte) (string, error) {
 }
 
 func recordFileOperation(tx *sql.Tx, operation fileOperation) error {
-	_, err := tx.Exec("INSERT INTO file_operations (id, action, note_id, stage_name, created_at) VALUES (?, ?, ?, ?, ?)", operation.ID, operation.Action, operation.NoteID, operation.StageName, time.Now().UTC().Format(time.RFC3339))
+	_, err := tx.Exec("INSERT INTO file_operations (id, action, note_id, stage_name, expected_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)", operation.ID, operation.Action, operation.NoteID, operation.StageName, operation.ExpectedHash, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 
 func (a *app) recoverFileOperations() error {
-	rows, err := a.db.Query("SELECT id, action, note_id, stage_name FROM file_operations ORDER BY created_at, id")
+	rows, err := a.db.Query("SELECT id, action, note_id, stage_name, expected_hash FROM file_operations ORDER BY created_at, id")
 	if err != nil {
 		return err
 	}
 	operations := make([]fileOperation, 0)
 	for rows.Next() {
 		var operation fileOperation
-		if err := rows.Scan(&operation.ID, &operation.Action, &operation.NoteID, &operation.StageName); err != nil {
+		if err := rows.Scan(&operation.ID, &operation.Action, &operation.NoteID, &operation.StageName, &operation.ExpectedHash); err != nil {
 			rows.Close()
 			return err
 		}
@@ -104,12 +120,28 @@ func (a *app) completeFileOperation(operation fileOperation) error {
 		if err != nil {
 			return err
 		}
+		if operation.ExpectedHash != "" {
+			matches, hashErr := fileMatchesHash(stage, operation.ExpectedHash)
+			if hashErr != nil && !errors.Is(hashErr, os.ErrNotExist) {
+				return hashErr
+			}
+			if hashErr == nil && !matches {
+				return errors.New("staged replacement hash does not match")
+			}
+		}
 		if err := os.Rename(stage, target); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
-			if _, statErr := os.Stat(target); statErr != nil {
-				return fmt.Errorf("staged replacement is missing: %w", statErr)
+			if operation.ExpectedHash == "" {
+				return errors.New("staged replacement is missing and has no expected hash")
+			}
+			matches, targetErr := fileMatchesHash(target, operation.ExpectedHash)
+			if targetErr != nil {
+				return fmt.Errorf("staged replacement is missing: %w", targetErr)
+			}
+			if !matches {
+				return errors.New("staged replacement target hash does not match")
 			}
 		}
 	case fileOperationDelete:
@@ -173,7 +205,7 @@ func (a *app) saveNoteWithFileOperation(id, title, tags, content string, expecte
 	if err != nil {
 		return nil, err
 	}
-	operation := fileOperation{ID: operationID, Action: fileOperationReplace, NoteID: id, StageName: stageName}
+	operation := fileOperation{ID: operationID, Action: fileOperationReplace, NoteID: id, StageName: stageName, ExpectedHash: fileContentHash(enc)}
 	if err := recordFileOperation(tx, operation); err != nil {
 		return nil, err
 	}

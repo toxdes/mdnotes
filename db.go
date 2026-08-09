@@ -92,6 +92,7 @@ var migrations = []migration{
 	{version: 9, up: migrateSyncOperationPayloadSchema},
 	{version: 10, up: migrateFileOperationSchema},
 	{version: 11, up: migrateClearLegacyIPBans},
+	{version: 12, up: migrateFileOperationHashSchema},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -409,6 +410,11 @@ func migrateFileOperationSchema(tx *sql.Tx) error {
 			created_at TEXT NOT NULL
 		);
 		CREATE INDEX idx_file_operations_created_at ON file_operations(created_at);`)
+	return err
+}
+
+func migrateFileOperationHashSchema(tx *sql.Tx) error {
+	_, err := tx.Exec("ALTER TABLE file_operations ADD COLUMN expected_hash TEXT NOT NULL DEFAULT ''")
 	return err
 }
 

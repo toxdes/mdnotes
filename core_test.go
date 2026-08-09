@@ -83,7 +83,7 @@ func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create migration table: %v", err)
 	}
-	for _, migration := range migrations[:len(migrations)-1] {
+	for _, migration := range migrations[:len(migrations)-2] {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin migration %d: %v", migration.version, err)
@@ -936,6 +936,43 @@ func TestRecoverFileOperationsCompletesCommittedReplacement(t *testing.T) {
 	var count int
 	if err := db.QueryRow("SELECT count(*) FROM file_operations").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("remaining file operations = %d, %v", count, err)
+	}
+}
+
+func TestRecoverFileOperationsRejectsOldTargetWhenStageIsMissing(t *testing.T) {
+	notesDir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(notesDir, "note-a.md"), []byte("old body"), 0600); err != nil {
+		t.Fatalf("write old target: %v", err)
+	}
+	stageName, err := stageNoteFile(notesDir, []byte("new body"))
+	if err != nil {
+		t.Fatalf("stage replacement: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO file_operations (id, action, note_id, stage_name, expected_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)", "replace-op", fileOperationReplace, "note-a", stageName, fileContentHash([]byte("new body")), "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("record file operation: %v", err)
+	}
+	if err := os.Remove(filepath.Join(notesDir, stageName)); err != nil {
+		t.Fatalf("remove stage: %v", err)
+	}
+	a := &app{db: db, notesDir: notesDir, noteCache: newNoteCache()}
+	if err := a.recoverFileOperations(); err == nil {
+		t.Fatal("recovery accepted an old target for a missing staged replacement")
+	}
+	data, err := os.ReadFile(filepath.Join(notesDir, "note-a.md"))
+	if err != nil || string(data) != "old body" {
+		t.Fatalf("target after failed recovery = %q, %v", data, err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM file_operations").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("remaining file operations = %d, %v; want 1", count, err)
 	}
 }
 
