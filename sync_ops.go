@@ -290,6 +290,9 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 	if _, err := tx.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)", deviceID, operation.ClientSequence, operation.OpID, operation.Type, string(encoded), encodedOperation, now); err != nil {
 		return syncOperationResult{}, err
 	}
+	if _, err := tx.Exec("UPDATE sync_operation_stats SET operation_count = operation_count + 1, payload_bytes = payload_bytes + ? WHERE id = 1", len(encodedOperation)); err != nil {
+		return syncOperationResult{}, err
+	}
 	if err := compactSyncOperationPayloads(tx); err != nil {
 		return syncOperationResult{}, err
 	}
@@ -318,57 +321,87 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 
 func compactSyncOperationAcknowledgements(tx *sql.Tx) error {
 	var count int64
-	if err := tx.QueryRow("SELECT count(*) FROM sync_operations").Scan(&count); err != nil {
+	if err := tx.QueryRow("SELECT operation_count FROM sync_operation_stats WHERE id = 1").Scan(&count); err != nil {
 		return err
 	}
 	if count <= maxSyncOperationAcknowledgements {
 		return nil
 	}
-	_, err := tx.Exec(`DELETE FROM sync_operations WHERE rowid IN (
+	result, err := tx.Exec(`DELETE FROM sync_operations WHERE rowid IN (
 		SELECT rowid FROM sync_operations
 		ORDER BY applied_at, device_id, client_sequence
 		LIMIT ?
 	)`, count-maxSyncOperationAcknowledgements)
+	if err != nil {
+		return err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec("UPDATE sync_operation_stats SET operation_count = operation_count - ? WHERE id = 1", removed)
 	return err
 }
 
 func compactSyncOperationPayloads(tx *sql.Tx) error {
 	var total int64
-	if err := tx.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&total); err != nil {
+	if err := tx.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&total); err != nil {
 		return err
 	}
 	if total <= maxSyncOperationPayloadBytes {
 		return nil
 	}
 	type storedPayload struct {
-		deviceID string
-		sequence int64
-		size     int64
+		rowID int64
+		size  int64
 	}
-	rows, err := tx.Query("SELECT device_id, client_sequence, length(operation) FROM sync_operations WHERE operation != ? ORDER BY applied_at, device_id, client_sequence", compactedOperationPayload)
-	if err != nil {
-		return err
-	}
-	payloads := make([]storedPayload, 0)
-	for rows.Next() {
-		var payload storedPayload
-		if err := rows.Scan(&payload.deviceID, &payload.sequence, &payload.size); err != nil {
-			rows.Close()
+	for total > maxSyncOperationPayloadBytes {
+		rows, err := tx.Query(`SELECT rowid, length(operation) FROM sync_operations
+			WHERE operation != ?
+			ORDER BY applied_at, device_id, client_sequence
+			LIMIT 100`, compactedOperationPayload)
+		if err != nil {
 			return err
 		}
-		payloads = append(payloads, payload)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, payload := range payloads {
-		if total <= maxSyncOperationPayloadBytes {
+		payloads := make([]storedPayload, 0, 100)
+		for rows.Next() {
+			var payload storedPayload
+			if err := rows.Scan(&payload.rowID, &payload.size); err != nil {
+				rows.Close()
+				return err
+			}
+			payloads = append(payloads, payload)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(payloads) == 0 {
 			break
 		}
-		if _, err := tx.Exec("UPDATE sync_operations SET operation = ? WHERE device_id = ? AND client_sequence = ?", compactedOperationPayload, payload.deviceID, payload.sequence); err != nil {
+		var reduced int64
+		for _, payload := range payloads {
+			result, err := tx.Exec("UPDATE sync_operations SET operation = ? WHERE rowid = ? AND operation != ?", compactedOperationPayload, payload.rowID, compactedOperationPayload)
+			if err != nil {
+				return err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed > 0 {
+				reduced += payload.size - int64(len(compactedOperationPayload))
+			}
+		}
+		if reduced <= 0 {
+			break
+		}
+		total -= reduced
+		if _, err := tx.Exec("UPDATE sync_operation_stats SET payload_bytes = ? WHERE id = 1", total); err != nil {
 			return err
 		}
-		total -= payload.size - int64(len(compactedOperationPayload))
 	}
 	return nil
 }

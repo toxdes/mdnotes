@@ -83,7 +83,7 @@ func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create migration table: %v", err)
 	}
-	for _, migration := range migrations[:len(migrations)-3] {
+	for _, migration := range migrations[:len(migrations)-4] {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin migration %d: %v", migration.version, err)
@@ -881,6 +881,9 @@ func TestCompactSyncOperationPayloadsPreservesAcknowledgements(t *testing.T) {
 			t.Fatalf("insert operation %d: %v", sequence, err)
 		}
 	}
+	if _, err := tx.Exec("UPDATE sync_operation_stats SET operation_count = 2, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1"); err != nil {
+		t.Fatalf("update sync operation stats: %v", err)
+	}
 	if err := compactSyncOperationPayloads(tx); err != nil {
 		t.Fatalf("compact payloads: %v", err)
 	}
@@ -896,6 +899,13 @@ func TestCompactSyncOperationPayloadsPreservesAcknowledgements(t *testing.T) {
 	}
 	if compactedCount == 0 || resultCount != 2 {
 		t.Fatalf("compacted = %d, acknowledgements = %d", compactedCount, resultCount)
+	}
+	var trackedBytes, actualBytes int64
+	if err := db.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&trackedBytes); err != nil {
+		t.Fatalf("read tracked payload bytes: %v", err)
+	}
+	if err := db.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&actualBytes); err != nil || trackedBytes != actualBytes {
+		t.Fatalf("tracked payload bytes = %d, actual = %d, %v", trackedBytes, actualBytes, err)
 	}
 }
 

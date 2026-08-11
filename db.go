@@ -94,6 +94,7 @@ var migrations = []migration{
 	{version: 11, up: migrateClearLegacyIPBans},
 	{version: 12, up: migrateFileOperationHashSchema},
 	{version: 13, up: migrateFileOperationRecoverySchema},
+	{version: 14, up: migrateSyncOperationCompactionSchema},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -424,6 +425,19 @@ func migrateFileOperationRecoverySchema(tx *sql.Tx) error {
 		ALTER TABLE file_operations ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE file_operations ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
 		ALTER TABLE file_operations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;`)
+	return err
+}
+
+func migrateSyncOperationCompactionSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE sync_operation_stats (
+			id              INTEGER PRIMARY KEY CHECK (id = 1),
+			operation_count INTEGER NOT NULL DEFAULT 0,
+			payload_bytes   INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO sync_operation_stats (id, operation_count, payload_bytes)
+		SELECT 1, COUNT(*), COALESCE(SUM(length(operation)), 0) FROM sync_operations;
+		CREATE INDEX idx_sync_operations_applied_at ON sync_operations(applied_at, device_id, client_sequence);`)
 	return err
 }
 
