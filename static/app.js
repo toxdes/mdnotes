@@ -867,9 +867,106 @@ async function bulkRemoteNotes(noteIDs) {
   return notes;
 }
 
+async function loadSyncGuards() {
+  return withOfflineStore(['queue', 'state'], 'readonly', async stores => {
+    const [operations, records] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+    ]);
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    return guarded;
+  });
+}
+
+async function applyRemoteChangePage(changes, downloaded, nextSequence) {
+  let activeNote = null;
+  let activeDeleted = false;
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const [operations, records] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+    ]);
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    for (const change of changes) {
+      if (guarded.has(change.note_id)) continue;
+      const remote = change.deleted ? null : downloaded.get(change.note_id);
+      const local = await requestValue(stores.notes.get(change.note_id));
+      if (local?.pending || (currentNoteId === change.note_id && isDirty)) continue;
+      if (!remote) {
+        await requestValue(stores.notes.delete(change.note_id));
+        if (currentNoteId === change.note_id) activeDeleted = true;
+        continue;
+      }
+      const next = {...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null};
+      await requestValue(stores.notes.put(next));
+      if (currentNoteId === change.note_id && !isDirty) activeNote = next;
+    }
+    await requestValue(stores.state.put({key: 'syncSequence', value: nextSequence}));
+  });
+  if (activeNote) updateOpenNote(activeNote);
+  if (activeDeleted && currentNoteId && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
+async function applyRemoteSnapshot(remoteNotes, remoteIDs, sequence = null) {
+  let activeNote = null;
+  let activeDeleted = false;
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const [operations, records, locals] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+      requestValue(stores.notes.getAll()),
+    ]);
+    const localByID = new Map(locals.map(note => [note.id, note]));
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    for (const [id, remote] of remoteNotes) {
+      if (guarded.has(id)) continue;
+      const local = localByID.get(id);
+      if (local?.pending || (currentNoteId === id && isDirty)) continue;
+      const next = {...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null};
+      await requestValue(stores.notes.put(next));
+      if (currentNoteId === id && !isDirty) activeNote = next;
+    }
+    for (const local of locals) {
+      if (remoteIDs.has(local.id) || guarded.has(local.id)) continue;
+      await requestValue(stores.notes.delete(local.id));
+      if (currentNoteId === local.id) activeDeleted = true;
+    }
+    if (sequence !== null) await requestValue(stores.state.put({key: 'syncSequence', value: sequence}));
+  });
+  if (activeNote) updateOpenNote(activeNote);
+  if (activeDeleted && currentNoteId && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
 async function pullRemoteChanges() {
   let since = Number(await getOfflineState('syncSequence') || 0);
   const fetchedNotes = new Map();
+  const guards = await loadSyncGuards();
   for (;;) {
     const page = await api(`/api/sync?since=${since}&limit=100`);
     if (!page) throw new Error('could not fetch sync changes');
@@ -880,34 +977,17 @@ async function pullRemoteChanges() {
     const downloadIDs = [];
     for (const change of page.changes) {
       if (change.deleted || fetchedNotes.has(change.note_id)) continue;
-      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
+      if (guards.has(change.note_id)) continue;
       downloadIDs.push(change.note_id);
     }
     const downloaded = await bulkRemoteNotes([...new Set(downloadIDs)]);
     downloaded.forEach((remote, id) => fetchedNotes.set(id, remote));
-
-    for (const change of page.changes) {
-      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
-      if (change.deleted) {
-        await applyRemoteDeletion(change.note_id);
-        continue;
-      }
-      const remote = fetchedNotes.get(change.note_id);
-      if (!remote) {
-        // The feed records history. A save entry can therefore be followed by
-        // a later deletion before this device asks for the current note. A
-        // missing entry is the authoritative final state, not a sync failure.
-        await applyRemoteDeletion(change.note_id);
-        continue;
-      }
-      await cacheRemoteNote(remote);
-    }
     const nextSince = Number(page.nextSequence || since);
     if (page.hasMore && nextSince <= since) {
       throw new Error(`sync cursor did not advance (since ${since}, next ${nextSince})`);
     }
+    await applyRemoteChangePage(page.changes, fetchedNotes, nextSince);
     since = nextSince;
-    await setOfflineState('syncSequence', since);
     if (!page.hasMore) return;
   }
 }
@@ -918,25 +998,17 @@ async function resetLocalNotesFromRemote(sequence) {
   const remoteIDs = new Set(summaries.map(note => note.id));
   const remoteNotes = new Map();
   const downloadIDs = [];
+  const guards = await loadSyncGuards();
   for (const summary of summaries) {
-    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
+    if (guards.has(summary.id)) continue;
     downloadIDs.push(summary.id);
   }
   for (let index = 0; index < downloadIDs.length; index += 100) {
     const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
     page.forEach((remote, id) => remoteNotes.set(id, remote));
   }
-  for (const id of downloadIDs) {
-    const remote = remoteNotes.get(id);
-    if (!remote) throw new Error('could not download refreshed note');
-    await cacheRemoteNote(remote);
-  }
-  for (const local of await getAllLocalNotes()) {
-    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id)) {
-      await removeLocalNote(local.id);
-    }
-  }
-  await setOfflineState('syncSequence', sequence);
+  for (const id of downloadIDs) if (!remoteNotes.get(id)) throw new Error('could not download refreshed note');
+  await applyRemoteSnapshot(remoteNotes, remoteIDs, sequence);
 }
 
 // A sync cursor records that this browser has observed the change feed, but a
@@ -948,24 +1020,22 @@ async function reconcileLocalNotes() {
   if (!Array.isArray(summaries)) throw new Error('could not reconcile local notes');
   const remoteIDs = new Set(summaries.map(note => note.id));
   const downloadIDs = [];
+  const remoteNotes = new Map();
+  const guards = await loadSyncGuards();
+  const locals = await getAllLocalNotes();
+  const localByID = new Map(locals.map(note => [note.id, note]));
   for (const summary of summaries) {
-    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
-    const local = await getLocalNote(summary.id);
+    if (guards.has(summary.id)) continue;
+    const local = localByID.get(summary.id);
     if (local && local.revision === summary.revision) continue;
     downloadIDs.push(summary.id);
   }
   for (let index = 0; index < downloadIDs.length; index += 100) {
     const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
-    for (const [id, remote] of page) {
-      if (!remote) throw new Error('could not download reconciled note');
-      await cacheRemoteNote(remote);
-    }
+    page.forEach((remote, id) => remoteNotes.set(id, remote));
   }
-  for (const local of await getAllLocalNotes()) {
-    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id) && !await getUnresolvedConflict(local.id)) {
-      await removeLocalNote(local.id);
-    }
-  }
+  for (const id of downloadIDs) if (!remoteNotes.get(id)) throw new Error('could not download reconciled note');
+  await applyRemoteSnapshot(remoteNotes, remoteIDs);
 }
 
 function updateOpenNote(note) {

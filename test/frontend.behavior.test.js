@@ -338,6 +338,25 @@ describe('batched queue flushing', () => {
   });
 });
 
+describe('batched remote application', () => {
+  test('applies a change page and cursor in one logical local update', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Old', content: 'Old content', revision: 1});
+    await app.hooks.putLocalNote({id: 'note-b', title: 'Delete me', content: 'Remove', revision: 1});
+    const remote = {id: 'note-a', title: 'New', tags: 'work', content: 'New content', revision: 2};
+
+    await app.hooks.applyRemoteChangePage(
+      [{note_id: 'note-a', deleted: false}, {note_id: 'note-b', deleted: true}],
+      new Map([['note-a', remote]]),
+      42,
+    );
+
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({...remote, pending: false});
+    expect(await app.hooks.getLocalNote('note-b')).toBeUndefined();
+    expect(await app.hooks.getOfflineState('syncSequence')).toBe(42);
+  });
+});
+
 describe('logout storage cleanup', () => {
   test('waits for other database connections before reporting cleanup complete', async () => {
     const first = track(await createApp());
