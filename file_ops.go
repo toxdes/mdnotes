@@ -24,6 +24,9 @@ type fileOperation struct {
 	NoteID       string
 	StageName    string
 	ExpectedHash string
+	FailureCount int
+	LastError    string
+	Quarantined  bool
 }
 
 func fileContentHash(content []byte) string {
@@ -39,6 +42,30 @@ func fileMatchesHash(path, expected string) (bool, error) {
 	return fileContentHash(content) == expected, nil
 }
 
+func syncNotesDirectory(notesDir string) error {
+	directory, err := os.Open(notesDir)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func removeFileAndSync(notesDir, name string) error {
+	err := os.Remove(filepath.Join(notesDir, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return syncNotesDirectory(notesDir)
+}
+
 func stageNoteFile(notesDir string, content []byte) (string, error) {
 	tmp, err := os.CreateTemp(notesDir, stageFilePrefix+"*")
 	if err != nil {
@@ -48,7 +75,7 @@ func stageNoteFile(notesDir string, content []byte) (string, error) {
 	remove := true
 	defer func() {
 		if remove {
-			_ = os.Remove(path)
+			_ = removeFileAndSync(notesDir, filepath.Base(path))
 		}
 	}()
 	if err := tmp.Chmod(0600); err != nil {
@@ -66,6 +93,9 @@ func stageNoteFile(notesDir string, content []byte) (string, error) {
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
+	if err := syncNotesDirectory(notesDir); err != nil {
+		return "", err
+	}
 	remove = false
 	return filepath.Base(path), nil
 }
@@ -76,17 +106,19 @@ func recordFileOperation(tx *sql.Tx, operation fileOperation) error {
 }
 
 func (a *app) recoverFileOperations() error {
-	rows, err := a.db.Query("SELECT id, action, note_id, stage_name, expected_hash FROM file_operations ORDER BY created_at, id")
+	rows, err := a.db.Query("SELECT id, action, note_id, stage_name, expected_hash, failure_count, last_error, quarantined FROM file_operations WHERE quarantined = 0 ORDER BY created_at, id")
 	if err != nil {
 		return err
 	}
 	operations := make([]fileOperation, 0)
 	for rows.Next() {
 		var operation fileOperation
-		if err := rows.Scan(&operation.ID, &operation.Action, &operation.NoteID, &operation.StageName, &operation.ExpectedHash); err != nil {
+		var quarantined int
+		if err := rows.Scan(&operation.ID, &operation.Action, &operation.NoteID, &operation.StageName, &operation.ExpectedHash, &operation.FailureCount, &operation.LastError, &quarantined); err != nil {
 			rows.Close()
 			return err
 		}
+		operation.Quarantined = quarantined != 0
 		operations = append(operations, operation)
 	}
 	if err := rows.Close(); err != nil {
@@ -97,10 +129,31 @@ func (a *app) recoverFileOperations() error {
 	}
 	for _, operation := range operations {
 		if err := a.completeFileOperation(operation); err != nil {
-			return err
+			if recordErr := a.recordFileOperationFailure(operation, err); recordErr != nil {
+				return recordErr
+			}
 		}
 	}
 	return a.removeOrphanedStageFiles()
+}
+
+func (a *app) recordFileOperationFailure(operation fileOperation, recoveryErr error) error {
+	message := strings.TrimSpace(recoveryErr.Error())
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	_, err := a.db.Exec(`UPDATE file_operations
+		SET failure_count = failure_count + 1,
+		    last_error = ?,
+		    quarantined = CASE WHEN failure_count + 1 >= 3 THEN 1 ELSE quarantined END
+		WHERE id = ?`, message, operation.ID)
+	return err
+}
+
+func (a *app) fileOperationBlocked(noteID string) (bool, error) {
+	var count int
+	err := a.db.QueryRow("SELECT COUNT(*) FROM file_operations WHERE note_id = ?", noteID).Scan(&count)
+	return count > 0, err
 }
 
 func (a *app) completeFileOperation(operation fileOperation) error {
@@ -129,6 +182,7 @@ func (a *app) completeFileOperation(operation fileOperation) error {
 				return errors.New("staged replacement hash does not match")
 			}
 		}
+		replaced := false
 		if err := os.Rename(stage, target); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -143,10 +197,27 @@ func (a *app) completeFileOperation(operation fileOperation) error {
 			if !matches {
 				return errors.New("staged replacement target hash does not match")
 			}
+		} else {
+			replaced = true
+		}
+		if replaced {
+			if err := syncNotesDirectory(a.notesDir); err != nil {
+				return err
+			}
 		}
 	case fileOperationDelete:
-		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		removed := false
+		if err := os.Remove(target); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		} else {
+			removed = true
+		}
+		if removed {
+			if err := syncNotesDirectory(a.notesDir); err != nil {
+				return err
+			}
 		}
 	default:
 		return errors.New("unknown file operation")
@@ -156,6 +227,25 @@ func (a *app) completeFileOperation(operation fileOperation) error {
 }
 
 func (a *app) removeOrphanedStageFiles() error {
+	rows, err := a.db.Query("SELECT stage_name FROM file_operations WHERE stage_name != ''")
+	if err != nil {
+		return err
+	}
+	referenced := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		referenced[name] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(a.notesDir)
 	if err != nil {
 		return err
@@ -164,11 +254,14 @@ func (a *app) removeOrphanedStageFiles() error {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), stageFilePrefix) {
 			continue
 		}
+		if _, ok := referenced[entry.Name()]; ok {
+			continue
+		}
 		if err := os.Remove(filepath.Join(a.notesDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	return nil
+	return syncNotesDirectory(a.notesDir)
 }
 
 func (a *app) saveNoteWithFileOperation(id, title, tags, content string, expectedRevision *int64) (*note, error) {
@@ -183,7 +276,7 @@ func (a *app) saveNoteWithFileOperation(id, title, tags, content string, expecte
 	committed := false
 	defer func() {
 		if !committed {
-			_ = os.Remove(filepath.Join(a.notesDir, stageName))
+			_ = removeFileAndSync(a.notesDir, stageName)
 		}
 	}()
 

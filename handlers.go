@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -223,7 +224,10 @@ func (a *app) loadNoteWithContent(id string) (noteWithContent, error) {
 	}
 	enc, err := os.ReadFile(path)
 	if err != nil {
-		return noteWithContent{}, sql.ErrNoRows
+		if errors.Is(err, os.ErrNotExist) {
+			return noteWithContent{}, sql.ErrNoRows
+		}
+		return noteWithContent{}, fmt.Errorf("read note file: %w", err)
 	}
 	plain, err := a.encryption.decryptNote(enc, id)
 	if err != nil {
@@ -364,6 +368,17 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
 		return
 	}
+	if blocked, err := a.fileOperationBlocked(id); err != nil {
+		http.Error(w, "could not inspect pending file operations", http.StatusInternalServerError)
+		return
+	} else if blocked {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "note file recovery requires attention",
+			"code":    "note_file_recovery_blocked",
+			"note_id": id,
+		})
+		return
+	}
 	n, err := a.saveNoteWithFileOperation(id, req.Title, tags, req.Content, req.BaseRevision)
 	if errors.Is(err, errRevisionConflict) {
 		a.writeNoteRevisionConflict(w, id)
@@ -398,6 +413,17 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 	defer a.noteMu.Unlock()
 	if err := a.recoverFileOperations(); err != nil {
 		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		return
+	}
+	if blocked, err := a.fileOperationBlocked(id); err != nil {
+		http.Error(w, "could not inspect pending file operations", http.StatusInternalServerError)
+		return
+	} else if blocked {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "note file recovery requires attention",
+			"code":    "note_file_recovery_blocked",
+			"note_id": id,
+		})
 		return
 	}
 	err := a.deleteNoteWithFileOperation(id, expectedRevision)

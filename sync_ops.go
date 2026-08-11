@@ -82,6 +82,22 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
 		return
 	}
+	for _, operation := range request.Operations {
+		if operation.Type != "note.save" && operation.Type != "note.delete" {
+			continue
+		}
+		if blocked, err := a.fileOperationBlocked(operation.NoteID); err != nil {
+			http.Error(w, "could not inspect pending file operations", http.StatusInternalServerError)
+			return
+		} else if blocked {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error":   "note file recovery requires attention",
+				"code":    "note_file_recovery_blocked",
+				"note_id": operation.NoteID,
+			})
+			return
+		}
+	}
 
 	lastSequence, err := syncDeviceSequence(a.db, request.DeviceID)
 	if err != nil {

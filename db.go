@@ -93,6 +93,7 @@ var migrations = []migration{
 	{version: 10, up: migrateFileOperationSchema},
 	{version: 11, up: migrateClearLegacyIPBans},
 	{version: 12, up: migrateFileOperationHashSchema},
+	{version: 13, up: migrateFileOperationRecoverySchema},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -415,6 +416,14 @@ func migrateFileOperationSchema(tx *sql.Tx) error {
 
 func migrateFileOperationHashSchema(tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE file_operations ADD COLUMN expected_hash TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+func migrateFileOperationRecoverySchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		ALTER TABLE file_operations ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE file_operations ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+		ALTER TABLE file_operations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;`)
 	return err
 }
 

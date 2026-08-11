@@ -83,7 +83,7 @@ func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create migration table: %v", err)
 	}
-	for _, migration := range migrations[:len(migrations)-2] {
+	for _, migration := range migrations[:len(migrations)-3] {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin migration %d: %v", migration.version, err)
@@ -1025,8 +1025,8 @@ func TestRecoverFileOperationsRejectsOldTargetWhenStageIsMissing(t *testing.T) {
 		t.Fatalf("remove stage: %v", err)
 	}
 	a := &app{db: db, notesDir: notesDir, noteCache: newNoteCache()}
-	if err := a.recoverFileOperations(); err == nil {
-		t.Fatal("recovery accepted an old target for a missing staged replacement")
+	if err := a.recoverFileOperations(); err != nil {
+		t.Fatalf("recovery returned an unrelated failure: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(notesDir, "note-a.md"))
 	if err != nil || string(data) != "old body" {
@@ -1035,6 +1035,85 @@ func TestRecoverFileOperationsRejectsOldTargetWhenStageIsMissing(t *testing.T) {
 	var count int
 	if err := db.QueryRow("SELECT count(*) FROM file_operations").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("remaining file operations = %d, %v; want 1", count, err)
+	}
+	blocked, err := a.fileOperationBlocked("note-a")
+	if err != nil || !blocked {
+		t.Fatalf("failed recovery blocked note = %t, %v; want true", blocked, err)
+	}
+}
+
+func TestRecoverFileOperationsIsolatesFailedNote(t *testing.T) {
+	notesDir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(notesDir, "note-a.md"), []byte("old body"), 0600); err != nil {
+		t.Fatalf("write old target: %v", err)
+	}
+	stageName, err := stageNoteFile(notesDir, []byte("unrelated new body"))
+	if err != nil {
+		t.Fatalf("stage unrelated replacement: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO file_operations (id, action, note_id, stage_name, expected_hash, created_at) VALUES
+		('failed-op', ?, 'note-a', 'missing-stage', ?, '2026-01-01T00:00:00Z'),
+		('healthy-op', ?, 'note-b', ?, ?, '2026-01-01T00:00:01Z')`, fileOperationReplace, fileContentHash([]byte("new body")), fileOperationReplace, stageName, fileContentHash([]byte("unrelated new body"))); err != nil {
+		t.Fatalf("record file operations: %v", err)
+	}
+	a := &app{db: db, notesDir: notesDir, noteCache: newNoteCache()}
+	if err := a.recoverFileOperations(); err != nil {
+		t.Fatalf("recover file operations: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(notesDir, "note-b.md"))
+	if err != nil || string(data) != "unrelated new body" {
+		t.Fatalf("unrelated note after recovery = %q, %v", data, err)
+	}
+	blocked, err := a.fileOperationBlocked("note-a")
+	if err != nil || !blocked {
+		t.Fatalf("failed note blocked = %t, %v; want true", blocked, err)
+	}
+	blocked, err = a.fileOperationBlocked("note-b")
+	if err != nil || blocked {
+		t.Fatalf("healthy note blocked = %t, %v; want false", blocked, err)
+	}
+	for range 2 {
+		if err := a.recoverFileOperations(); err != nil {
+			t.Fatalf("repeat recovery: %v", err)
+		}
+	}
+	var quarantined int
+	if err := db.QueryRow("SELECT quarantined FROM file_operations WHERE id = 'failed-op'").Scan(&quarantined); err != nil || quarantined != 1 {
+		t.Fatalf("failed operation quarantine = %d, %v; want 1", quarantined, err)
+	}
+}
+
+func TestUnreadableNoteFileIsNotReportedAsMissing(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := upsertNote(db, "unreadable", "Unreadable", "unreadable.md", ""); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "unreadable.md"), 0700); err != nil {
+		t.Fatalf("create unreadable note path: %v", err)
+	}
+	a := &app{db: db, notesDir: dir, noteCache: newNoteCache()}
+	r := httptest.NewRequest(http.MethodGet, "/api/notes/unreadable", nil)
+	r.SetPathValue("id", "unreadable")
+	w := httptest.NewRecorder()
+	a.handleGetNote(w, r)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("unreadable note status = %d: %s", w.Code, w.Body.String())
 	}
 }
 
