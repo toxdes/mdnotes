@@ -1344,32 +1344,109 @@ async function acknowledgeCompactedOperation(operation) {
   }
 }
 
+const syncPushBatchLimit = 100;
+const syncPushBatchByteLimit = 3 * 1024 * 1024;
+
+function outgoingSyncOperation(operation) {
+  const outgoing = {
+    client_sequence: operation.client_sequence,
+    op_id: operation.op_id,
+    type: operation.type,
+    note_id: operation.note_id,
+    base_revision: operation.base_revision,
+  };
+  if (operation.type === 'note.save') {
+    outgoing.title = operation.note.title;
+    outgoing.tags = operation.note.tags;
+    outgoing.content = operation.note.content;
+    outgoing.base_content = operation.note.base_content || '';
+  } else if (operation.type === 'prefs.save') {
+    outgoing.prefs = operation.prefs;
+  }
+  return outgoing;
+}
+
+function encodedByteLength(value) {
+  const encoded = JSON.stringify(value);
+  return typeof TextEncoder === 'function' ? new TextEncoder().encode(encoded).byteLength : encoded.length;
+}
+
+function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
+  return withOfflineStore(['queue'], 'readwrite', stores => new Promise((resolve, reject) => {
+    const batch = [];
+    const request = stores.queue.index('client_sequence').openCursor();
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve(batch);
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor || batch.length >= maxOperations) {
+        finish();
+        return;
+      }
+      const operation = cursor.value;
+      const candidate = [...batch.map(item => outgoingSyncOperation(item)), outgoingSyncOperation(operation)];
+      const requestBytes = encodedByteLength({device_id: deviceID, operations: candidate});
+      if (batch.length && requestBytes > maxBytes) {
+        finish();
+        return;
+      }
+      if (!operation.attempted_at) {
+        operation.attempted_at = new Date().toISOString();
+        cursor.update(operation);
+      }
+      batch.push(operation);
+      if (batch.length >= maxOperations) finish();
+      else cursor.continue();
+    };
+  }));
+}
+
+async function applySyncAcknowledgement(operation, acknowledgement) {
+  if (acknowledgement.status === 'compacted') {
+    await acknowledgeCompactedOperation(operation);
+    return;
+  }
+  if (acknowledgement.status === 'conflict') {
+    if (await mergeConflictedNote(operation)) {
+      showToast('Merged your non-overlapping changes.', 'success');
+    } else {
+      const resolverReady = await createConflictResolution(operation);
+      if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
+      else showToast('A conflict copy was created so your changes are safe.', 'warning');
+    }
+    return;
+  }
+  if (acknowledgement.status !== 'applied') throw new Error('unknown sync acknowledgement');
+  if (operation.type === 'note.save') {
+    const acknowledgedNote = operation.note;
+    const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
+    const local = await getLocalNote(operation.note_id);
+    if (local) {
+      await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+    }
+    if (currentNoteId === operation.note_id) {
+      currentRevision = acknowledgement.revision || 0;
+      currentBaseRevision = hasLater ? acknowledgement.revision : null;
+    }
+  }
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
+}
+
 async function flushPendingChanges() {
   let pushed = false;
+  let maxOperations = syncPushBatchLimit;
   for (;;) {
-    const operations = await pendingOperations();
+    const deviceID = await syncDeviceID();
+    const operations = await claimPendingOperationBatch(deviceID, maxOperations, syncPushBatchByteLimit);
     if (!operations.length) return pushed;
-    const operation = await claimQueueOperation(operations[0].id);
-    if (!operation) continue;
-    const outgoing = {
-      client_sequence: operation.client_sequence,
-      op_id: operation.op_id,
-      type: operation.type,
-      note_id: operation.note_id,
-      base_revision: operation.base_revision,
-    };
-    if (operation.type === 'note.save') {
-      outgoing.title = operation.note.title;
-      outgoing.tags = operation.note.tags;
-      outgoing.content = operation.note.content;
-      outgoing.base_content = operation.note.base_content || '';
-    } else if (operation.type === 'prefs.save') {
-      outgoing.prefs = operation.prefs;
-    }
-    let result;
-    result = await syncFetch('/api/sync/push', {
+    const result = await syncFetch('/api/sync/push', {
       method: 'POST',
-      body: JSON.stringify({device_id: await syncDeviceID(), operations: [outgoing]}),
+      body: JSON.stringify({device_id: deviceID, operations: operations.map(outgoingSyncOperation)}),
     });
     pushed = true;
     if (result.response.status === 401) {
@@ -1388,43 +1465,25 @@ async function flushPendingChanges() {
     }
     if (!result.response.ok) {
       const permanent = result.response.status === 400 || result.response.status === 413 || result.data?.permanent === true;
-      if (permanent && await quarantineQueueOperation(operation, typeof result.data === 'string' ? result.data : result.data?.error)) {
-        showToast('A local change needs attention before it can sync.', 'warning');
-        continue;
+      if (permanent) {
+        if (operations.length > 1) {
+          maxOperations = result.response.status === 413 ? Math.max(1, Math.floor(maxOperations / 2)) : 1;
+          continue;
+        }
+        if (await quarantineQueueOperation(operations[0], typeof result.data === 'string' ? result.data : result.data?.error)) {
+          showToast('A local change needs attention before it can sync.', 'warning');
+          continue;
+        }
       }
       const error = new Error(typeof result.data === 'string' ? result.data : 'sync failed');
       error.responseStatus = result.response.status;
       throw error;
     }
-    const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
-    if (!acknowledgement) throw new Error('sync acknowledgement missing');
-    if (acknowledgement.status === 'compacted') {
-      await acknowledgeCompactedOperation(operation);
-      continue;
+    for (const operation of operations) {
+      const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
+      if (!acknowledgement) throw new Error('sync acknowledgement missing');
+      await applySyncAcknowledgement(operation, acknowledgement);
     }
-    if (acknowledgement.status === 'conflict') {
-      if (await mergeConflictedNote(operation)) {
-        showToast('Merged your non-overlapping changes.', 'success');
-      } else {
-        const resolverReady = await createConflictResolution(operation);
-        if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
-        else showToast('A conflict copy was created so your changes are safe.', 'warning');
-      }
-      continue;
-    }
-    if (operation.type === 'note.save') {
-      const acknowledgedNote = operation.note;
-      const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
-      const local = await getLocalNote(operation.note_id);
-      if (local) {
-        await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
-      }
-      if (currentNoteId === operation.note_id) {
-        currentRevision = acknowledgement.revision || 0;
-        currentBaseRevision = hasLater ? acknowledgement.revision : null;
-      }
-    }
-    await removePendingOperationIfIdentityMatches(operation.id, operation);
   }
 }
 

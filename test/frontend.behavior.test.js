@@ -268,10 +268,15 @@ describe('permanent queue rejection recovery', () => {
             op_id: operation.op_id,
           }));
         }
-        if (pushCount === 2) expect(operation.type).toBe('noop');
+        if (pushCount === 2) {
+          expect(request.operations).toHaveLength(1);
+          expect(operation.type).toBe('note.save');
+          return response(400, JSON.stringify({error: 'invalid note save operation', permanent: true, op_id: operation.op_id}));
+        }
+        if (pushCount === 3) expect(operation.type).toBe('noop');
         else expect(operation.type).toBe('note.save');
         return response(200, JSON.stringify({
-          acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'applied', revision: pushCount === 2 ? undefined : 1}],
+          acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'applied', revision: pushCount === 3 ? undefined : 1}],
           expected_sequence: operation.client_sequence + 1,
         }));
       },
@@ -291,10 +296,45 @@ describe('permanent queue rejection recovery', () => {
     });
 
     expect(await app.hooks.flushPendingChanges()).toBe(true);
-    expect(pushCount).toBe(3);
+    expect(pushCount).toBe(4);
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
     expect(await app.hooks.getOfflineState('rejectedSync:note-a')).toMatchObject({type: 'note.save'});
     expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pending: true, content: 'Keep locally'});
+  });
+});
+
+describe('batched queue flushing', () => {
+  test('sends ordered pending operations in one bounded push', async () => {
+    const requests = [];
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        if (String(path) !== '/api/sync/push') throw new Error(`unexpected request: ${path}`);
+        const request = JSON.parse(options.body);
+        requests.push(request);
+        return response(200, JSON.stringify({
+          acknowledged: request.operations.map((operation, index) => ({
+            client_sequence: operation.client_sequence,
+            op_id: operation.op_id,
+            status: 'applied',
+            revision: index + 1,
+          })),
+          expected_sequence: request.operations.at(-1).client_sequence + 1,
+        }));
+      },
+    }));
+    for (const [index, id] of ['note-a', 'note-b', 'note-c'].entries()) {
+      await app.hooks.queueOperation({
+        type: 'note.save',
+        note_id: id,
+        base_revision: 0,
+        note: {id, title: `Note ${index}`, content: `Content ${index}`},
+      });
+    }
+
+    await app.hooks.flushPendingChanges();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].operations.map(operation => operation.note_id)).toEqual(['note-a', 'note-b', 'note-c']);
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
   });
 });
 
