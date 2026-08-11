@@ -28,6 +28,8 @@ globalThis.__mdnotesTestHooks = {
   getOfflineDatabaseInfo,
   getOfflineState,
   clearOfflineData,
+  api,
+  cancelActiveSyncRequests,
   putLocalNote,
   init,
   getState: () => ({

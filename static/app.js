@@ -740,6 +740,7 @@ function beginSyncNetworkRequest() {
 
 function endSyncNetworkRequest() {
   syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
+  if (syncNetworkRequestsInFlight === 0) setIdleSyncStatus();
 }
 
 function setIdleSyncStatus() {
@@ -769,11 +770,11 @@ async function api(path, opts) {
       credentials: 'same-origin',
       headers: requestOpts?.body ? {'Content-Type':'application/json'} : {},
       ...requestOpts,
-    });
+    }, {group: syncRequest ? activeSyncControllers : null});
     if (res.status === 401) {
       setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
       requireAuthentication();
-      if (throwOnError) throw new APIError('authentication required', 401);
+      if (throwOnError || syncRequest) throw new APIError('authentication required', 401);
       return null;
     }
     if (res.status === 204) return true;
@@ -786,7 +787,7 @@ async function api(path, opts) {
     const error = e instanceof APIError ? e : Object.assign(e, {retryable: true});
     setSyncDiagnostic(`${method} ${path} ${error?.responseStatus ? `returned HTTP ${error.responseStatus}` : 'failed'}: ${error?.message || 'unknown error'}`, error?.responseStatus);
     console.error(error);
-    if (throwOnError) throw error;
+    if (throwOnError || syncRequest) throw error;
     return null;
   } finally {
     if (syncRequest) endSyncNetworkRequest();
@@ -857,7 +858,7 @@ async function bulkRemoteNotes(noteIDs) {
   const notes = new Map();
   for (let index = 0; index < noteIDs.length; index += bulkNoteBatchSize) {
     const batch = noteIDs.slice(index, index + bulkNoteBatchSize);
-    const response = await api(`/api/sync/notes?ids=${encodeURIComponent(batch.join(','))}`);
+    const response = await api(`/api/sync/notes?ids=${encodeURIComponent(batch.join(','))}`, {syncRequest: true});
     if (!response || !Array.isArray(response.notes) || !Array.isArray(response.missing)) {
       throw new Error('could not download changed notes');
     }
@@ -968,7 +969,7 @@ async function pullRemoteChanges() {
   const fetchedNotes = new Map();
   const guards = await loadSyncGuards();
   for (;;) {
-    const page = await api(`/api/sync?since=${since}&limit=100`);
+    const page = await api(`/api/sync?since=${since}&limit=100`, {syncRequest: true});
     if (!page) throw new Error('could not fetch sync changes');
     if (page.resetRequired) {
       await resetLocalNotesFromRemote(Number(page.nextSequence || 0));
@@ -993,7 +994,7 @@ async function pullRemoteChanges() {
 }
 
 async function resetLocalNotesFromRemote(sequence) {
-  const summaries = await api('/api/notes');
+  const summaries = await api('/api/notes', {syncRequest: true});
   if (!Array.isArray(summaries)) throw new Error('could not refresh notes after sync compaction');
   const remoteIDs = new Set(summaries.map(note => note.id));
   const remoteNotes = new Map();
@@ -1016,7 +1017,7 @@ async function resetLocalNotesFromRemote(sequence) {
 // storage repair). Reconcile against note summaries at session start so a
 // valid-but-stale cursor cannot leave the dashboard incomplete forever.
 async function reconcileLocalNotes() {
-  const summaries = await api('/api/notes');
+  const summaries = await api('/api/notes', {syncRequest: true});
   if (!Array.isArray(summaries)) throw new Error('could not reconcile local notes');
   const remoteIDs = new Set(summaries.map(note => note.id));
   const downloadIDs = [];
@@ -1057,7 +1058,7 @@ async function mergeConflictedNote(operation) {
   // queued snapshot and accidentally omitting the last keystrokes.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true});
   if (!local || !remote) return false;
   // Queued edits created before three-way metadata existed cannot be merged
   // safely for title/tags; the durable resolver handles them instead.
@@ -1230,7 +1231,7 @@ async function createConflictResolution(operation) {
   // the 250ms local-save timer is still pending.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true});
   if (!local || !remote || operation.type !== 'note.save') {
     await preserveConflictCopy(operation, local, remote);
     return false;

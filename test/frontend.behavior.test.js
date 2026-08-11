@@ -357,6 +357,32 @@ describe('batched remote application', () => {
   });
 });
 
+describe('sync request lifecycle', () => {
+  test('tracks and cancels a pull-style request through the shared manager', async () => {
+    let markStarted;
+    let release;
+    let signal;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        signal = options.signal;
+        markStarted();
+        await gate;
+        return response(200, '{}');
+      },
+    }));
+    const request = app.hooks.api('/api/sync?since=0', {syncRequest: true});
+    await started;
+    expect(app.window.document.querySelector('#sync-status').dataset.state).toBe('syncing');
+    app.hooks.cancelActiveSyncRequests();
+    expect(signal.aborted).toBe(true);
+    release();
+    await request;
+    expect(app.window.document.querySelector('#sync-status').dataset.state).toBe('online');
+  });
+});
+
 describe('logout storage cleanup', () => {
   test('waits for other database connections before reporting cleanup complete', async () => {
     const first = track(await createApp());
