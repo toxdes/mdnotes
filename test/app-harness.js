@@ -32,6 +32,7 @@ globalThis.__mdnotesTestHooks = {
   cancelActiveSyncRequests,
   putLocalNote,
   init,
+  restoreRoute,
   getState: () => ({
     currentNoteId,
     currentRevision,

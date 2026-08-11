@@ -383,6 +383,25 @@ describe('sync request lifecycle', () => {
   });
 });
 
+describe('deep-link restoration', () => {
+  test('fetches an uncached deep-linked note before declaring it missing', async () => {
+    const remote = {id: 'note-a', filename: 'note-a.md', title: 'Remote note', tags: 'work', content: 'Loaded directly', revision: 4};
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.history.replaceState({}, '', '/note-a');
+
+    await app.hooks.restoreRoute({fetchRemote: true});
+
+    expect(app.window.location.pathname).toBe('/note-a');
+    expect(app.window.document.querySelector('#note-title').value).toBe('Remote note');
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject(remote);
+  });
+});
+
 describe('logout storage cleanup', () => {
   test('waits for other database connections before reporting cleanup complete', async () => {
     const first = track(await createApp());

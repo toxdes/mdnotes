@@ -2038,12 +2038,22 @@ async function followWikiLink(title) {
   scheduleSync();
 }
 
-async function restoreRoute() {
+async function restoreRoute({fetchRemote = false} = {}) {
   const noteID = noteIDFromLocation();
   if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
   if (noteID && await getLocalNote(noteID)) {
     await openNote(noteID, {route: 'none'});
     return;
+  }
+  if (noteID && fetchRemote && !await hasPendingOperation(noteID) && !await getUnresolvedConflict(noteID)) {
+    try {
+      const remote = await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true, throwOnError: true});
+      await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+      await openNote(noteID, {route: 'none'});
+      return;
+    } catch (error) {
+      if (error?.responseStatus !== 404) return;
+    }
   }
   if (noteID) {
     setDashboardRoute({replace: true});
@@ -2959,7 +2969,7 @@ async function init() {
     if (res) {
       cacheAppVersion(res);
       void loadPrefs();
-      await restoreRoute();
+      await restoreRoute({fetchRemote: true});
       connectServerEvents();
       scheduleSync({reconcile: true});
     } else if (authenticationRequired) {
