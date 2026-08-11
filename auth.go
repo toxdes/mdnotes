@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -116,6 +117,22 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := a.rl.realIP(r)
+	retryAfter, err := a.rl.loginRetryAfter(ip)
+	if err != nil {
+		http.Error(w, "could not check login rate limit", http.StatusInternalServerError)
+		return
+	}
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		_ = a.rl.recordLoginAttempt(ip, false)
+		writeJSONStatus(w, http.StatusTooManyRequests, map[string]any{
+			"error":       "too many login attempts",
+			"code":        "login_rate_limited",
+			"retry_after": retryAfter,
+		})
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -123,11 +140,11 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.password)) != 1 {
-		a.rl.recordLoginAttempt(a.rl.realIP(r), false)
+		a.rl.recordLoginAttempt(ip, false)
 		http.Error(w, "wrong password", http.StatusUnauthorized)
 		return
 	}
-	a.rl.recordLoginAttempt(a.rl.realIP(r), true)
+	a.rl.recordLoginAttempt(ip, true)
 	token, err := a.sessions.create()
 	if err != nil {
 		http.Error(w, "could not create session", http.StatusInternalServerError)

@@ -153,6 +153,48 @@ func TestRateLimiterBanIsTemporaryAndLoginWindowResets(t *testing.T) {
 	}
 }
 
+func TestLoginRateLimitDoesNotBlockAuthenticatedRoutes(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	for range 5 {
+		if err := rl.recordLoginAttempt("203.0.113.9", false); err != nil {
+			t.Fatalf("record failed login: %v", err)
+		}
+	}
+	a := &app{db: db, password: "correct", sessions: newSessionStore(db), rl: rl}
+	login := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"wrong"}`))
+	login.RemoteAddr = "203.0.113.9:1234"
+	login.Header.Set("Content-Type", "application/json")
+	loginResult := httptest.NewRecorder()
+	a.handleLogin(loginResult, login)
+	if loginResult.Code != http.StatusTooManyRequests || loginResult.Header().Get("Retry-After") == "" {
+		t.Fatalf("rate-limited login = %d, retry-after %q", loginResult.Code, loginResult.Header().Get("Retry-After"))
+	}
+
+	token, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	check := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	check.RemoteAddr = "203.0.113.9:1234"
+	check.AddCookie(&http.Cookie{Name: "session", Value: token})
+	checkResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(checkResult, check)
+	if checkResult.Code != http.StatusOK {
+		t.Fatalf("authenticated route after login limit = %d: %s", checkResult.Code, checkResult.Body.String())
+	}
+}
+
 func (r *sseTestRecorder) Flush() {
 	r.flushes++
 }
