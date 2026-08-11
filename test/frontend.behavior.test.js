@@ -297,3 +297,31 @@ describe('permanent queue rejection recovery', () => {
     expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pending: true, content: 'Keep locally'});
   });
 });
+
+describe('logout storage cleanup', () => {
+  test('waits for other database connections before reporting cleanup complete', async () => {
+    const first = track(await createApp());
+    const originalIndexedDB = first.window.indexedDB;
+    let deleteRequest;
+    Object.defineProperty(first.window, 'indexedDB', {
+      configurable: true,
+      value: {
+        deleteDatabase: () => {
+          deleteRequest = {};
+          setTimeout(() => deleteRequest.onblocked?.(), 0);
+          return deleteRequest;
+        },
+      },
+    });
+
+    let completed = false;
+    const cleanup = first.hooks.clearOfflineData().then(() => { completed = true; });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(completed).toBe(false);
+
+    deleteRequest.onsuccess();
+    await cleanup;
+    expect(completed).toBe(true);
+    Object.defineProperty(first.window, 'indexedDB', {configurable: true, value: originalIndexedDB});
+  });
+});

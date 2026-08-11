@@ -25,6 +25,7 @@ globalThis.__mdnotesTestHooks = {
   applyRemoteDeletion,
   getLocalNote,
   getOfflineState,
+  clearOfflineData,
   putLocalNote,
   init,
   getState: () => ({

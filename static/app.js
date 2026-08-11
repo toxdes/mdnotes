@@ -112,6 +112,10 @@ function openOfflineDB() {
       if (!db.objectStoreNames.contains('state')) db.createObjectStore('state', {keyPath: 'key'});
     };
     request.onsuccess = async () => {
+      request.result.onversionchange = () => {
+        request.result.close();
+        offlineDBPromise = undefined;
+      };
       try {
         await repairOfflineQueue(request.result);
         resolve(request.result);
@@ -508,15 +512,33 @@ async function supersedeQueuedNoteOperations(noteID, afterSequence) {
 }
 
 async function clearOfflineData() {
-  const db = await openOfflineDB();
-  db.close();
+  try {
+    syncCoordinationChannel?.postMessage({type: 'logout', sender: syncTabID});
+  } catch (_) {}
+  const dbPromise = offlineDBPromise;
   offlineDBPromise = undefined;
+  if (dbPromise) {
+    try { (await dbPromise).close(); } catch (_) {}
+  }
   await new Promise((resolve, reject) => {
     const request = indexedDB.deleteDatabase(offlineDBName);
-    request.onsuccess = resolve;
-    request.onerror = () => reject(request.error);
-    request.onblocked = resolve;
+    const timeout = setTimeout(() => reject(new Error('local data cleanup is blocked by another app tab')), 5000);
+    request.onerror = () => {
+      clearTimeout(timeout);
+      reject(request.error);
+    };
+    request.onsuccess = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
   });
+}
+
+async function closeOfflineDatabaseConnection() {
+  const dbPromise = offlineDBPromise;
+  offlineDBPromise = undefined;
+  if (!dbPromise) return;
+  try { (await dbPromise).close(); } catch (_) {}
 }
 
 function newLocalNoteID() {
@@ -531,6 +553,7 @@ try {
     syncCoordinationChannel.addEventListener('message', event => {
       if (!event.data || event.data.sender === syncTabID) return;
       if (event.data.type === 'sync-request') scheduleSync({}, 0);
+      if (event.data.type === 'logout') void closeOfflineDatabaseConnection();
     });
   }
 } catch (_) {
@@ -1681,7 +1704,13 @@ $('#logout-btn').addEventListener('click', async () => {
   cancelActiveSyncRequests();
   disconnectServerEvents();
   await api('/api/logout', {method:'POST'});
-  await clearOfflineData();
+  try {
+    await clearOfflineData();
+  } catch (error) {
+    console.error('could not clear local data during logout', error);
+    showToast('Close other app tabs, then try signing out again.', 'warning');
+    return;
+  }
   localStorage.removeItem('mdnotes-offline-ready');
   localStorage.removeItem('mdnotes-prefs');
   show(screens.login);
