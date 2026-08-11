@@ -287,25 +287,44 @@ type saveRequest struct {
 	BaseRevision *int64 `json:"base_revision,omitempty"`
 }
 
-func checkNoteRevision(db *sql.DB, id string, expected int64) error {
+func currentNoteRevision(db *sql.DB, id string) (int64, error) {
 	n, err := getNote(db, id)
 	if err == nil {
-		if n.Revision != expected {
-			return errRevisionConflict
-		}
-		return nil
+		return n.Revision, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return 0, err
 	}
 	var latest int64
 	if err := db.QueryRow("SELECT COALESCE(MAX(revision), 0) FROM sync_changes WHERE note_id = ?", id).Scan(&latest); err != nil {
+		return 0, err
+	}
+	return latest, nil
+}
+
+func checkNoteRevision(db *sql.DB, id string, expected int64) error {
+	latest, err := currentNoteRevision(db, id)
+	if err != nil {
 		return err
 	}
-	if expected != 0 || latest != 0 {
+	if latest != expected {
 		return errRevisionConflict
 	}
 	return nil
+}
+
+func (a *app) writeNoteRevisionConflict(w http.ResponseWriter, noteID string) {
+	revision, err := currentNoteRevision(a.db, noteID)
+	if err != nil {
+		http.Error(w, "could not read current note revision", http.StatusInternalServerError)
+		return
+	}
+	writeJSONStatus(w, http.StatusConflict, map[string]any{
+		"error":            "note changed on another device",
+		"code":             "note_revision_conflict",
+		"note_id":          noteID,
+		"current_revision": revision,
+	})
 }
 
 func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
@@ -329,6 +348,12 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 	} else if !noteIDPattern.MatchString(id) {
 		http.Error(w, "invalid note id", http.StatusBadRequest)
 		return
+	} else if req.BaseRevision == nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "base_revision is required for an existing note",
+			"code":  "base_revision_required",
+		})
+		return
 	}
 
 	tags := normalizeTags(req.Tags)
@@ -341,7 +366,7 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := a.saveNoteWithFileOperation(id, req.Title, tags, req.Content, req.BaseRevision)
 	if errors.Is(err, errRevisionConflict) {
-		http.Error(w, "note changed on another device", http.StatusConflict)
+		a.writeNoteRevisionConflict(w, id)
 		return
 	}
 	if err != nil {
@@ -362,6 +387,12 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		expectedRevision = &revision
+	} else {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "base_revision is required for deletion",
+			"code":  "base_revision_required",
+		})
+		return
 	}
 	a.noteMu.Lock()
 	defer a.noteMu.Unlock()
@@ -371,7 +402,7 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 	}
 	err := a.deleteNoteWithFileOperation(id, expectedRevision)
 	if errors.Is(err, errRevisionConflict) {
-		http.Error(w, "note changed on another device", http.StatusConflict)
+		a.writeNoteRevisionConflict(w, id)
 		return
 	}
 	if err != nil {

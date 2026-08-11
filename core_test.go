@@ -470,12 +470,34 @@ func TestSaveRejectsStaleOfflineRevisionBeforeReplacingFile(t *testing.T) {
 		t.Fatalf("first save status = %d: %s", firstResult.Code, firstResult.Body.String())
 	}
 
+	missingRevision := httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"id":"offline-note","title":"Unsafe","content":"unsafe body","tags":""}`))
+	missingRevision.Header.Set("Content-Type", "application/json")
+	missingRevisionResult := httptest.NewRecorder()
+	a.handleSaveNote(missingRevisionResult, missingRevision)
+	if missingRevisionResult.Code != http.StatusBadRequest {
+		t.Fatalf("missing save revision status = %d: %s", missingRevisionResult.Code, missingRevisionResult.Body.String())
+	}
+
+	missingDeleteRevision := httptest.NewRequest(http.MethodDelete, "/api/notes/offline-note", nil)
+	missingDeleteResult := httptest.NewRecorder()
+	a.handleDeleteNote(missingDeleteResult, missingDeleteRevision)
+	if missingDeleteResult.Code != http.StatusBadRequest {
+		t.Fatalf("missing delete revision status = %d: %s", missingDeleteResult.Code, missingDeleteResult.Body.String())
+	}
+
 	stale := httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"id":"offline-note","title":"Stale","content":"stale body","tags":"","base_revision":0}`))
 	stale.Header.Set("Content-Type", "application/json")
 	staleResult := httptest.NewRecorder()
 	a.handleSaveNote(staleResult, stale)
 	if staleResult.Code != http.StatusConflict {
 		t.Fatalf("stale save status = %d: %s", staleResult.Code, staleResult.Body.String())
+	}
+	var conflict map[string]any
+	if err := json.Unmarshal(staleResult.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("decode stale save conflict: %v", err)
+	}
+	if conflict["code"] != "note_revision_conflict" || conflict["note_id"] != "offline-note" || conflict["current_revision"] != float64(1) {
+		t.Fatalf("stale save conflict = %#v", conflict)
 	}
 	data, err := os.ReadFile(filepath.Join(notesDir, "offline-note.md"))
 	if err != nil || string(data) != "first body" {
