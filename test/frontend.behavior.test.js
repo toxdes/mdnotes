@@ -325,3 +325,27 @@ describe('logout storage cleanup', () => {
     Object.defineProperty(first.window, 'indexedDB', {configurable: true, value: originalIndexedDB});
   });
 });
+
+describe('offline database migrations', () => {
+  test('upgrades the legacy layout to the explicit schema and queue index', async () => {
+    const app = track(await createApp());
+    const legacy = await new Promise((resolve, reject) => {
+      const request = app.window.indexedDB.open('mdnotes-offline', 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        db.createObjectStore('notes', {keyPath: 'id'});
+        const queue = db.createObjectStore('queue', {keyPath: 'id', autoIncrement: true});
+        queue.createIndex('note_id', 'note_id', {unique: false});
+        db.createObjectStore('state', {keyPath: 'key'});
+      };
+      request.onsuccess = () => { request.result.close(); resolve(); };
+      request.onerror = () => reject(request.error);
+    });
+    expect(legacy).toBeUndefined();
+
+    expect(await app.hooks.getOfflineDatabaseInfo()).toMatchObject({
+      version: 3,
+      queueIndexes: expect.arrayContaining(['note_id', 'client_sequence']),
+    });
+  });
+});

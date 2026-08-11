@@ -24,6 +24,7 @@ globalThis.__mdnotesTestHooks = {
   acknowledgeCompactedOperation,
   applyRemoteDeletion,
   getLocalNote,
+  getOfflineDatabaseInfo,
   getOfflineState,
   clearOfflineData,
   putLocalNote,

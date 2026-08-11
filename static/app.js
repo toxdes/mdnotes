@@ -70,6 +70,7 @@ const unhealthySseFallbackSyncAgeMs = 30 * 1000;
 // the app shell available, while IndexedDB holds the user's working set and a
 // durable queue of mutations to replay after connectivity returns.
 const offlineDBName = 'mdnotes-offline';
+const offlineDBVersion = 3;
 let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
@@ -101,15 +102,24 @@ function openOfflineDB() {
     // Do not request a fixed database version here. A browser may have a
     // newer local schema from a prior build; opening it with an older version
     // fails before the app can read its offline notes.
-    const request = indexedDB.open(offlineDBName);
-    request.onupgradeneeded = () => {
+    const request = indexedDB.open(offlineDBName, offlineDBVersion);
+    request.onupgradeneeded = event => {
       const db = request.result;
-      if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', {keyPath: 'id'});
-      if (!db.objectStoreNames.contains('queue')) {
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('notes')) {
+        db.createObjectStore('notes', {keyPath: 'id'});
+      }
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('queue')) {
         const queue = db.createObjectStore('queue', {keyPath: 'id', autoIncrement: true});
         queue.createIndex('note_id', 'note_id', {unique: false});
       }
-      if (!db.objectStoreNames.contains('state')) db.createObjectStore('state', {keyPath: 'key'});
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('state')) {
+        db.createObjectStore('state', {keyPath: 'key'});
+      }
+      if (event.oldVersion < 3 && db.objectStoreNames.contains('queue')) {
+        const queue = event.target.transaction.objectStore('queue');
+        if (!queue.indexNames.contains('note_id')) queue.createIndex('note_id', 'note_id', {unique: false});
+        if (!queue.indexNames.contains('client_sequence')) queue.createIndex('client_sequence', 'client_sequence', {unique: false});
+      }
     };
     request.onsuccess = async () => {
       request.result.onversionchange = () => {
@@ -128,9 +138,13 @@ function openOfflineDB() {
     };
     request.onerror = () => {
       offlineDBPromise = undefined;
-      reportOfflineStorageFailure(request.error);
-      reject(request.error);
+      const error = request.error?.name === 'VersionError'
+        ? new Error('offline data was created by a newer app version')
+        : request.error;
+      reportOfflineStorageFailure(error);
+      reject(error);
     };
+    request.onblocked = () => showToast('Close other app tabs to update local storage.', 'warning');
   });
   return offlineDBPromise;
 }
@@ -246,6 +260,14 @@ async function withOfflineStore(names, mode, work) {
 
 function getLocalNote(id) {
   return withOfflineStore(['notes'], 'readonly', stores => requestValue(stores.notes.get(id)));
+}
+
+async function getOfflineDatabaseInfo() {
+  const db = await openOfflineDB();
+  return {
+    version: db.version,
+    queueIndexes: [...db.transaction('queue', 'readonly').objectStore('queue').indexNames],
+  };
 }
 
 function putLocalNote(note) {
