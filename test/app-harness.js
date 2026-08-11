@@ -12,6 +12,8 @@ const testHookSource = `
 globalThis.__mdnotesTestHooks = {
   saveCurrentNote,
   queueOperation,
+  flushPendingChanges,
+  quarantineQueueOperation,
   saveLocalNoteAndQueue,
   pendingOperations,
   pendingOperationsForNote,
@@ -22,6 +24,7 @@ globalThis.__mdnotesTestHooks = {
   acknowledgeCompactedOperation,
   applyRemoteDeletion,
   getLocalNote,
+  getOfflineState,
   putLocalNote,
   init,
   getState: () => ({

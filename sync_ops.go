@@ -62,9 +62,16 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sync request", http.StatusBadRequest)
 		return
 	}
-	for _, operation := range request.Operations {
+	for index, operation := range request.Operations {
 		if err := validateSyncOperation(operation); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+				"error":           err.Error(),
+				"code":            "invalid_sync_operation",
+				"permanent":       true,
+				"operation_index": index,
+				"client_sequence": operation.ClientSequence,
+				"op_id":           operation.OpID,
+			})
 			return
 		}
 	}
@@ -214,7 +221,7 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		if err != nil {
 			return syncOperationResult{}, err
 		}
-		pendingFileOperation = &fileOperation{ID: fileOperationID, Action: fileOperationReplace, NoteID: operation.NoteID, StageName: stagedName}
+		pendingFileOperation = &fileOperation{ID: fileOperationID, Action: fileOperationReplace, NoteID: operation.NoteID, StageName: stagedName, ExpectedHash: fileContentHash(enc)}
 		if err := recordFileOperation(tx, *pendingFileOperation); err != nil {
 			return syncOperationResult{}, err
 		}

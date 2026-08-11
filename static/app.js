@@ -276,6 +276,10 @@ function unresolvedConflictKey(noteID) {
   return `unresolvedConflict:${noteID}`;
 }
 
+function rejectedSyncKey(noteID) {
+  return `rejectedSync:${noteID}`;
+}
+
 function getUnresolvedConflict(noteID) {
   return getOfflineState(unresolvedConflictKey(noteID));
 }
@@ -285,6 +289,9 @@ function setUnresolvedConflict(conflict) {
 }
 
 async function queueOperationInStores(stores, operation) {
+  if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'prefs.save') {
+    await requestValue(stores.state.delete(rejectedSyncKey(operation.note_id)));
+  }
   if (operation.type === 'note.save' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
     const existing = queued
@@ -380,9 +387,10 @@ async function repairSyncSequenceGap(expectedSequence) {
 }
 
 async function hasPendingOperation(noteID) {
-  return withOfflineStore(['queue'], 'readonly', async stores => {
+  return withOfflineStore(['queue', 'state'], 'readonly', async stores => {
     const item = await requestValue(stores.queue.index('note_id').get(noteID));
-    return Boolean(item);
+    if (item) return true;
+    return Boolean(await requestValue(stores.state.get(rejectedSyncKey(noteID))));
   });
 }
 
@@ -426,6 +434,32 @@ function removePendingOperationIfIdentityMatches(id, expectedOperation) {
     const operation = await requestValue(stores.queue.get(id));
     if (!operation || operation.op_id !== expectedOperation.op_id || operation.client_sequence !== expectedOperation.client_sequence || queueOperationPayload(operation) !== queueOperationPayload(expectedOperation)) return false;
     await requestValue(stores.queue.delete(id));
+    return true;
+  });
+}
+
+async function quarantineQueueOperation(operation, reason) {
+  return withOfflineStore(['queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) return false;
+    await requestValue(stores.state.put({
+      key: rejectedSyncKey(operation.note_id),
+      value: {
+        op_id: operation.op_id,
+        client_sequence: operation.client_sequence,
+        note_id: operation.note_id,
+        type: operation.type,
+        reason: reason || 'server rejected the operation',
+        rejected_at: new Date().toISOString(),
+      },
+    }));
+    queued.type = 'noop';
+    delete queued.note;
+    delete queued.prefs;
+    delete queued.base_revision;
+    queued.rejected = true;
+    queued.rejected_reason = reason || 'server rejected the operation';
+    await requestValue(stores.queue.put(queued));
     return true;
   });
 }
@@ -760,7 +794,8 @@ async function applyRemoteDeletion(noteID) {
   const removed = await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
     const pending = await requestValue(stores.queue.index('note_id').getAll(noteID));
     const conflict = await requestValue(stores.state.get(unresolvedConflictKey(noteID)));
-    if (pending.length || conflict) return false;
+    const rejected = await requestValue(stores.state.get(rejectedSyncKey(noteID)));
+    if (pending.length || conflict || rejected) return false;
     await requestValue(stores.notes.delete(noteID));
     return true;
   });
@@ -1307,6 +1342,11 @@ async function flushPendingChanges() {
       throw new Error(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict');
     }
     if (!result.response.ok) {
+      const permanent = result.response.status === 400 || result.response.status === 413 || result.data?.permanent === true;
+      if (permanent && await quarantineQueueOperation(operation, typeof result.data === 'string' ? result.data : result.data?.error)) {
+        showToast('A local change needs attention before it can sync.', 'warning');
+        continue;
+      }
       const error = new Error(typeof result.data === 'string' ? result.data : 'sync failed');
       error.responseStatus = result.response.status;
       throw error;

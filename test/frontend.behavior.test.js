@@ -250,3 +250,50 @@ describe('remote deletion coordination', () => {
     expect(await app.hooks.getLocalNote('note-a')).toMatchObject({title: 'Local edit', content: 'Keep me'});
   });
 });
+
+describe('permanent queue rejection recovery', () => {
+  test('quarantines a rejected head operation and replays its sequence as a noop', async () => {
+    let pushCount = 0;
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        if (String(path) !== '/api/sync/push') throw new Error(`unexpected request: ${path}`);
+        const request = JSON.parse(options.body);
+        const operation = request.operations[0];
+        pushCount++;
+        if (pushCount === 1) {
+          return response(400, JSON.stringify({
+            error: 'invalid note save operation',
+            code: 'invalid_sync_operation',
+            permanent: true,
+            op_id: operation.op_id,
+          }));
+        }
+        if (pushCount === 2) expect(operation.type).toBe('noop');
+        else expect(operation.type).toBe('note.save');
+        return response(200, JSON.stringify({
+          acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'applied', revision: pushCount === 2 ? undefined : 1}],
+          expected_sequence: operation.client_sequence + 1,
+        }));
+      },
+    }));
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Too large', content: 'Keep locally', pending: true});
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: 1,
+      note: {id: 'note-a', title: 'Too large', content: 'Keep locally'},
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-b',
+      base_revision: 0,
+      note: {id: 'note-b', title: 'Later note', content: 'Continue syncing'},
+    });
+
+    expect(await app.hooks.flushPendingChanges()).toBe(true);
+    expect(pushCount).toBe(3);
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+    expect(await app.hooks.getOfflineState('rejectedSync:note-a')).toMatchObject({type: 'note.save'});
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pending: true, content: 'Keep locally'});
+  });
+});

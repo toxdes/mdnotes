@@ -908,6 +908,46 @@ func TestSyncPushAcknowledgesCompactedReplay(t *testing.T) {
 	}
 }
 
+func TestSyncPushReportsPermanentValidationErrors(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	baseRevision := int64(0)
+	body, err := json.Marshal(syncPushRequest{
+		DeviceID: "device_a",
+		Operations: []syncOperationRequest{{
+			ClientSequence: 1,
+			OpID:           "operation_1",
+			Type:           "note.save",
+			NoteID:         "note-a",
+			BaseRevision:   &baseRevision,
+			Title:          strings.Repeat("x", maxTitleBytes+1),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body)))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	(&app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}).handleSyncPush(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("validation status = %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode validation response: %v", err)
+	}
+	if response["code"] != "invalid_sync_operation" || response["permanent"] != true || response["op_id"] != "operation_1" {
+		t.Fatalf("validation response = %#v", response)
+	}
+}
+
 func TestRecoverFileOperationsCompletesCommittedReplacement(t *testing.T) {
 	notesDir := t.TempDir()
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
