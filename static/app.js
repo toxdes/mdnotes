@@ -1051,14 +1051,24 @@ function updateOpenNote(note) {
   updatePreview();
 }
 
-async function mergeConflictedNote(operation) {
+async function loadConflictRemoteNote(noteID) {
+  try {
+    return await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true});
+  } catch (error) {
+    // A 404 is authoritative: the remote note was deleted. Other failures
+    // must abort conflict handling so the original operation can be retried.
+    if (error?.responseStatus === 404) return null;
+    throw error;
+  }
+}
+
+async function mergeConflictedNote(operation, remote) {
   if (operation.type !== 'note.save' || !operation.note || !window.MDNotesMerge) return false;
   // A network response can arrive while the user is still typing. Capture that
   // newer local state before deriving the merge, rather than merging an older
   // queued snapshot and accidentally omitting the last keystrokes.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true});
   if (!local || !remote) return false;
   // Queued edits created before three-way metadata existed cannot be merged
   // safely for title/tags; the durable resolver handles them instead.
@@ -1134,6 +1144,40 @@ function conflictBase(local, operation) {
   };
 }
 
+async function createRemoteDeletionConflict(operation, local) {
+  const preserved = {
+    ...local,
+    id: operation.note_id,
+    title: local.title || 'Untitled',
+    tags: local.tags || '',
+    content: local.content || '',
+  };
+  const conflict = {
+    kind: 'remote-deleted',
+    note_id: operation.note_id,
+    created_at: new Date().toISOString(),
+    base: conflictBase(preserved, operation),
+    local: preserved,
+    remote: null,
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('conflicting sync operation changed before deletion resolution');
+    }
+    await requestValue(stores.notes.put({...preserved, pending: false}));
+    await requestValue(stores.state.put({key: unresolvedConflictKey(operation.note_id), value: conflict}));
+    const laterOperations = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    for (const later of laterOperations) {
+      if (later.id !== operation.id && later.client_sequence > operation.client_sequence && !later.attempted_at) {
+        later.type = 'noop';
+        await requestValue(stores.queue.put(later));
+      }
+    }
+    await requestValue(stores.queue.delete(operation.id));
+  });
+}
+
 function renderConflictDiff(target, base, version, changedClass) {
   const baseLines = String(base || '').split('\n');
   const versionLines = String(version || '').split('\n');
@@ -1156,10 +1200,12 @@ function renderConflictDiff(target, base, version, changedClass) {
 
 let activeConflictID = null;
 let activeConflictSelection = 'local';
+let activeConflictKind = 'edit';
 
 function closeConflictResolver() {
   activeConflictID = null;
   activeConflictSelection = 'local';
+  activeConflictKind = 'edit';
   closeModal($('#conflict-modal'));
 }
 
@@ -1197,7 +1243,16 @@ function setConflictSelection(selection) {
 }
 
 function showConflictResolver(conflict) {
+  activeConflictKind = 'edit';
   activeConflictID = conflict.note_id;
+  $('#conflict-title').textContent = 'Resolve conflicting edits';
+  $('.conflict-intro').textContent = 'This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.';
+  $('#conflict-deleted-details').classList.add('hidden');
+  $$('.conflict-fields, .conflict-metadata-compare, .conflict-compare, #conflict-selection-status, .conflict-result, .conflict-base:not(#conflict-deleted-details)').forEach(element => element.classList.remove('hidden'));
+  $('#conflict-copy').className = 'btn-text';
+  $('#conflict-copy').textContent = 'Keep as copy';
+  $('#conflict-save').className = 'btn-primary';
+  $('#conflict-save').textContent = 'Save resolution';
   $('#conflict-note-title').value = conflict.local.title || '';
   $('#conflict-note-tags').value = conflict.local.tags || '';
   $('#conflict-note-content').value = conflict.local.content || '';
@@ -1211,10 +1266,31 @@ function showConflictResolver(conflict) {
   $('#conflict-note-content').focus();
 }
 
+function showDeletedConflict(conflict) {
+  activeConflictKind = 'remote-deleted';
+  activeConflictID = conflict.note_id;
+  $('#conflict-title').textContent = 'Note deleted on another device';
+  $('.conflict-intro').textContent = 'Your changes are saved on this device. Choose whether to keep them as a new note or accept the deletion.';
+  $$('.conflict-fields, .conflict-metadata-compare, .conflict-compare, #conflict-selection-status, .conflict-result, .conflict-base').forEach(element => element.classList.add('hidden'));
+  $('#conflict-deleted-details').classList.remove('hidden');
+  $('#conflict-deleted-content').textContent = [
+    `Title: ${conflict.local.title || 'Untitled'}`,
+    `Tags: ${conflict.local.tags || 'None'}`,
+    '',
+    conflict.local.content || '(empty note)',
+  ].join('\n');
+  $('#conflict-copy').className = 'btn-primary';
+  $('#conflict-copy').textContent = 'Keep as new note';
+  $('#conflict-save').className = 'btn-text danger';
+  $('#conflict-save').textContent = 'Accept deletion';
+  openModal($('#conflict-modal'));
+}
+
 async function showConflictResolverFor(noteID) {
   const conflict = await getUnresolvedConflict(noteID);
   if (!conflict) return false;
-  showConflictResolver(conflict);
+  if (conflict.kind === 'remote-deleted') showDeletedConflict(conflict);
+  else showConflictResolver(conflict);
   return true;
 }
 
@@ -1225,13 +1301,16 @@ function fillConflictResolution(version, selection) {
   setConflictSelection(selection);
 }
 
-async function createConflictResolution(operation) {
+async function createConflictResolution(operation, remote) {
   // Always capture fresh keystrokes before replacing the cached note. This is
   // especially important for notification-driven sync, which can arrive while
   // the 250ms local-save timer is still pending.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true});
+  if (!remote && operation.type === 'note.save' && (local || operation.note)) {
+    await createRemoteDeletionConflict(operation, local || operation.note);
+    return 'remote-deleted';
+  }
   if (!local || !remote || operation.type !== 'note.save') {
     await preserveConflictCopy(operation, local, remote);
     return false;
@@ -1329,6 +1408,60 @@ async function keepConflictAsCopy() {
   scheduleSync();
 }
 
+async function keepDeletedConflictAsCopy() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict || conflict.kind !== 'remote-deleted') return;
+  const conflictID = newLocalNoteID();
+  const now = new Date().toISOString();
+  const copy = {
+    ...conflict.local,
+    id: conflictID,
+    title: `${conflict.local.title || 'Untitled'} (conflict copy)`,
+    filename: `${conflictID}.md`,
+    created_at: conflict.local.created_at || now,
+    updated_at: now,
+    revision: 0,
+    base_revision: 0,
+    base_title: '',
+    base_tags: '',
+    base_content: '',
+    pending: true,
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.put(copy));
+    await queueOperationInStores(stores, {type: 'note.save', note_id: conflictID, base_revision: 0, note: copy});
+    await requestValue(stores.notes.delete(noteID));
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  currentNoteId = conflictID;
+  isDirty = false;
+  updateOpenNote(copy);
+  setNoteRoute(conflictID);
+  closeConflictResolver();
+  showToast('Your changes were saved as a new note.', 'success');
+  if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+  scheduleSync();
+}
+
+async function acceptDeletedConflict() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict || conflict.kind !== 'remote-deleted') return;
+  await withOfflineStore(['notes', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.delete(noteID));
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  if (currentNoteId === noteID) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+  closeConflictResolver();
+  showToast('The remote deletion was accepted.', 'success');
+  scheduleSync();
+}
+
 $('#conflict-use-local').addEventListener('click', async () => {
   const conflict = activeConflictID && await getUnresolvedConflict(activeConflictID);
   if (conflict) fillConflictResolution(conflict.local, 'local');
@@ -1345,8 +1478,8 @@ $('#conflict-use-remote').addEventListener('click', async () => {
   });
 });
 
-$('#conflict-save').addEventListener('click', () => { void saveConflictResolution(); });
-$('#conflict-copy').addEventListener('click', () => { void keepConflictAsCopy(); });
+$('#conflict-save').addEventListener('click', () => { void (activeConflictKind === 'remote-deleted' ? acceptDeletedConflict() : saveConflictResolution()); });
+$('#conflict-copy').addEventListener('click', () => { void (activeConflictKind === 'remote-deleted' ? keepDeletedConflictAsCopy() : keepConflictAsCopy()); });
 $('#conflict-later').addEventListener('click', closeConflictResolver);
 $('#conflict-close').addEventListener('click', closeConflictResolver);
 $('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
@@ -1483,11 +1616,14 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
     return;
   }
   if (acknowledgement.status === 'conflict') {
-    if (await mergeConflictedNote(operation)) {
+    const remote = await loadConflictRemoteNote(operation.note_id);
+    if (await mergeConflictedNote(operation, remote)) {
       showToast('Merged your non-overlapping changes.', 'success');
     } else {
-      const resolverReady = await createConflictResolution(operation);
-      if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
+      const resolverReady = await createConflictResolution(operation, remote);
+      if (resolverReady === 'remote-deleted') {
+        await showConflictResolverFor(operation.note_id);
+      } else if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
       else showToast('A conflict copy was created so your changes are safe.', 'warning');
     }
     return;
@@ -2070,6 +2206,10 @@ async function restoreCachedStartup() {
     return;
   }
   await loadDashboard({sync: false});
+  const conflicts = await unresolvedConflictIDs();
+  for (const conflictID of conflicts) {
+    if (await getLocalNote(conflictID) && await showConflictResolverFor(conflictID)) break;
+  }
 }
 
 // --- Autosave ---
@@ -2127,6 +2267,31 @@ async function persistEditorSnapshot(snapshot, trySync) {
     created_at: existing?.created_at || now,
     updated_at: now,
   };
+  const unresolved = await getUnresolvedConflict(snapshot.noteID);
+  if (unresolved?.kind === 'remote-deleted') {
+    const conflictLocal = {...local, pending: false};
+    try {
+      await withOfflineStore(['notes', 'state'], 'readwrite', async stores => {
+        await requestValue(stores.notes.put(conflictLocal));
+        await requestValue(stores.state.put({
+          key: unresolvedConflictKey(snapshot.noteID),
+          value: {...unresolved, local: conflictLocal},
+        }));
+      });
+    } catch (error) {
+      console.error('local conflict update failed', error);
+      showToast('Could not save locally. Free browser storage and try again.', 'warning');
+      return false;
+    }
+    if (editorSnapshotIsCurrent(snapshot)) {
+      currentBaseRevision = null;
+      savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
+      isDirty = false;
+      if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+      setIdleSyncStatus();
+    }
+    return true;
+  }
   try {
     await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});
   } catch (error) {

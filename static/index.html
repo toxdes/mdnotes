@@ -169,6 +169,10 @@ SOFTWARE.
     <div class="modal-body conflict-modal-body">
       <div class="modal-heading"><h3 id="conflict-title">Resolve conflicting edits</h3><button id="conflict-close" class="modal-close" type="button" aria-label="Close conflict resolver"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg></button></div>
       <p class="conflict-intro">This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.</p>
+      <div id="conflict-deleted-details" class="conflict-base hidden">
+        <strong>Changes saved on this device</strong>
+        <pre id="conflict-deleted-content"></pre>
+      </div>
       <div class="conflict-fields">
         <label class="meta-field">
           <span class="input-label">Title to save</span>

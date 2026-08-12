@@ -187,6 +187,126 @@ describe('F-03 compacted acknowledgement recovery', () => {
   });
 });
 
+describe('conflict deletion recovery', () => {
+  async function createDeletedConflictApp() {
+    let remoteReads = 0;
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        if (String(path) === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          const operation = request.operations[0];
+          return response(200, JSON.stringify({
+            acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'conflict', current_revision: 2}],
+            expected_sequence: operation.client_sequence + 1,
+          }));
+        }
+        if (String(path) === '/api/notes/note-a') {
+          remoteReads++;
+          return response(404);
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Local edit', content: 'Keep this', pending: true});
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: 1,
+      note: {id: 'note-a', title: 'Local edit', content: 'Keep this'},
+    });
+    return {app, getRemoteReads: () => remoteReads};
+  }
+
+  test('persists the decision and keeps local content when the remote note was deleted', async () => {
+    const {app, getRemoteReads} = await createDeletedConflictApp();
+
+    await expect(app.hooks.flushPendingChanges()).resolves.toBe(true);
+
+    expect(getRemoteReads()).toBe(1);
+    expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toMatchObject({kind: 'remote-deleted', note_id: 'note-a'});
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pending: false, content: 'Keep this'});
+    expect(app.window.document.querySelector('#conflict-title').textContent).toBe('Note deleted on another device');
+
+    app.window.document.querySelector('#conflict-later').click();
+    expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toMatchObject({kind: 'remote-deleted'});
+
+    app.hooks.setEditorState({id: 'note-a', dirty: true, title: 'Updated locally', content: 'Newer local content'});
+    await app.hooks.saveCurrentNote(false);
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+    expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toMatchObject({
+      local: {title: 'Updated locally', content: 'Newer local content'},
+    });
+  });
+
+  test('keeps the local version as a new note when requested', async () => {
+    const {app} = await createDeletedConflictApp();
+
+    await app.hooks.flushPendingChanges();
+    app.window.document.querySelector('#conflict-copy').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    app.hooks.cancelScheduledSync();
+
+    const pending = await app.hooks.pendingOperations();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].note_id).not.toBe('note-a');
+    expect(pending[0].note).toMatchObject({title: 'Local edit (conflict copy)', content: 'Keep this'});
+    expect(await app.hooks.getLocalNote('note-a')).toBeUndefined();
+    expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toBeUndefined();
+  });
+
+  test('discards the local version only when deletion is accepted', async () => {
+    const {app} = await createDeletedConflictApp();
+
+    await app.hooks.flushPendingChanges();
+    app.window.document.querySelector('#conflict-save').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    app.hooks.cancelScheduledSync();
+
+    expect(await app.hooks.getLocalNote('note-a')).toBeUndefined();
+    expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toBeUndefined();
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+  });
+
+  test('keeps the original operation when the remote lookup fails transiently', async () => {
+    let pushCount = 0;
+    let remoteReads = 0;
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        if (String(path) === '/api/sync/push') {
+          pushCount++;
+          const request = JSON.parse(options.body);
+          const operation = request.operations[0];
+          return response(200, JSON.stringify({
+            acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'conflict', current_revision: 2}],
+            expected_sequence: operation.client_sequence + 1,
+          }));
+        }
+        if (String(path) === '/api/notes/note-a') {
+          remoteReads++;
+          return response(503, 'temporary failure');
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Local edit', content: 'Keep this', pending: true});
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: 1,
+      note: {id: 'note-a', title: 'Local edit', content: 'Keep this'},
+    });
+
+    await expect(app.hooks.flushPendingChanges()).rejects.toMatchObject({responseStatus: 503});
+
+    expect(pushCount).toBe(1);
+    expect(remoteReads).toBe(1);
+    expect(await app.hooks.pendingOperations()).toHaveLength(1);
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pending: true, content: 'Keep this'});
+  });
+});
+
 describe('F-04 service worker revisions', () => {
   test('registers the worker with the server-provided frontend revision', async () => {
     const register = vi.fn(async () => {});
