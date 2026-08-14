@@ -187,8 +187,10 @@ describe('F-01 editor save coordination', () => {
     });
   });
 
-  test('drains the latest snapshot before starting a new note', async () => {
+  test('drains the latest snapshot before exposing the new-note action', async () => {
     const app = track(await createApp({deferredSave: true}));
+    app.hooks.showNoteInEditor({id: 'note-a', revision: 1, title: 'Old note', tags: '', content: 'saved version'});
+    app.window.history.replaceState({}, '', '/note-a');
     app.hooks.setEditorState({
       id: 'note-a',
       dirty: true,
@@ -203,20 +205,23 @@ describe('F-01 editor save coordination', () => {
     app.hooks.markDirty();
     app.hooks.saveCurrentNote(false);
 
-    app.window.document.querySelector('#new-note-btn').click();
-    const newNoteID = app.hooks.getState().currentNoteId;
+    app.window.document.querySelector('#back-btn').click();
+    expect(app.window.document.querySelector('#new-note-btn').closest('#dashboard').classList.contains('hidden')).toBe(true);
     app.releaseFirstSave();
     await firstSave;
+    await vi.waitFor(() => {
+      expect(app.window.document.querySelector('#dashboard').classList.contains('hidden')).toBe(false);
+      expect(app.window.location.pathname).toBe('/');
+    });
 
     expect(app.saveCalls).toHaveLength(2);
     expect(app.saveCalls[1]).toMatchObject({
       note: {id: 'note-a', content: 'newest version'},
       operation: {note_id: 'note-a'},
     });
-    expect(app.hooks.getState()).toMatchObject({
-      currentNoteId: newNoteID,
-      isDirty: false,
-    });
+
+    app.window.document.querySelector('#new-note-btn').click();
+    expect(app.hooks.getState().currentNoteId).not.toBe('note-a');
   });
 });
 
