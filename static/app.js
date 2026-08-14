@@ -1875,16 +1875,16 @@ async function withSyncLeadership(work) {
 
 function scheduleSync(options = {}, delayMs = 75) {
   mergeSyncScheduleOptions(options);
+  if (document.visibilityState === 'hidden') return;
   if (syncScheduleTimer) return;
   const delay = Math.max(delayMs, syncRetryDelayMs);
   syncScheduleTimer = setTimeout(async () => {
     syncScheduleTimer = null;
-    const requested = syncScheduleOptions;
-    syncScheduleOptions = {};
     if (document.visibilityState === 'hidden') {
-      scheduleSync(requested, 1000);
       return;
     }
+    const requested = syncScheduleOptions;
+    syncScheduleOptions = {};
     if (syncInFlight) {
       scheduleSync(requested, 100);
       return;
@@ -3399,6 +3399,10 @@ window.addEventListener('online', async () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     if (isDirty) saveCurrentNote(false);
+    if (syncScheduleTimer) {
+      clearTimeout(syncScheduleTimer);
+      syncScheduleTimer = null;
+    }
     cancelActiveSyncRequests();
   }
   if (document.visibilityState === 'visible') {

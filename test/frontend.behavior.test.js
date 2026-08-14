@@ -100,6 +100,36 @@ describe('typed API outcomes', () => {
   });
 });
 
+describe('sync scheduling while hidden', () => {
+  test('keeps pending sync work dormant until the tab becomes visible', async () => {
+    const requests = [];
+    const app = track(await createApp({
+      fetchImpl: async url => {
+        requests.push(url);
+        const path = String(url);
+        if (path.includes('/api/sync')) return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        if (path.endsWith('/api/notes')) return response(200, []);
+        return response(200, {});
+      },
+    }));
+    const setVisibility = value => Object.defineProperty(app.window.document, 'visibilityState', {value, configurable: true});
+
+    setVisibility('hidden');
+    app.hooks.scheduleSync({reconcile: true});
+    await new Promise(resolve => setTimeout(resolve, 1100));
+
+    expect(requests).toHaveLength(0);
+    expect(app.hooks.getSyncScheduleState()).toEqual({scheduled: false, options: {reconcile: true}});
+
+    setVisibility('visible');
+    app.window.document.dispatchEvent(new app.window.Event('visibilitychange'));
+    expect(app.hooks.getSyncScheduleState().scheduled).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 150));
+
+    expect(requests.some(url => String(url).includes('/api/sync'))).toBe(true);
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));

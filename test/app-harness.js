@@ -32,6 +32,7 @@ globalThis.__mdnotesTestHooks = {
   clearOfflineData,
   api,
   cancelActiveSyncRequests,
+  scheduleSync,
   putLocalNote,
   init,
   restoreRoute,
@@ -66,6 +67,10 @@ globalThis.__mdnotesTestHooks = {
     syncScheduleTimer = null;
     syncScheduleOptions = {};
   },
+  getSyncScheduleState: () => ({
+    scheduled: Boolean(syncScheduleTimer),
+    options: {...syncScheduleOptions},
+  }),
 };
 `;
 
