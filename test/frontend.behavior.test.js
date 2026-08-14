@@ -47,6 +47,34 @@ describe('font availability', () => {
   });
 });
 
+describe('markdown preview policy', () => {
+  test('escapes raw HTML, rejects unsafe resource URLs, and lazy-loads images', async () => {
+    const app = track(await createApp());
+    app.window.marked = {
+      Renderer: class {},
+      parse: (markdown, options) => [
+        '<p>before</p>',
+        options.renderer.html({text: '<form action="/delete"><input name="title"></form>'}),
+        '<a href="javascript:alert(1)">unsafe link</a>',
+        '<img src="https://example.com/image.png" alt="remote">',
+        '<img src="data:text/html,unsafe" alt="blocked">',
+      ].join(''),
+    };
+
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: '# Note'});
+
+    const preview = app.window.document.querySelector('#preview');
+    expect(preview.querySelector('form')).toBeNull();
+    expect(preview.textContent).toContain('<form action="/delete">');
+    expect(preview.querySelector('a').getAttribute('href')).toBeNull();
+    const remoteImage = preview.querySelector('img[src="https://example.com/image.png"]');
+    expect(remoteImage).not.toBeNull();
+    expect(remoteImage.getAttribute('loading')).toBe('lazy');
+    expect(remoteImage.getAttribute('decoding')).toBe('async');
+    expect(preview.querySelector('img[src^="data:"]')).toBeNull();
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));

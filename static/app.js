@@ -2893,6 +2893,65 @@ function linkifyWikiLinks(container) {
   }
 }
 
+const previewAllowedElements = new Set([
+  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HR', 'IMG', 'INPUT', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'SUB', 'SUP', 'TABLE',
+  'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL',
+]);
+const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'title', 'type']);
+
+function safePreviewURL(value, allowMailto = false) {
+  if (!value || /[\u0000-\u001f]/.test(value)) return false;
+  try {
+    const url = new URL(value, window.location.href);
+    return ['http:', 'https:'].includes(url.protocol) || (allowMailto && url.protocol === 'mailto:');
+  } catch (_) {
+    return false;
+  }
+}
+
+function sanitizePreview(container) {
+  [...container.querySelectorAll('*')].forEach(element => {
+    if (!previewAllowedElements.has(element.tagName)) {
+      element.remove();
+      return;
+    }
+    const attributeNames = [];
+    for (let index = 0; index < element.attributes.length; index++) {
+      const attribute = element.attributes.item(index);
+      if (attribute?.name) attributeNames.push(attribute.name);
+    }
+    attributeNames.forEach(attributeName => {
+      const name = attributeName.toLowerCase();
+      if (!previewAllowedAttributes.has(name) || name.startsWith('on')) element.removeAttribute(attributeName);
+    });
+    if (element.tagName === 'A') {
+      const href = element.getAttribute('href');
+      if (href && !safePreviewURL(href, true)) element.removeAttribute('href');
+    }
+    if (element.tagName === 'IMG') {
+      const src = element.getAttribute('src');
+      if (!src || !safePreviewURL(src)) {
+        element.remove();
+        return;
+      }
+      element.setAttribute('loading', 'lazy');
+      element.setAttribute('decoding', 'async');
+    }
+    if (element.tagName === 'INPUT' && element.getAttribute('type') !== 'checkbox') element.remove();
+  });
+}
+
+function markdownRenderOptions() {
+  const options = {breaks:true, gfm:true};
+  if (typeof marked.Renderer === 'function') {
+    const renderer = new marked.Renderer();
+    renderer.html = token => esc(token.text ?? token.raw ?? '');
+    options.renderer = renderer;
+  }
+  return options;
+}
+
 $('#preview').addEventListener('click', event => {
   const link = event.target.closest('a[data-wiki-title]');
   if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -2908,7 +2967,8 @@ function updatePreview() {
     return;
   }
   if (typeof marked !== 'undefined' && marked.parse) {
-    $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
+    $('#preview').innerHTML = marked.parse(md, markdownRenderOptions());
+    sanitizePreview($('#preview'));
     linkifyWikiLinks($('#preview'));
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
