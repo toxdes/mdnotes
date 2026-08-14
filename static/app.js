@@ -1256,15 +1256,61 @@ function closeConflictResolver() {
 }
 
 function openModal(modal) {
+  if (!modal.__keyboardBound) {
+    modal.addEventListener('keydown', handleModalKeydown);
+    modal.__keyboardBound = true;
+  }
+  modal.__opener = document.activeElement && typeof document.activeElement.focus === 'function' ? document.activeElement : null;
   modal.classList.remove('hidden', 'is-closing');
+  modal.setAttribute('aria-hidden', 'false');
+  const initialFocus = modal.querySelector('[autofocus]') || modal.querySelector('.modal-close') || modalFocusableElements(modal)[0] || modal.querySelector('[role="dialog"]');
+  if (initialFocus) initialFocus.focus();
+}
+
+function modalFocusableElements(modal) {
+  return [...modal.querySelectorAll('button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])')].filter(element => {
+    if (element.disabled || element.hidden || element.closest('.hidden, [hidden]')) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  });
+}
+
+function handleModalKeydown(event) {
+  const modal = event.currentTarget;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    if (modal.id === 'conflict-modal') closeConflictResolver();
+    else closeModal(modal);
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = modalFocusableElements(modal);
+  if (!focusable.length) {
+    event.preventDefault();
+    modal.querySelector('[role="dialog"]')?.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function closeModal(modal) {
   if (modal.classList.contains('hidden') || modal.classList.contains('is-closing')) return;
   modal.classList.add('is-closing');
+  const opener = modal.__opener;
   const finish = () => {
     modal.classList.remove('is-closing');
     modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    modal.__opener = null;
+    if (opener?.isConnected) opener.focus();
   };
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     finish();
@@ -2125,10 +2171,10 @@ function renderDashboard(notes, conflicts) {
   const tags = [...new Set(notes.flatMap(note => (note.tags || '').split(',').map(tag => tag.trim()).filter(Boolean)))].sort((a, b) => a.localeCompare(b));
   if (currentTag && !tags.includes(currentTag)) currentTag = null;
   const bar = $('#tag-bar');
-  let html = '<span class="tag'+(currentTag?'':' active')+'" data-tag="">All</span>';
+  let html = '<button type="button" class="tag'+(currentTag?'':' active')+'" data-tag="" aria-pressed="'+(currentTag ? 'false' : 'true')+'">All</button>';
   tags.forEach(t => {
     const active = t === currentTag ? ' active' : '';
-    html += `<span class="tag${active}" data-tag="${esc(t)}">${esc(t)}</span>`;
+    html += `<button type="button" class="tag${active}" data-tag="${esc(t)}" aria-pressed="${active ? 'true' : 'false'}">${esc(t)}</button>`;
   });
   bar.innerHTML = html;
   bar.querySelectorAll('.tag').forEach(el => {
@@ -2140,15 +2186,17 @@ function renderDashboard(notes, conflicts) {
   if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
-    list.innerHTML = '<div class="note-empty">No notes yet</div>';
+    list.innerHTML = '<li class="note-empty">No notes yet</li>';
     return;
   }
   list.innerHTML = notes.map(n => `
-    <div class="note-item" data-id="${esc(n.id)}">
+    <li>
+      <button type="button" class="note-item" data-id="${esc(n.id)}">
       <div class="note-title">${esc(n.title || 'Untitled')}${conflicts.has(n.id) ? '<span class="note-conflict">Conflict</span>' : ''}</div>
       <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
       ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
-    </div>
+      </button>
+    </li>
   `).join('');
   list.querySelectorAll('.note-item').forEach(el => {
     el.addEventListener('click', () => openNote(el.dataset.id));
@@ -2178,7 +2226,9 @@ async function loadDashboard({sync = true} = {}) {
 }
 
 function applyEditorPrefs() {
-  $('.meta-pane').classList.toggle('collapsed', prefs.collapseDetails);
+  const collapsed = Boolean(prefs.collapseDetails);
+  $('.meta-pane').classList.toggle('collapsed', collapsed);
+  $('.meta-toggle').setAttribute('aria-expanded', String(!collapsed));
   $('#editor').classList.toggle('header-hidden', prefs.hideHeaderOnFullscreen && panelState !== 'both');
   if (prefs.hideToolbar) {
     $('.fmt-bar').classList.add('hidden');
@@ -2483,7 +2533,7 @@ tablePicker.id = 'table-picker';
 tablePicker.className = 'table-picker hidden';
 tablePicker.setAttribute('role', 'dialog');
 tablePicker.setAttribute('aria-label', 'Choose table size');
-tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="grid"></div>';
+tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="group" aria-label="Table size options"></div>';
 document.body.append(tablePicker);
 
 const tableGrid = tablePicker.querySelector('.table-grid');
@@ -2498,7 +2548,6 @@ for (let row = 1; row <= tablePickerRows; row++) {
     cell.className = 'table-grid-cell';
     cell.dataset.rows = String(row);
     cell.dataset.columns = String(column);
-    cell.setAttribute('role', 'gridcell');
     cell.setAttribute('aria-label', `${column} columns by ${row} rows`);
     tableGrid.append(cell);
   }
@@ -2699,7 +2748,9 @@ $('#note-content').addEventListener('keydown', e => {
 
 // --- Meta pane toggle ---
 $('.meta-toggle')?.addEventListener('click', () => {
-  $('.meta-pane').classList.toggle('collapsed');
+  const pane = $('.meta-pane');
+  const collapsed = pane.classList.toggle('collapsed');
+  $('.meta-toggle').setAttribute('aria-expanded', String(!collapsed));
 });
 
 // --- Panel toggle ---
@@ -2734,6 +2785,10 @@ function setPanelState(state) {
     button.setAttribute('aria-label', label);
     button.setAttribute('aria-pressed', String(panelWide));
     button.querySelector('use').setAttribute('href', panelWide ? '#icon-width-reading' : '#icon-width-full');
+  });
+  document.querySelectorAll('.panel-switch').forEach(button => {
+    const targetVisible = state === 'both' || state === button.dataset.panelSwitch;
+    button.setAttribute('aria-expanded', String(targetVisible));
   });
   applyPanelRatio();
   if (state !== 'editor') schedulePreviewCheck();

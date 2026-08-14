@@ -6,6 +6,7 @@
     "test:browser": "playwright test --config=playwright.config.js"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.62.1",
     "fake-indexeddb": "^6.2.4",
     "jsdom": "^26.1.0",

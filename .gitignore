@@ -3,6 +3,8 @@ DESIGN_SYSTEM.md
 TODO.md
 /dist/
 node_modules/
+test-results/
+playwright-report/
 *.db
 /notes/
 .env

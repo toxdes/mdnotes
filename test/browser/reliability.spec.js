@@ -32,7 +32,7 @@ test('restores a cached note when sync APIs are unavailable', async ({page}) => 
   await page.reload({waitUntil: 'domcontentloaded'});
 
   await expect(page.locator('#dashboard')).toBeVisible();
-  await expect(page.locator('.note-item')).toContainText(title);
+  await expect(page.locator('.note-item').filter({hasText: title})).toBeVisible();
   await expect(page.locator('#dashboard .offline-notice-message')).toContainText('Changes are saved on this device');
 });
 

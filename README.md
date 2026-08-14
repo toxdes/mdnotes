@@ -79,7 +79,7 @@ Cross-compile all targets (Linux binaries compressed with UPX):
 
 ## Tests
 
-Run the default frontend behavior suite with `npm run test:frontend`. The opt-in browser reliability suite uses the installed Chrome binary and a temporary Go server; run it with `npm run test:browser`. It covers offline cached startup, unchanged navigation request counts, and a warm dashboard performance budget.
+Run the default frontend behavior suite with `npm run test:frontend`. The opt-in browser reliability suite uses the installed Chrome binary and a temporary Go server; run it with `npm run test:browser`. It covers offline cached startup, unchanged navigation request counts, a warm dashboard performance budget, keyboard navigation, and serious accessibility violations.
 
 ## Docker
 
