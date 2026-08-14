@@ -1901,6 +1901,11 @@ async function withSyncLeadership(work) {
         result = await work();
       });
       if (acquired) return result;
+      // A normal null result means another tab owns the Web Lock. That owner
+      // does not also hold the IndexedDB fallback lease, so falling through
+      // would allow both tabs to synchronize concurrently.
+      scheduleSync({}, 500);
+      return false;
     } catch (error) {
       if (acquired) throw error;
       console.warn('Web Locks unavailable; using IndexedDB sync lease', error);
