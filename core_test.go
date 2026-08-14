@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -183,6 +184,33 @@ func TestRateLimiterBanIsTemporaryAndLoginWindowResets(t *testing.T) {
 	var count int
 	if err := db.QueryRow("SELECT count FROM rate_limits WHERE ip = ? AND typ = 'login'", "203.0.113.8").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("expired-window login count = %d, %v; want 1", count, err)
+	}
+}
+
+func TestLoginRateLimitExpiresAfterAdvertisedBackoff(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	updated := time.Now().UTC().Add(-2 * time.Second).Format(time.RFC3339)
+	if _, err := db.Exec("INSERT INTO rate_limits (ip, typ, count, updated_at) VALUES (?, 'login', 5, ?)", "203.0.113.10", updated); err != nil {
+		t.Fatalf("seed login limit: %v", err)
+	}
+
+	retryAfter, err := rl.loginRetryAfter("203.0.113.10")
+	if err != nil {
+		t.Fatalf("check login retry: %v", err)
+	}
+	if retryAfter != 0 {
+		t.Fatalf("retry after elapsed one-second backoff = %d; want 0", retryAfter)
 	}
 }
 
@@ -981,6 +1009,50 @@ func TestCompactSyncOperationPayloadsPreservesAcknowledgements(t *testing.T) {
 	}
 	if err := db.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&actualBytes); err != nil || trackedBytes != actualBytes {
 		t.Fatalf("tracked payload bytes = %d, actual = %d, %v", trackedBytes, actualBytes, err)
+	}
+}
+
+func TestCompactSyncOperationAcknowledgementsKeepsPayloadStatsExact(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	previousLimit := maxSyncOperationAcknowledgements
+	maxSyncOperationAcknowledgements = 1
+	t.Cleanup(func() { maxSyncOperationAcknowledgements = previousLimit })
+	for sequence, payload := range []string{"first-payload", "second-payload"} {
+		if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)", "device", sequence+1, "op"+strconv.Itoa(sequence+1), "noop", `{"status":"applied"}`, payload, fmt.Sprintf("2026-01-01T00:00:0%dZ", sequence)); err != nil {
+			t.Fatalf("insert operation %d: %v", sequence, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = 2, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1"); err != nil {
+		t.Fatalf("seed sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin compaction: %v", err)
+	}
+	if err := compactSyncOperationAcknowledgements(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("compact acknowledgements: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit compaction: %v", err)
+	}
+
+	var trackedBytes, actualBytes int64
+	if err := db.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&trackedBytes); err != nil {
+		t.Fatalf("read tracked payload bytes: %v", err)
+	}
+	if err := db.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&actualBytes); err != nil {
+		t.Fatalf("read actual payload bytes: %v", err)
+	}
+	if trackedBytes != actualBytes {
+		t.Fatalf("tracked payload bytes = %d, actual = %d", trackedBytes, actualBytes)
 	}
 }
 

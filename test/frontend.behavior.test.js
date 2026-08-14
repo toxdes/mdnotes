@@ -186,6 +186,38 @@ describe('F-01 editor save coordination', () => {
       savedSnapshot: {title: 'New note', content: 'new content'},
     });
   });
+
+  test('drains the latest snapshot before starting a new note', async () => {
+    const app = track(await createApp({deferredSave: true}));
+    app.hooks.setEditorState({
+      id: 'note-a',
+      dirty: true,
+      title: 'Old note',
+      content: 'first version',
+      savedSnapshot: {title: '', tags: '', content: ''},
+    });
+
+    const firstSave = app.hooks.saveCurrentNote(false);
+    await app.firstSaveStarted;
+    app.window.document.querySelector('#note-content').value = 'newest version';
+    app.hooks.markDirty();
+    app.hooks.saveCurrentNote(false);
+
+    app.window.document.querySelector('#new-note-btn').click();
+    const newNoteID = app.hooks.getState().currentNoteId;
+    app.releaseFirstSave();
+    await firstSave;
+
+    expect(app.saveCalls).toHaveLength(2);
+    expect(app.saveCalls[1]).toMatchObject({
+      note: {id: 'note-a', content: 'newest version'},
+      operation: {note_id: 'note-a'},
+    });
+    expect(app.hooks.getState()).toMatchObject({
+      currentNoteId: newNoteID,
+      isDirty: false,
+    });
+  });
 });
 
 describe('F-02 immutable queue operations', () => {
@@ -236,6 +268,19 @@ describe('F-02 immutable queue operations', () => {
     secondTab.hooks.cancelScheduledSync();
     release();
     expect(await leaderRun).toBe('leader');
+  });
+
+  test('does not fall through to the fallback lease when a Web Lock is held', async () => {
+    const app = track(await createApp());
+    Object.defineProperty(app.window.navigator, 'locks', {
+      configurable: true,
+      value: {request: vi.fn(async (_name, _options, callback) => callback(null))},
+    });
+    const work = vi.fn(() => 'unexpected leader');
+
+    expect(await app.hooks.withSyncLeadership(work)).toBe(false);
+    expect(work).not.toHaveBeenCalled();
+    app.hooks.cancelScheduledSync();
   });
 });
 
@@ -424,6 +469,13 @@ describe('conflict deletion recovery', () => {
 });
 
 describe('F-04 service worker revisions', () => {
+  test('does not register a provisional legacy revision before the server revision is known', async () => {
+    const register = vi.fn(async () => {});
+    const app = track(await createApp({serviceWorker: {register}}));
+
+    expect(register).not.toHaveBeenCalled();
+  });
+
   test('registers the worker with the server-provided frontend revision', async () => {
     const register = vi.fn(async () => {});
     const app = track(await createApp({serviceWorker: {register}}));
