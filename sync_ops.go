@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -190,6 +192,91 @@ func storedSyncOperation(db *sql.DB, deviceID string, sequence int64, opID strin
 	return result, nil
 }
 
+var preferenceFieldNames = map[string]struct{}{
+	"autoSave":               {},
+	"hidePreview":            {},
+	"hideHeaderOnFullscreen": {},
+	"hideToolbar":            {},
+	"collapseDetails":        {},
+	"hideCursorHighlight":    {},
+	"theme":                  {},
+	"accentColor":            {},
+	"fontFamily":             {},
+	"editorFontFamily":       {},
+	"previewFontFamily":      {},
+}
+
+func preferenceFields(p *prefs) (map[string]json.RawMessage, error) {
+	encoded, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "revision")
+	delete(fields, "_sync_patch")
+	delete(fields, "_sync_base")
+	return fields, nil
+}
+
+func jsonValuesEqual(left, right json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(left), bytes.TrimSpace(right))
+}
+
+func preferencePatchConflicts(current *prefs, operation *prefs) (bool, error) {
+	currentFields, err := preferenceFields(current)
+	if err != nil {
+		return false, err
+	}
+	for key, desired := range operation.SyncPatch {
+		if _, ok := preferenceFieldNames[key]; !ok {
+			return false, fmt.Errorf("unknown preference field %q", key)
+		}
+		base, ok := operation.SyncBase[key]
+		if !ok {
+			return true, nil
+		}
+		currentValue, exists := currentFields[key]
+		if !exists {
+			currentValue = json.RawMessage(`""`)
+		}
+		if !jsonValuesEqual(currentValue, base) && !jsonValuesEqual(currentValue, desired) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func applyPreferencePatch(current *prefs, patch map[string]json.RawMessage) (*prefs, error) {
+	fields, err := preferenceFields(current)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range patch {
+		if _, ok := preferenceFieldNames[key]; !ok {
+			return nil, fmt.Errorf("unknown preference field %q", key)
+		}
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("invalid preference value for %q", key)
+		}
+		fields[key] = value
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	var next prefs
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&next); err != nil {
+		return nil, err
+	}
+	next.Revision = current.Revision
+	return &next, nil
+}
+
 func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest) (syncOperationResult, error) {
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -269,13 +356,41 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 			return syncOperationResult{}, err
 		}
 	case "prefs.save":
-		data, err := json.Marshal(operation.Prefs)
+		current, err := getPrefsTx(tx)
 		if err != nil {
 			return syncOperationResult{}, err
 		}
-		if _, err := tx.Exec("UPDATE prefs SET data = ? WHERE id = 1", string(data)); err != nil {
+		if len(operation.Prefs.SyncPatch) > 0 {
+			if operation.BaseRevision != nil && *operation.BaseRevision != current.Revision {
+				conflict, err := preferencePatchConflicts(current, operation.Prefs)
+				if err != nil {
+					return syncOperationResult{}, err
+				}
+				if conflict {
+					result.Status = "conflict"
+					result.CurrentRevision = current.Revision
+					break
+				}
+			}
+			next, err := applyPreferencePatch(current, operation.Prefs.SyncPatch)
+			if err != nil {
+				return syncOperationResult{}, err
+			}
+			if err := savePrefsTx(tx, next, nil); err != nil {
+				return syncOperationResult{}, err
+			}
+			result.Revision = next.Revision
+			break
+		}
+		if operation.BaseRevision != nil && *operation.BaseRevision != current.Revision {
+			result.Status = "conflict"
+			result.CurrentRevision = current.Revision
+			break
+		}
+		if err := savePrefsTx(tx, operation.Prefs, nil); err != nil {
 			return syncOperationResult{}, err
 		}
+		result.Revision = operation.Prefs.Revision
 	case "noop":
 	}
 

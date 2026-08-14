@@ -62,17 +62,20 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 type prefs struct {
-	AutoSave               bool   `json:"autoSave"`
-	HidePreview            bool   `json:"hidePreview"`
-	HideHeaderOnFullscreen bool   `json:"hideHeaderOnFullscreen"`
-	HideToolbar            bool   `json:"hideToolbar"`
-	CollapseDetails        bool   `json:"collapseDetails"`
-	HideCursorHighlight    bool   `json:"hideCursorHighlight"`
-	Theme                  string `json:"theme,omitempty"`
-	AccentColor            string `json:"accentColor,omitempty"`
-	FontFamily             string `json:"fontFamily,omitempty"`
-	EditorFontFamily       string `json:"editorFontFamily,omitempty"`
-	PreviewFontFamily      string `json:"previewFontFamily,omitempty"`
+	Revision               int64                      `json:"revision,omitempty"`
+	AutoSave               bool                       `json:"autoSave"`
+	HidePreview            bool                       `json:"hidePreview"`
+	HideHeaderOnFullscreen bool                       `json:"hideHeaderOnFullscreen"`
+	HideToolbar            bool                       `json:"hideToolbar"`
+	CollapseDetails        bool                       `json:"collapseDetails"`
+	HideCursorHighlight    bool                       `json:"hideCursorHighlight"`
+	Theme                  string                     `json:"theme,omitempty"`
+	AccentColor            string                     `json:"accentColor,omitempty"`
+	FontFamily             string                     `json:"fontFamily,omitempty"`
+	EditorFontFamily       string                     `json:"editorFontFamily,omitempty"`
+	PreviewFontFamily      string                     `json:"previewFontFamily,omitempty"`
+	SyncPatch              map[string]json.RawMessage `json:"_sync_patch,omitempty"`
+	SyncBase               map[string]json.RawMessage `json:"_sync_base,omitempty"`
 }
 
 type migration struct {
@@ -95,6 +98,7 @@ var migrations = []migration{
 	{version: 12, up: migrateFileOperationHashSchema},
 	{version: 13, up: migrateFileOperationRecoverySchema},
 	{version: 14, up: migrateSyncOperationCompactionSchema},
+	{version: 15, up: migratePreferenceRevisionSchema},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -441,26 +445,74 @@ func migrateSyncOperationCompactionSchema(tx *sql.Tx) error {
 	return err
 }
 
+func migratePreferenceRevisionSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE prefs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`)
+	return err
+}
+
 func getPrefs(db *sql.DB) (*prefs, error) {
-	var data string
-	err := db.QueryRow("SELECT data FROM prefs WHERE id = 1").Scan(&data)
+	dbTx, err := db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	p := &prefs{AutoSave: true}
-	if err := json.Unmarshal([]byte(data), p); err != nil {
-		return nil, fmt.Errorf("decode preferences: %w", err)
+	defer dbTx.Rollback()
+	p, err := getPrefsTx(dbTx)
+	if err != nil {
+		return nil, err
 	}
 	return p, nil
 }
 
-func savePrefs(db *sql.DB, p *prefs) error {
-	b, err := json.Marshal(p)
+func getPrefsTx(tx *sql.Tx) (*prefs, error) {
+	var data string
+	var revision int64
+	if err := tx.QueryRow("SELECT data, revision FROM prefs WHERE id = 1").Scan(&data, &revision); err != nil {
+		return nil, err
+	}
+	p := &prefs{AutoSave: true, Revision: revision}
+	if err := json.Unmarshal([]byte(data), p); err != nil {
+		return nil, fmt.Errorf("decode preferences: %w", err)
+	}
+	p.Revision = revision
+	p.SyncPatch = nil
+	p.SyncBase = nil
+	return p, nil
+}
+
+func savePrefsTx(tx *sql.Tx, p *prefs, expectedRevision *int64) error {
+	current, err := getPrefsTx(tx)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec("UPDATE prefs SET data = ? WHERE id = 1", string(b))
-	return err
+	if expectedRevision != nil && *expectedRevision != current.Revision {
+		return errRevisionConflict
+	}
+	stored := *p
+	stored.Revision = 0
+	stored.SyncPatch = nil
+	stored.SyncBase = nil
+	b, err := json.Marshal(&stored)
+	if err != nil {
+		return err
+	}
+	nextRevision := current.Revision + 1
+	if _, err := tx.Exec("UPDATE prefs SET data = ?, revision = ? WHERE id = 1", string(b), nextRevision); err != nil {
+		return err
+	}
+	p.Revision = nextRevision
+	return nil
+}
+
+func savePrefs(db *sql.DB, p *prefs, expectedRevision *int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := savePrefsTx(tx, p, expectedRevision); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func listNotes(db *sql.DB, tag string) ([]note, error) {

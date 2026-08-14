@@ -22,6 +22,7 @@ globalThis.__mdnotesTestHooks = {
   withSyncLeadership,
   registerServiceWorker,
   acknowledgeCompactedOperation,
+  savePref,
   applyRemoteDeletion,
   applyRemoteChangePage,
   getLocalNote,

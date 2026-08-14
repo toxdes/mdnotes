@@ -469,9 +469,48 @@ func (a *app) handleSavePrefs(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &p, 16<<10) {
 		return
 	}
-	if err := savePrefs(a.db, &p); err != nil {
+	expectedRevision, err := ifMatchRevision(r)
+	if err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "invalid preference revision",
+			"code":  "invalid_preferences_revision",
+		})
+		return
+	}
+	if err := savePrefs(a.db, &p, expectedRevision); errors.Is(err, errRevisionConflict) {
+		current, currentErr := getPrefs(a.db)
+		if currentErr != nil {
+			http.Error(w, "could not load preferences", http.StatusInternalServerError)
+			return
+		}
+		writeJSONStatus(w, http.StatusConflict, map[string]any{
+			"error":            "preferences changed on another device",
+			"code":             "preferences_revision_conflict",
+			"current_revision": current.Revision,
+		})
+		return
+	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, &p)
+	saved, err := getPrefs(a.db)
+	if err != nil {
+		http.Error(w, "could not load preferences", http.StatusInternalServerError)
+		return
+	}
+	a.publishChange("preferences")
+	writeJSON(w, saved)
+}
+
+func ifMatchRevision(r *http.Request) (*int64, error) {
+	raw := strings.TrimSpace(r.Header.Get("If-Match"))
+	if raw == "" || raw == "*" {
+		return nil, nil
+	}
+	raw = strings.Trim(raw, `"`)
+	revision, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || revision < 1 {
+		return nil, errors.New("invalid preference revision")
+	}
+	return &revision, nil
 }

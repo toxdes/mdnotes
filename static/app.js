@@ -19,7 +19,7 @@ let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let editorSessionGeneration = 0;
-const DEFAULT_PREFS = {autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
+const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
 const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
 const FONT_CACHE_NAME = 'mdnotes-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
@@ -314,6 +314,24 @@ function setUnresolvedConflict(conflict) {
   return setOfflineState(unresolvedConflictKey(conflict.note_id), conflict);
 }
 
+function mergeQueuedPreferencePayload(existing, operation) {
+  const existingPatch = existing.prefs?._sync_patch;
+  const nextPatch = operation.prefs?._sync_patch;
+  if (!existingPatch || !nextPatch) {
+    existing.base_revision = operation.base_revision;
+    existing.prefs = operation.prefs;
+    return;
+  }
+  const patch = {...existingPatch};
+  const base = {...(existing.prefs?._sync_base || {})};
+  const nextBase = operation.prefs?._sync_base || {};
+  Object.entries(nextPatch).forEach(([key, value]) => {
+    if (!(key in base)) base[key] = nextBase[key];
+    patch[key] = value;
+  });
+  existing.prefs = {...operation.prefs, _sync_patch: patch, _sync_base: base};
+}
+
 async function queueOperationInStores(stores, operation) {
   if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'prefs.save') {
     await requestValue(stores.state.delete(rejectedSyncKey(operation.note_id)));
@@ -327,9 +345,12 @@ async function queueOperationInStores(stores, operation) {
       .filter(item => !item.attempted_at && item.type === operation.type)
       .sort((left, right) => right.client_sequence - left.client_sequence)[0];
     if (existing) {
-      existing.base_revision = operation.base_revision;
-      existing.note = operation.note;
-      existing.prefs = operation.prefs;
+      if (operation.type === 'prefs.save') mergeQueuedPreferencePayload(existing, operation);
+      else {
+        existing.base_revision = operation.base_revision;
+        existing.note = operation.note;
+        existing.prefs = operation.prefs;
+      }
       await requestValue(stores.queue.put(existing));
       return;
     }
@@ -1616,6 +1637,10 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
     return;
   }
   if (acknowledgement.status === 'conflict') {
+    if (operation.type === 'prefs.save') {
+      await resolvePreferenceConflict(operation);
+      return;
+    }
     const remote = await loadConflictRemoteNote(operation.note_id);
     if (await mergeConflictedNote(operation, remote)) {
       showToast('Merged your non-overlapping changes.', 'success');
@@ -1629,6 +1654,11 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
     return;
   }
   if (acknowledgement.status !== 'applied') throw new Error('unknown sync acknowledgement');
+  if (operation.type === 'prefs.save') {
+    prefs = normalizePrefs({...prefs, revision: acknowledgement.revision || prefs.revision});
+    localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    applyPrefs();
+  }
   if (operation.type === 'note.save') {
     const acknowledgedNote = operation.note;
     const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
@@ -1692,6 +1722,53 @@ async function flushPendingChanges() {
       await applySyncAcknowledgement(operation, acknowledgement);
     }
   }
+}
+
+function preferenceValuesEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function resolvePreferenceConflict(operation) {
+  const remote = await api('/api/prefs', {syncRequest: true});
+  if (!remote) throw new Error('could not load remote preferences');
+  const payload = operation.prefs || {};
+  const patch = payload._sync_patch || {};
+  const base = payload._sync_base || {};
+  const safePatch = {};
+  const conflicts = [];
+  Object.entries(patch).forEach(([key, desired]) => {
+    const current = remote[key];
+    if (!(key in base) || (!preferenceValuesEqual(current, base[key]) && !preferenceValuesEqual(current, desired))) {
+      conflicts.push(key);
+    } else if (!preferenceValuesEqual(current, desired)) {
+      safePatch[key] = desired;
+    }
+  });
+
+  const next = normalizePrefs({...remote, ...safePatch});
+  await withOfflineStore(['queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('preference operation changed before conflict resolution');
+    }
+    await requestValue(stores.queue.delete(operation.id));
+    if (Object.keys(safePatch).length) {
+      const safeBase = Object.fromEntries(Object.keys(safePatch).map(key => [key, remote[key]]));
+      await queueOperationInStores(stores, {
+        type: 'prefs.save',
+        note_id: '__prefs__',
+        base_revision: remote.revision,
+        prefs: {...next, _sync_patch: safePatch, _sync_base: safeBase},
+      });
+    }
+  });
+  prefs = next;
+  localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+  applyPrefs();
+  if (conflicts.length) {
+    showToast('Some preferences changed on another device. Those settings were kept.', 'warning');
+  }
+  scheduleSync();
 }
 
 function mergeSyncScheduleOptions(options = {}) {
@@ -2874,6 +2951,7 @@ function legacyThemeID() {
 
 function normalizePrefs(value = {}, fallback = {}) {
   const merged = {...DEFAULT_PREFS, ...fallback, ...value};
+  merged.revision = Number.isSafeInteger(Number(merged.revision)) && Number(merged.revision) > 0 ? Number(merged.revision) : 1;
   if (!value.theme && !fallback.theme) merged.theme = legacyThemeID();
   if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
   if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
@@ -3027,9 +3105,19 @@ $('#prefs-modal .modal-backdrop').addEventListener('click', () => {
 });
 
 async function savePref(key, value) {
+  const previous = {...prefs};
   prefs = normalizePrefs({...prefs, [key]: value});
   localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
-  await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
+  await queueOperation({
+    type: 'prefs.save',
+    note_id: '__prefs__',
+    base_revision: previous.revision || 1,
+    prefs: {
+      ...prefs,
+      _sync_patch: {[key]: prefs[key]},
+      _sync_base: {[key]: previous[key]},
+    },
+  });
   if (key === 'theme' || key === 'accentColor') applyTheme(prefs.theme);
   if (['fontFamily', 'editorFontFamily', 'previewFontFamily'].includes(key)) void applyFonts(true);
   applyEditorPrefs();

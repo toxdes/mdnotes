@@ -503,6 +503,62 @@ describe('sync request lifecycle', () => {
   });
 });
 
+describe('preference sync coordination', () => {
+  test('coalesces preference changes into field-level patches', async () => {
+    const app = track(await createApp());
+
+    await app.hooks.savePref('theme', 'default-dark');
+    await app.hooks.savePref('accentColor', '#123456');
+    app.hooks.cancelScheduledSync();
+
+    const pending = await app.hooks.pendingOperations();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].base_revision).toBe(1);
+    expect(pending[0].prefs._sync_patch).toEqual({theme: 'default-dark', accentColor: '#123456'});
+    expect(pending[0].prefs._sync_base).toEqual({theme: 'default-light', accentColor: ''});
+  });
+
+  test('surfaces same-field preference conflicts and keeps the remote value', async () => {
+    const remote = {
+      revision: 2,
+      autoSave: true,
+      hidePreview: false,
+      hideHeaderOnFullscreen: false,
+      hideToolbar: false,
+      collapseDetails: false,
+      hideCursorHighlight: false,
+      theme: 'solarized-dark',
+      accentColor: '',
+      fontFamily: 'system-sans',
+      editorFontFamily: 'system-monospace',
+      previewFontFamily: 'system-sans',
+    };
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        if (String(path) === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          const operation = request.operations[0];
+          return response(200, JSON.stringify({
+            acknowledged: [{client_sequence: operation.client_sequence, op_id: operation.op_id, status: 'conflict', current_revision: 2}],
+            expected_sequence: operation.client_sequence + 1,
+          }));
+        }
+        if (String(path) === '/api/prefs') return response(200, JSON.stringify(remote));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+    await app.hooks.savePref('theme', 'default-dark');
+    app.hooks.cancelScheduledSync();
+
+    await expect(app.hooks.flushPendingChanges()).resolves.toBe(true);
+
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+    expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs'))).toMatchObject({theme: 'solarized-dark', revision: 2});
+    expect(app.window.document.querySelector('#toast-region').textContent).toContain('Some preferences changed on another device');
+  });
+});
+
 describe('deep-link restoration', () => {
   test('fetches an uncached deep-linked note before declaring it missing', async () => {
     const remote = {id: 'note-a', filename: 'note-a.md', title: 'Remote note', tags: 'work', content: 'Loaded directly', revision: 4};

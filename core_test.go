@@ -83,7 +83,7 @@ func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create migration table: %v", err)
 	}
-	for _, migration := range migrations[:len(migrations)-4] {
+	for _, migration := range migrations[:10] {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin migration %d: %v", migration.version, err)
@@ -1019,6 +1019,146 @@ func TestSyncPushReportsPermanentValidationErrors(t *testing.T) {
 	}
 	if response["code"] != "invalid_sync_operation" || response["permanent"] != true || response["op_id"] != "operation_1" {
 		t.Fatalf("validation response = %#v", response)
+	}
+}
+
+func TestPreferenceSyncMergesDisjointChangesAndConflictsSameField(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}
+	push := func(device string, sequence int64, opID string, patch, base map[string]json.RawMessage, revision int64) syncPushResponse {
+		body, err := json.Marshal(syncPushRequest{
+			DeviceID: device,
+			Operations: []syncOperationRequest{{
+				ClientSequence: sequence,
+				OpID:           opID,
+				Type:           "prefs.save",
+				BaseRevision:   &revision,
+				Prefs:          &prefs{SyncPatch: patch, SyncBase: base},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("marshal preference push: %v", err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body)))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		a.handleSyncPush(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("preference push status = %d: %s", w.Code, w.Body.String())
+		}
+		var response syncPushResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode preference push: %v", err)
+		}
+		return response
+	}
+	raw := func(value string) json.RawMessage { return json.RawMessage(strconv.Quote(value)) }
+
+	first := push("device_a", 1, "pref_a", map[string]json.RawMessage{"theme": raw("default-dark")}, map[string]json.RawMessage{"theme": raw("default-light")}, 1)
+	if first.Acknowledged[0].Status != "applied" || first.Acknowledged[0].Revision != 2 {
+		t.Fatalf("first preference result = %#v", first.Acknowledged)
+	}
+	second := push("device_b", 1, "pref_b", map[string]json.RawMessage{"accentColor": raw("#123456")}, map[string]json.RawMessage{"accentColor": raw("")}, 1)
+	if second.Acknowledged[0].Status != "applied" || second.Acknowledged[0].Revision != 3 {
+		t.Fatalf("disjoint preference result = %#v", second.Acknowledged)
+	}
+	p, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("load merged preferences: %v", err)
+	}
+	if p.Theme != "default-dark" || p.AccentColor != "#123456" || p.Revision != 3 {
+		t.Fatalf("merged preferences = %#v", p)
+	}
+	conflict := push("device_c", 1, "pref_c", map[string]json.RawMessage{"theme": raw("default-light")}, map[string]json.RawMessage{"theme": raw("default-light")}, 1)
+	if conflict.Acknowledged[0].Status != "conflict" || conflict.Acknowledged[0].CurrentRevision != 3 {
+		t.Fatalf("same-field preference result = %#v", conflict.Acknowledged)
+	}
+}
+
+func TestDirectPreferencePatchUsesRevisionAndPublishesChange(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	events := newEventBroker()
+	a := &app{db: db, events: events}
+	p, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("load initial preferences: %v", err)
+	}
+	subscriber := events.subscribe()
+	defer events.unsubscribe(subscriber)
+	p.Theme = "default-dark"
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal preferences: %v", err)
+	}
+	initial := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	initial.Header.Set("Content-Type", "application/json")
+	initialResult := httptest.NewRecorder()
+	a.handleSavePrefs(initialResult, initial)
+	if initialResult.Code != http.StatusOK {
+		t.Fatalf("initial preference status = %d: %s", initialResult.Code, initialResult.Body.String())
+	}
+	<-subscriber
+
+	p.Theme = "default-light"
+	body, err = json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal stale preferences: %v", err)
+	}
+	stale := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	stale.Header.Set("Content-Type", "application/json")
+	stale.Header.Set("If-Match", `"1"`)
+	staleResult := httptest.NewRecorder()
+	a.handleSavePrefs(staleResult, stale)
+	if staleResult.Code != http.StatusConflict {
+		t.Fatalf("stale preference status = %d: %s", staleResult.Code, staleResult.Body.String())
+	}
+
+	current, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("reload preferences: %v", err)
+	}
+	body, err = json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal current preferences: %v", err)
+	}
+	current.Theme = "default-dark"
+	body, err = json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal updated preferences: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `"2"`)
+	result := httptest.NewRecorder()
+	a.handleSavePrefs(result, request)
+	if result.Code != http.StatusOK {
+		t.Fatalf("direct preference status = %d: %s", result.Code, result.Body.String())
+	}
+	select {
+	case kind := <-subscriber:
+		if kind != "preferences" {
+			t.Fatalf("preference event kind = %q", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for preference event")
+	}
+	updated, err := getPrefs(db)
+	if err != nil || updated.Theme != "default-dark" || updated.Revision != 3 {
+		t.Fatalf("updated preferences = %#v, %v", updated, err)
 	}
 }
 
