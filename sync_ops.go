@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	maxSyncPushBytes          = 4 << 20
-	compactedOperationPayload = `{"compacted":true}`
+	maxSyncPushBytes                 = 4 << 20
+	syncOperationCompactionBatchSize = 100
+	compactedOperationPayload        = `{"compacted":true}`
 )
 
 var maxSyncOperationPayloadBytes int64 = 32 << 20
@@ -442,11 +443,21 @@ func compactSyncOperationAcknowledgements(tx *sql.Tx) error {
 	if count <= maxSyncOperationAcknowledgements {
 		return nil
 	}
+	batchSize := min(count-maxSyncOperationAcknowledgements, int64(syncOperationCompactionBatchSize))
+	var removedBytes int64
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(payload_size), 0) FROM (
+		SELECT length(operation) AS payload_size
+		FROM sync_operations
+		ORDER BY applied_at, device_id, client_sequence
+		LIMIT ?
+	)`, batchSize).Scan(&removedBytes); err != nil {
+		return err
+	}
 	result, err := tx.Exec(`DELETE FROM sync_operations WHERE rowid IN (
 		SELECT rowid FROM sync_operations
 		ORDER BY applied_at, device_id, client_sequence
 		LIMIT ?
-	)`, count-maxSyncOperationAcknowledgements)
+	)`, batchSize)
 	if err != nil {
 		return err
 	}
@@ -454,7 +465,10 @@ func compactSyncOperationAcknowledgements(tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec("UPDATE sync_operation_stats SET operation_count = operation_count - ? WHERE id = 1", removed)
+	_, err = tx.Exec(`UPDATE sync_operation_stats
+		SET operation_count = MAX(0, operation_count - ?),
+		    payload_bytes = MAX(0, payload_bytes - ?)
+		WHERE id = 1`, removed, removedBytes)
 	return err
 }
 
@@ -474,11 +488,11 @@ func compactSyncOperationPayloads(tx *sql.Tx) error {
 		rows, err := tx.Query(`SELECT rowid, length(operation) FROM sync_operations
 			WHERE operation != ?
 			ORDER BY applied_at, device_id, client_sequence
-			LIMIT 100`, compactedOperationPayload)
+			LIMIT ?`, compactedOperationPayload, syncOperationCompactionBatchSize)
 		if err != nil {
 			return err
 		}
-		payloads := make([]storedPayload, 0, 100)
+		payloads := make([]storedPayload, 0, syncOperationCompactionBatchSize)
 		for rows.Next() {
 			var payload storedPayload
 			if err := rows.Scan(&payload.rowID, &payload.size); err != nil {

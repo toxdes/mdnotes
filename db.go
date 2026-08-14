@@ -99,6 +99,7 @@ var migrations = []migration{
 	{version: 13, up: migrateFileOperationRecoverySchema},
 	{version: 14, up: migrateSyncOperationCompactionSchema},
 	{version: 15, up: migratePreferenceRevisionSchema},
+	{version: 16, up: migrateRepairSyncOperationStats},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -447,6 +448,14 @@ func migrateSyncOperationCompactionSchema(tx *sql.Tx) error {
 
 func migratePreferenceRevisionSchema(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE prefs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`)
+	return err
+}
+
+func migrateRepairSyncOperationStats(tx *sql.Tx) error {
+	_, err := tx.Exec(`UPDATE sync_operation_stats
+		SET operation_count = (SELECT COUNT(*) FROM sync_operations),
+		    payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations)
+		WHERE id = 1`)
 	return err
 }
 

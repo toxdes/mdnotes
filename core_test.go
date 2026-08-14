@@ -1092,6 +1092,79 @@ func TestCompactSyncOperationAcknowledgementsKeepsPayloadStatsExact(t *testing.T
 	}
 }
 
+func TestCompactSyncOperationAcknowledgementsBoundsDeletionBatch(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	previousLimit := maxSyncOperationAcknowledgements
+	maxSyncOperationAcknowledgements = 1
+	t.Cleanup(func() { maxSyncOperationAcknowledgements = previousLimit })
+	total := syncOperationCompactionBatchSize + 2
+	for sequence := 1; sequence <= total; sequence++ {
+		if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, 'noop', '{}', '{}', ?)", "device", sequence, "op"+strconv.Itoa(sequence), fmt.Sprintf("2026-01-01T00:00:%02dZ", sequence)); err != nil {
+			t.Fatalf("insert operation %d: %v", sequence, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = ?, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1", total); err != nil {
+		t.Fatalf("seed sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin compaction: %v", err)
+	}
+	if err := compactSyncOperationAcknowledgements(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("compact acknowledgements: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit compaction: %v", err)
+	}
+	var remaining int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sync_operations").Scan(&remaining); err != nil || remaining != 2 {
+		t.Fatalf("remaining operations = %d, %v; want 2", remaining, err)
+	}
+}
+
+func TestRepairSyncOperationStatsMigrationRecountsExistingRows(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES ('device', 1, 'op1', 'noop', '{}', 'existing-payload', '2026-01-01T00:00:00Z')"); err != nil {
+		t.Fatalf("insert existing operation: %v", err)
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = 99, payload_bytes = 999 WHERE id = 1"); err != nil {
+		t.Fatalf("corrupt sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin repair: %v", err)
+	}
+	if err := migrateRepairSyncOperationStats(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("repair sync operation stats: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit repair: %v", err)
+	}
+	var count, bytes int64
+	if err := db.QueryRow("SELECT operation_count, payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&count, &bytes); err != nil {
+		t.Fatalf("read repaired stats: %v", err)
+	}
+	if count != 1 || bytes != int64(len("existing-payload")) {
+		t.Fatalf("repaired stats = count %d bytes %d", count, bytes)
+	}
+}
+
 func TestSyncPushAcknowledgesCompactedReplay(t *testing.T) {
 	notesDir := t.TempDir()
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
