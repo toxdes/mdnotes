@@ -241,6 +241,10 @@ func TestLoginRateLimitDoesNotBlockAuthenticatedRoutes(t *testing.T) {
 	if loginResult.Code != http.StatusTooManyRequests || loginResult.Header().Get("Retry-After") == "" {
 		t.Fatalf("rate-limited login = %d, retry-after %q", loginResult.Code, loginResult.Header().Get("Retry-After"))
 	}
+	var attempts int
+	if err := db.QueryRow("SELECT count FROM rate_limits WHERE ip = ? AND typ = 'login'", "203.0.113.9").Scan(&attempts); err != nil || attempts != 5 {
+		t.Fatalf("attempts after rate-limited request = %d, %v; want 5", attempts, err)
+	}
 
 	token, err := a.sessions.create()
 	if err != nil {

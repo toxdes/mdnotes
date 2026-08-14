@@ -125,7 +125,6 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		_ = a.rl.recordLoginAttempt(ip, false)
 		writeJSONStatus(w, http.StatusTooManyRequests, map[string]any{
 			"error":       "too many login attempts",
 			"code":        "login_rate_limited",

@@ -133,18 +133,17 @@ func (rl *rateLimiter) loginRetryAfter(ip string) (int, error) {
 	if count < 5 {
 		return 0, nil
 	}
-	backoff := 1 << min(count-5, 8)
-	remaining := int(time.Until(updated.Add(loginAttemptWindow)).Seconds())
-	if remaining < 1 {
+	backoffSeconds := 1 << min(count-5, 8)
+	if backoffSeconds > 300 {
+		backoffSeconds = 300
+	}
+	remaining := time.Until(updated.Add(time.Duration(backoffSeconds) * time.Second))
+	if remaining <= 0 {
 		return 0, nil
 	}
-	if backoff > 300 {
-		backoff = 300
-	}
-	if backoff > remaining {
-		backoff = remaining
-	}
-	return backoff, nil
+	// Retry-After is an integer number of seconds and must not round down to a
+	// time at which the request would still be rejected.
+	return int((remaining + time.Second - 1) / time.Second), nil
 }
 
 func (rl *rateLimiter) banCheckMiddleware(next http.Handler) http.Handler {
