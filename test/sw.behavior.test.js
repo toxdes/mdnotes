@@ -65,6 +65,7 @@ function loadWorker({revision = 'new', caches, fetchImpl}) {
     URL,
     Request,
     Response,
+    Headers,
     console,
   };
   vm.runInNewContext(serviceWorkerSource, context);
@@ -92,7 +93,8 @@ test('a failed install leaves the active revision cache untouched', async () => 
   const caches = createCacheStorage();
   const oldCache = await caches.open('mdnotes-shell-old');
   await oldCache.put('/app.js', new Response('old app'));
-  const fetchImpl = vi.fn(async request => {
+  const fetchImpl = vi.fn(async (request, options) => {
+    expect(options.headers['X-MDNotes-Shell']).toBe('1');
     if (String(request).endsWith('/app.js')) throw new Error('asset unavailable');
     return new Response(`asset ${request}`);
   });

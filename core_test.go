@@ -89,6 +89,21 @@ func TestGzipMiddlewareCompressesErrorResponsesCorrectly(t *testing.T) {
 	}
 }
 
+func TestGzipMiddlewareLeavesServiceWorkerShellUncompressed(t *testing.T) {
+	handler := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("shell"))
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	request.Header.Set("X-MDNotes-Shell", "1")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+
+	if result.Code != http.StatusOK || result.Header().Get("Content-Encoding") != "" || result.Body.String() != "shell" {
+		t.Fatalf("service worker shell response = status %d, encoding %q, body %q", result.Code, result.Header().Get("Content-Encoding"), result.Body.String())
+	}
+}
+
 func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {

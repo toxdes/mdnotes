@@ -341,10 +341,15 @@ describe('conflict deletion recovery', () => {
 
     await app.hooks.flushPendingChanges();
     app.window.document.querySelector('#conflict-save').click();
-    await new Promise(resolve => setTimeout(resolve, 0));
+    let localNote;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      localNote = await app.hooks.getLocalNote('note-a');
+      if (!localNote) break;
+    }
     app.hooks.cancelScheduledSync();
 
-    expect(await app.hooks.getLocalNote('note-a')).toBeUndefined();
+    expect(localNote).toBeUndefined();
     expect(await app.hooks.getOfflineState('unresolvedConflict:note-a')).toBeUndefined();
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
   });

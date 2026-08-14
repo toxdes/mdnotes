@@ -12,18 +12,30 @@ const SHELL_ASSETS = new Set(ASSETS);
 const FONT_CACHE = 'mdnotes-fonts';
 const FONT_ORIGINS = new Set(['https://fonts.googleapis.com', 'https://fonts.gstatic.com']);
 
+async function normalizeShellResponse(response) {
+  if (!response) return undefined;
+  const headers = new Headers(response.headers);
+  headers.delete('Content-Encoding');
+  headers.delete('Content-Length');
+  return new Response(await response.arrayBuffer(), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function isShellCache(name) {
   return name === LEGACY_CACHE || name.startsWith(CACHE_PREFIX);
 }
 
 async function cachedShellResponse(request) {
   const cache = await caches.open(CACHE);
-  if (request.mode === 'navigate') return (await cache.match('/index.html')) || cache.match('/');
-  return cache.match(request);
+  if (request.mode === 'navigate') return normalizeShellResponse((await cache.match('/index.html')) || await cache.match('/'));
+  return normalizeShellResponse(await cache.match(request));
 }
 
 async function fetchShellAsset(request) {
-  const response = await fetch(request, {cache: 'no-cache'});
+  const response = await fetch(request, {cache: 'no-cache', headers: {'X-MDNotes-Shell': '1'}});
   if (response.ok) {
     const url = new URL(request.url);
     if (!url.search && SHELL_ASSETS.has(url.pathname)) {
@@ -40,7 +52,7 @@ self.addEventListener('install', e => {
     // cache used by the active worker.
     const cache = await caches.open(CACHE);
     await Promise.all(ASSETS.map(async asset => {
-      const response = await fetch(asset, {cache: 'no-cache'});
+      const response = await fetch(asset, {cache: 'no-cache', headers: {'X-MDNotes-Shell': '1'}});
       if (!response.ok) throw new Error(`could not cache ${asset}`);
       await cache.put(asset, response);
     }));

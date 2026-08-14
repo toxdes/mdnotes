@@ -2,9 +2,11 @@
   "name": "mdnotes-frontend-tests",
   "private": true,
   "scripts": {
-    "test:frontend": "vitest run test && node --test static/merge.test.js"
+    "test:frontend": "vitest run test && node --test static/merge.test.js",
+    "test:browser": "playwright test --config=playwright.config.js"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "fake-indexeddb": "^6.2.4",
     "jsdom": "^26.1.0",
     "vitest": "^3.2.4"

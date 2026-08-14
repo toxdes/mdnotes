@@ -59,6 +59,10 @@ func embeddedAppRevision() string {
 
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-MDNotes-Shell") == "1" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		// Keep dynamic endpoints cheap and do not recompress already-compressed
 		// assets. Range responses must stay uncompressed for correct byte ranges.
 		if r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/api/") {
