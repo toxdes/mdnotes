@@ -47,6 +47,26 @@ describe('font availability', () => {
   });
 });
 
+describe('editor display preferences', () => {
+  test('applies status display modes and save button visibility', async () => {
+    const app = track(await createApp());
+    const root = app.window.document.documentElement;
+    const statusLabel = app.window.document.querySelector('#editor-status .sync-indicator-label');
+    expect(app.window.document.querySelector('#pref-status')).not.toBeNull();
+    expect(app.window.document.querySelector('#pref-hidesave')).not.toBeNull();
+
+    await app.hooks.savePref('statusDisplay', 'compact');
+    expect(root.dataset.statusDisplay).toBe('compact');
+    expect(statusLabel).not.toBeNull();
+
+    await app.hooks.savePref('hideSaveButton', true);
+    expect(app.window.document.querySelector('#editor').classList.contains('hide-save-button')).toBe(true);
+
+    await app.hooks.savePref('statusDisplay', 'off');
+    expect(root.dataset.statusDisplay).toBe('off');
+  });
+});
+
 describe('markdown preview policy', () => {
   test('escapes raw HTML, rejects unsafe resource URLs, and lazy-loads images', async () => {
     const app = track(await createApp());

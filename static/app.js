@@ -19,7 +19,7 @@ let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let editorSessionGeneration = 0;
-const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
+const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
 const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
 const FONT_CACHE_NAME = 'mdnotes-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
@@ -2235,6 +2235,8 @@ function applyEditorPrefs() {
   $('.meta-pane').classList.toggle('collapsed', collapsed);
   $('.meta-toggle').setAttribute('aria-expanded', String(!collapsed));
   $('#editor').classList.toggle('header-hidden', prefs.hideHeaderOnFullscreen && panelState !== 'both');
+  document.documentElement.dataset.statusDisplay = prefs.statusDisplay;
+  $('#editor').classList.toggle('hide-save-button', Boolean(prefs.hideSaveButton));
   if (prefs.hideToolbar) {
     $('.fmt-bar').classList.add('hidden');
   } else {
@@ -3100,6 +3102,7 @@ function legacyThemeID() {
 function normalizePrefs(value = {}, fallback = {}) {
   const merged = {...DEFAULT_PREFS, ...fallback, ...value};
   merged.revision = Number.isSafeInteger(Number(merged.revision)) && Number(merged.revision) > 0 ? Number(merged.revision) : 1;
+  if (!['normal', 'compact', 'off'].includes(merged.statusDisplay)) merged.statusDisplay = DEFAULT_PREFS.statusDisplay;
   if (!value.theme && !fallback.theme) merged.theme = legacyThemeID();
   if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
   if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
@@ -3235,8 +3238,10 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-hidepreview').checked = prefs.hidePreview;
   $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
   $('#pref-hidetoolbar').checked = prefs.hideToolbar;
+  $('#pref-hidesave').checked = prefs.hideSaveButton;
   $('#pref-collapse').checked = prefs.collapseDetails;
   $('#pref-hidecursor').checked = prefs.hideCursorHighlight;
+  $('#pref-status').value = prefs.statusDisplay;
   $('#pref-theme').value = prefs.theme;
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
   $('#pref-font').value = prefs.fontFamily;
@@ -3286,6 +3291,9 @@ $('#pref-hideheader').addEventListener('change', function () {
 $('#pref-hidetoolbar').addEventListener('change', function () {
   savePref('hideToolbar', this.checked);
 });
+$('#pref-hidesave').addEventListener('change', function () {
+  savePref('hideSaveButton', this.checked);
+});
 $('#pref-collapse').addEventListener('change', function () {
   savePref('collapseDetails', this.checked);
 });
@@ -3297,6 +3305,7 @@ $('#pref-accent').addEventListener('change', function () { void savePref('accent
 $('#pref-font').addEventListener('change', function () { void savePref('fontFamily', this.value); });
 $('#pref-editor-font').addEventListener('change', function () { void savePref('editorFontFamily', this.value); });
 $('#pref-preview-font').addEventListener('change', function () { void savePref('previewFontFamily', this.value); });
+$('#pref-status').addEventListener('change', function () { void savePref('statusDisplay', this.value); });
 
 $$('.prefs-nav').forEach(button => button.addEventListener('click', () => {
   const section = button.dataset.prefSection;

@@ -67,8 +67,10 @@ type prefs struct {
 	HidePreview            bool                       `json:"hidePreview"`
 	HideHeaderOnFullscreen bool                       `json:"hideHeaderOnFullscreen"`
 	HideToolbar            bool                       `json:"hideToolbar"`
+	HideSaveButton         bool                       `json:"hideSaveButton"`
 	CollapseDetails        bool                       `json:"collapseDetails"`
 	HideCursorHighlight    bool                       `json:"hideCursorHighlight"`
+	StatusDisplay          string                     `json:"statusDisplay,omitempty"`
 	Theme                  string                     `json:"theme,omitempty"`
 	AccentColor            string                     `json:"accentColor,omitempty"`
 	FontFamily             string                     `json:"fontFamily,omitempty"`
