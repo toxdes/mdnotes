@@ -61,7 +61,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !syncIdentifierPattern.MatchString(request.DeviceID) || len(request.Operations) > 100 {
-		http.Error(w, "invalid sync request", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid_sync_request", "invalid sync request")
 		return
 	}
 	for index, operation := range request.Operations {
@@ -81,7 +81,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 	a.noteMu.Lock()
 	defer a.noteMu.Unlock()
 	if err := a.recoverFileOperations(); err != nil {
-		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "recover_file_operations_failed", "could not recover pending file operations")
 		return
 	}
 	for _, operation := range request.Operations {
@@ -89,7 +89,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if blocked, err := a.fileOperationBlocked(operation.NoteID); err != nil {
-			http.Error(w, "could not inspect pending file operations", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "inspect_file_operations_failed", "could not inspect pending file operations")
 			return
 		} else if blocked {
 			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
@@ -103,7 +103,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 
 	lastSequence, err := syncDeviceSequence(a.db, request.DeviceID)
 	if err != nil {
-		http.Error(w, "could not read sync state", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "read_sync_state_failed", "could not read sync state")
 		return
 	}
 	response := syncPushResponse{Acknowledged: make([]syncOperationResult, 0, len(request.Operations)), ExpectedSequence: lastSequence + 1}
@@ -115,7 +115,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if err != nil {
-				http.Error(w, "invalid replayed operation", http.StatusConflict)
+				writeAPIError(w, http.StatusConflict, "invalid_replayed_operation", "invalid replayed operation")
 				return
 			}
 			response.Acknowledged = append(response.Acknowledged, stored)
@@ -127,7 +127,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := a.applySyncOperation(request.DeviceID, operation)
 		if err != nil {
-			http.Error(w, "could not apply sync operation", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "apply_sync_operation_failed", "could not apply sync operation")
 			return
 		}
 		if result.Status == "applied" {

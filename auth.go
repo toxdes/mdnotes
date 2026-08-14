@@ -88,7 +88,7 @@ func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie("session")
 		if err != nil || !a.sessions.valid(c.Value) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeAPIError(w, http.StatusUnauthorized, "authentication_required", "unauthorized")
 			return
 		}
 		next(w, r)
@@ -120,7 +120,7 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := a.rl.realIP(r)
 	retryAfter, err := a.rl.loginRetryAfter(ip)
 	if err != nil {
-		http.Error(w, "could not check login rate limit", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "login_rate_limit_failed", "could not check login rate limit")
 		return
 	}
 	if retryAfter > 0 {
@@ -141,13 +141,13 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.password)) != 1 {
 		a.rl.recordLoginAttempt(ip, false)
-		http.Error(w, "wrong password", http.StatusUnauthorized)
+		writeAPIError(w, http.StatusUnauthorized, "invalid_credentials", "wrong password")
 		return
 	}
 	a.rl.recordLoginAttempt(ip, true)
 	token, err := a.sessions.create()
 	if err != nil {
-		http.Error(w, "could not create session", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "create_session_failed", "could not create session")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{

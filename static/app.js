@@ -746,7 +746,7 @@ async function fetchWithTimeout(path, options = {}, {group = null, timeoutMs = h
 }
 
 function isAbortError(error) {
-  return error?.name === 'AbortError';
+  return error?.name === 'AbortError' || error?.kind === 'aborted';
 }
 
 function cancelActiveSyncRequests() {
@@ -771,12 +771,39 @@ function setIdleSyncStatus() {
 }
 
 class APIError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, {status = 0, code = '', kind = 'http', retryable = null, cause = null} = {}) {
     super(message);
     this.name = 'APIError';
+    this.kind = kind;
+    this.code = code;
     this.responseStatus = status;
-    this.retryable = !status || status === 408 || status === 429 || status >= 500;
+    this.retryable = retryable ?? (!status || status === 408 || status === 429 || status >= 500);
+    if (cause) this.cause = cause;
   }
+}
+
+async function responseBody(response) {
+  const text = await response.text();
+  if (typeof text !== 'string') return text;
+  if (!text) return null;
+  try { return JSON.parse(text); } catch (_) { return text; }
+}
+
+function apiErrorFromPayload(payload, status, statusText = '') {
+  const message = typeof payload === 'string' ? payload : payload?.error || statusText || 'request failed';
+  const code = typeof payload === 'object' && payload ? String(payload.code || '') : '';
+  return new APIError(message, {status, code});
+}
+
+function apiErrorFromTransport(error) {
+  if (error instanceof APIError) return error;
+  const timedOut = error?.name === 'TimeoutError';
+  const aborted = error?.name === 'AbortError';
+  return new APIError(timedOut ? 'request timed out' : aborted ? 'request aborted' : 'network request failed', {
+    kind: timedOut ? 'timeout' : aborted ? 'aborted' : 'network',
+    retryable: !aborted,
+    cause: error,
+  });
 }
 
 async function api(path, opts) {
@@ -793,24 +820,20 @@ async function api(path, opts) {
       headers: requestOpts?.body ? {'Content-Type':'application/json'} : {},
       ...requestOpts,
     }, {group: syncRequest ? activeSyncControllers : null});
-    if (res.status === 401) {
-      setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
-      requireAuthentication();
-      if (throwOnError || syncRequest) throw new APIError('authentication required', 401);
-      return null;
-    }
     if (res.status === 204) return true;
+    const body = await responseBody(res);
     if (!res.ok) {
-      const text = await res.text();
-      throw new APIError(text || res.statusText, res.status);
+      const error = apiErrorFromPayload(body, res.status, res.statusText);
+      if (res.status === 401) requireAuthentication();
+      throw error;
     }
-    return await res.json();
+    if (body === null) throw new APIError('invalid server response', {kind: 'protocol', retryable: false});
+    return body;
   } catch(e) {
-    const error = e instanceof APIError ? e : Object.assign(e, {retryable: true});
+    const error = apiErrorFromTransport(e);
     setSyncDiagnostic(`${method} ${path} ${error?.responseStatus ? `returned HTTP ${error.responseStatus}` : 'failed'}: ${error?.message || 'unknown error'}`, error?.responseStatus);
     console.error(error);
-    if (throwOnError || syncRequest) throw error;
-    return null;
+    throw error;
   } finally {
     if (syncRequest) endSyncNetworkRequest();
   }
@@ -833,8 +856,9 @@ async function syncFetch(path, options) {
     if (!response.ok) setSyncDiagnostic(`${method} ${path} returned HTTP ${response.status}: ${typeof data === 'string' ? data : response.statusText}`, response.status);
     return {response, data};
   } catch (error) {
-    setSyncDiagnostic(`${method} ${path} failed: ${error?.message || 'unknown error'}`);
-    throw error;
+    const typed = apiErrorFromTransport(error);
+    setSyncDiagnostic(`${method} ${path} failed: ${typed.message}`);
+    throw typed;
   } finally {
     endSyncNetworkRequest();
   }
@@ -1689,9 +1713,7 @@ async function flushPendingChanges() {
     pushed = true;
     if (result.response.status === 401) {
       requireAuthentication();
-      const error = new Error('sign in required to sync');
-      error.responseStatus = 401;
-      throw error;
+      throw apiErrorFromPayload(result.data, 401, 'Unauthorized');
     }
     if (result.response.status === 409) {
       const expected = Number(result.data?.expected_sequence);
@@ -1699,7 +1721,11 @@ async function flushPendingChanges() {
         showToast('Recovered a local sync gap. Retrying your changes.', 'warning');
         continue;
       }
-      throw new Error(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict');
+      throw new APIError(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict', {
+        status: 409,
+        code: 'sync_sequence_conflict',
+        retryable: false,
+      });
     }
     if (!result.response.ok) {
       const permanent = result.response.status === 400 || result.response.status === 413 || result.data?.permanent === true;
@@ -1713,9 +1739,7 @@ async function flushPendingChanges() {
           continue;
         }
       }
-      const error = new Error(typeof result.data === 'string' ? result.data : 'sync failed');
-      error.responseStatus = result.response.status;
-      throw error;
+      throw apiErrorFromPayload(result.data, result.response.status, result.response.statusText);
     }
     for (const operation of operations) {
       const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
@@ -1731,7 +1755,6 @@ function preferenceValuesEqual(left, right) {
 
 async function resolvePreferenceConflict(operation) {
   const remote = await api('/api/prefs', {syncRequest: true});
-  if (!remote) throw new Error('could not load remote preferences');
   const payload = operation.prefs || {};
   const patch = payload._sync_patch || {};
   const base = payload._sync_base || {};
@@ -2053,23 +2076,27 @@ $('#login-form').addEventListener('submit', async e => {
   authenticationRequired = false;
   clearSyncDiagnostic();
   const pw = e.target.password.value;
-  const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
-  if (res) {
+  try {
+    const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
     $('#login-error').textContent = '';
     cacheAppVersion(res);
     await loadPrefs();
     await restoreRoute();
     connectServerEvents();
     scheduleSync({reconcile: true});
-  } else {
-    $('#login-error').textContent = 'Wrong password';
+  } catch (error) {
+    $('#login-error').textContent = error.code === 'invalid_credentials' ? 'Wrong password' : error.code === 'login_rate_limited' ? 'Too many attempts. Please try again later.' : 'Could not sign in. Please try again.';
   }
 });
 
 $('#logout-btn').addEventListener('click', async () => {
   cancelActiveSyncRequests();
   disconnectServerEvents();
-  await api('/api/logout', {method:'POST'});
+  try {
+    await api('/api/logout', {method:'POST'});
+  } catch (error) {
+    console.warn('server logout failed; clearing local session data', error);
+  }
   try {
     await clearOfflineData();
   } catch (error) {
@@ -3276,7 +3303,12 @@ function hasSelectedWebFont() {
 }
 
 async function loadPrefs() {
-  const p = await api('/api/prefs');
+  let p = null;
+  try {
+    p = await api('/api/prefs');
+  } catch (error) {
+    console.warn('preferences unavailable; using cached preferences', error);
+  }
   if (p && !await hasPendingOperation('__prefs__')) {
     let cached = {};
     try { cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}'); } catch (_) {}
@@ -3319,6 +3351,7 @@ async function init() {
     }
   } catch (error) {
     console.error('initialization failed', error);
+    if (error?.responseStatus === 401) return;
     if (localStartupReady) {
       markServerOffline();
     } else {

@@ -46,6 +46,24 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 	}
 }
 
+func TestAPIValidationErrorsUseStableJSONCodes(t *testing.T) {
+	a := &app{}
+	request := httptest.NewRequest(http.MethodGet, "/api/search?q="+strings.Repeat("x", 257), nil)
+	result := httptest.NewRecorder()
+	a.handleSearchNotes(result, request)
+
+	if result.Code != http.StatusBadRequest || !strings.Contains(result.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("validation response = status %d, content type %q", result.Code, result.Header().Get("Content-Type"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(result.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode validation response: %v", err)
+	}
+	if body["code"] != "search_query_too_long" || body["error"] != "search query is too long" {
+		t.Fatalf("validation body = %#v", body)
+	}
+}
+
 func TestGzipMiddlewareCompressesErrorResponsesCorrectly(t *testing.T) {
 	handler := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)

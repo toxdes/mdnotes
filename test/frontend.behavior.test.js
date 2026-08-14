@@ -75,6 +75,31 @@ describe('markdown preview policy', () => {
   });
 });
 
+describe('typed API outcomes', () => {
+  test('preserves server status, stable code, and retry policy', async () => {
+    const app = track(await createApp({fetchImpl: async () => response(409, JSON.stringify({error: 'note changed', code: 'note_revision_conflict'}))}));
+    app.window.console.error = () => {};
+
+    await expect(app.hooks.api('/api/notes/note-a')).rejects.toMatchObject({
+      kind: 'http',
+      responseStatus: 409,
+      code: 'note_revision_conflict',
+      retryable: false,
+    });
+  });
+
+  test('classifies transport failures separately from HTTP errors', async () => {
+    const app = track(await createApp({fetchImpl: async () => { throw new TypeError('network unavailable'); }}));
+    app.window.console.error = () => {};
+
+    await expect(app.hooks.api('/api/check')).rejects.toMatchObject({
+      kind: 'network',
+      responseStatus: 0,
+      retryable: true,
+    });
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));
@@ -297,10 +322,13 @@ describe('conflict deletion recovery', () => {
 
     await app.hooks.flushPendingChanges();
     app.window.document.querySelector('#conflict-copy').click();
-    await new Promise(resolve => setTimeout(resolve, 0));
+    let pending = [];
+    for (let attempt = 0; attempt < 20 && !pending.length; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      pending = await app.hooks.pendingOperations();
+    }
     app.hooks.cancelScheduledSync();
 
-    const pending = await app.hooks.pendingOperations();
     expect(pending).toHaveLength(1);
     expect(pending[0].note_id).not.toBe('note-a');
     expect(pending[0].note).toMatchObject({title: 'Local edit (conflict copy)', content: 'Keep this'});
