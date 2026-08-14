@@ -256,6 +256,38 @@ func TestLoginRateLimitDoesNotBlockAuthenticatedRoutes(t *testing.T) {
 	}
 }
 
+func TestSuccessfulLoginReturnsAuthoritativeAppRevision(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	a := &app{db: db, password: "correct", sessions: newSessionStore(db), rl: rl}
+	request := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"correct"}`))
+	request.RemoteAddr = "203.0.113.11:1234"
+	response := httptest.NewRecorder()
+
+	a.handleLogin(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("login status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if body["ok"] != true || body["version"] != version || body["revision"] != appRevision {
+		t.Fatalf("login app identity = %#v; want version %q revision %q", body, version, appRevision)
+	}
+}
+
 func (r *sseTestRecorder) Flush() {
 	r.flushes++
 }

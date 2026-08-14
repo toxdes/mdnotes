@@ -3443,7 +3443,6 @@ function registerServiceWorker(revision = appRevisionAtLoad) {
     console.warn('service worker registration failed', error);
   });
 }
-registerServiceWorker();
 
 window.addEventListener('popstate', () => { void restoreRoute(); });
 

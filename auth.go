@@ -159,5 +159,5 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionLifetime.Seconds()),
 	})
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "version": version, "revision": appRevision})
 }
