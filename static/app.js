@@ -28,6 +28,7 @@ const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Li
 const SYSTEM_FONT_OPTIONS = [{value:'system-sans',label:'System (Sans)'}, {value:'system-serif',label:'System (Serif)'}, {value:'system-monospace',label:'System (Monospace)'}];
 let prefs = {...DEFAULT_PREFS};
 let fontAvailability = 'checking';
+let fontAvailabilityPromise = null;
 let fontLoadGeneration = 0;
 let fontApplyQueue = Promise.resolve();
 let renderedPreviewSource = null;
@@ -3023,7 +3024,8 @@ async function applyFontsNow(clearCache = false) {
         link.addEventListener('error', reject, {once:true});
         setTimeout(() => reject(new Error('font load timed out')), 5000);
       });
-      await document.fonts.load(`1rem "${fontFamily}"`);
+      const loadedFaces = await document.fonts.load(`1rem "${fontFamily}"`);
+      if (!loadedFaces || loadedFaces.length === 0) throw new Error('font face unavailable');
       loaded.set(fontFamily, true);
     } catch (error) {
       link.remove();
@@ -3094,6 +3096,7 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-editor-font').value = prefs.editorFontFamily;
   $('#pref-preview-font').value = prefs.previewFontFamily;
   openModal($('#prefs-modal'));
+  void checkFontAvailability(fontAvailability === 'unavailable');
 });
 
 $('#prefs-close').addEventListener('click', () => {
@@ -3174,21 +3177,42 @@ $$('.prefs-nav').forEach(button => button.addEventListener('keydown', event => {
   tabs[next].click();
 }));
 
-async function checkFontAvailability() {
-  const probe = document.createElement('link');
-  probe.rel = 'stylesheet';
-  probe.href = fontCSSURL('Inter');
-  const loaded = await new Promise(resolve => {
-    const timeout = setTimeout(() => resolve(false), 5000);
-    probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
-    probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
-    document.head.append(probe);
-  });
-  probe.remove();
-  fontAvailability = loaded ? 'available' : 'unavailable';
-  $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
+async function checkFontAvailability(force = false) {
+  if (!force && (fontAvailability === 'available' || fontAvailability === 'unavailable')) return fontAvailability;
+  if (fontAvailabilityPromise) return fontAvailabilityPromise;
+  fontAvailability = 'checking';
+  $('#font-availability').textContent = 'Checking Google Fonts...';
   renderFontOptions();
-  if (fontAvailability === 'available') void applyFonts();
+
+  fontAvailabilityPromise = (async () => {
+    const probe = document.createElement('link');
+    probe.rel = 'stylesheet';
+    probe.href = fontCSSURL('Inter');
+    const stylesheetLoaded = await new Promise(resolve => {
+      const timeout = setTimeout(() => resolve(false), 5000);
+      probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
+      probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
+      document.head.append(probe);
+    });
+    probe.remove();
+    let faceLoaded = false;
+    if (stylesheetLoaded) {
+      try {
+        const loadedFaces = await document.fonts.load('1rem "Inter"');
+        faceLoaded = Boolean(loadedFaces && loadedFaces.length);
+      } catch (_) {}
+    }
+    fontAvailability = stylesheetLoaded && faceLoaded ? 'available' : 'unavailable';
+    $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
+    renderFontOptions();
+    if (fontAvailability === 'available') void applyFonts();
+    return fontAvailability;
+  })().finally(() => { fontAvailabilityPromise = null; });
+  return fontAvailabilityPromise;
+}
+
+function hasSelectedWebFont() {
+  return FONT_SLOTS.some(slot => prefs[slot.preference] && !isSystemFont(prefs[slot.preference]));
 }
 
 async function loadPrefs() {
@@ -3199,7 +3223,7 @@ async function loadPrefs() {
     prefs = normalizePrefs(p, cached);
     localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
     applyPrefs();
-    void checkFontAvailability();
+    if (hasSelectedWebFont()) void checkFontAvailability();
     return;
   }
   try {
@@ -3207,7 +3231,7 @@ async function loadPrefs() {
     if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
   applyPrefs();
-  void checkFontAvailability();
+  if (hasSelectedWebFont()) void checkFontAvailability();
 }
 
 // --- Init ---
@@ -3272,6 +3296,10 @@ window.addEventListener('popstate', () => { void restoreRoute(); });
 
 window.addEventListener('online', async () => {
   connectServerEvents();
+  if (hasSelectedWebFont()) {
+    fontAvailability = 'checking';
+    void checkFontAvailability();
+  }
   scheduleSync({reconcile: true});
 });
 

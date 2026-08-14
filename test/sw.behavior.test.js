@@ -130,3 +130,22 @@ test('navigation is served from the active shell cache without waiting for netwo
   expect(await response.text()).toBe('cached shell');
   expect(fetchImpl).not.toHaveBeenCalled();
 });
+
+test('caches Google Fonts CSS and font binaries for offline reloads', async () => {
+  const caches = createCacheStorage();
+  const fetchImpl = vi.fn(async request => {
+    const url = typeof request === 'string' ? request : request.url;
+    if (url.includes('fonts.googleapis.com')) return new Response('font css');
+    if (url.includes('fonts.gstatic.com')) return new Response('font binary');
+    throw new Error(`unexpected request: ${url}`);
+  });
+  const worker = loadWorker({caches, fetchImpl});
+  const cssRequest = {method: 'GET', url: 'https://fonts.googleapis.com/css2?family=Inter'};
+  const fontRequest = {method: 'GET', url: 'https://fonts.gstatic.com/s/inter/test.woff2'};
+
+  expect(await (await worker.fetch(cssRequest)).text()).toBe('font css');
+  expect(await (await worker.fetch(fontRequest)).text()).toBe('font binary');
+  expect(await (await worker.fetch(cssRequest)).text()).toBe('font css');
+  expect(await (await worker.fetch(fontRequest)).text()).toBe('font binary');
+  expect(fetchImpl).toHaveBeenCalledTimes(2);
+});

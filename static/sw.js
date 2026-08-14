@@ -10,7 +10,7 @@ const ASSETS = [
 ];
 const SHELL_ASSETS = new Set(ASSETS);
 const FONT_CACHE = 'mdnotes-fonts';
-const FONT_ORIGINS = new Set(['https://fonts.googleapis.com']);
+const FONT_ORIGINS = new Set(['https://fonts.googleapis.com', 'https://fonts.gstatic.com']);
 
 function isShellCache(name) {
   return name === LEGACY_CACHE || name.startsWith(CACHE_PREFIX);
@@ -65,7 +65,9 @@ self.addEventListener('fetch', e => {
       const cached = await cache.match(request);
       if (cached) return cached;
       const response = await fetch(request);
-      if (response.ok) await cache.put(request, response.clone());
+      // gstatic can be returned as an opaque response in some browser modes.
+      // It is still a valid cache entry for the browser's font loader.
+      if (response.ok || response.type === 'opaque') await cache.put(request, response.clone());
       return response;
     }).catch(async () => (await caches.match(request)) || new Response('', {status: 503, statusText: 'Offline'})));
     return;

@@ -23,6 +23,7 @@ globalThis.__mdnotesTestHooks = {
   registerServiceWorker,
   acknowledgeCompactedOperation,
   savePref,
+  checkFontAvailability,
   applyRemoteDeletion,
   applyRemoteChangePage,
   getLocalNote,

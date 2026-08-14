@@ -22,6 +22,31 @@ function track(app) {
   return app;
 }
 
+describe('font availability', () => {
+  test('requires both the stylesheet and a loaded font face', async () => {
+    const app = track(await createApp());
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    const fontLoads = [];
+    app.window.document.fonts.load = async descriptor => {
+      fontLoads.push(descriptor);
+      return [{}];
+    };
+    head.append = (...nodes) => {
+      append(...nodes);
+      nodes.filter(node => node.rel === 'stylesheet').forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      });
+    };
+
+    await expect(app.hooks.checkFontAvailability()).resolves.toBe('available');
+
+    expect(fontLoads).toContain('1rem "Inter"');
+    expect(app.window.document.querySelector('#font-availability').textContent).toBe('Google Fonts available');
+    expect(app.window.document.querySelector('#pref-font option[value="Inter"]').disabled).toBe(false);
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));
