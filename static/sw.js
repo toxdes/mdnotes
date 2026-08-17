@@ -73,15 +73,32 @@ self.addEventListener('fetch', e => {
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
   if (FONT_ORIGINS.has(url.origin)) {
-    e.respondWith(caches.open(FONT_CACHE).then(async cache => {
-      const cached = await cache.match(request);
-      if (cached) return cached;
-      const response = await fetch(request);
-      // gstatic can be returned as an opaque response in some browser modes.
-      // It is still a valid cache entry for the browser's font loader.
-      if (response.ok || response.type === 'opaque') await cache.put(request, response.clone());
-      return response;
-    }).catch(async () => (await caches.match(request)) || new Response('', {status: 503, statusText: 'Offline'})));
+    e.respondWith((async () => {
+      let cache;
+      try {
+        cache = await caches.open(FONT_CACHE);
+        const cached = await cache.match(request);
+        if (cached) return cached;
+      } catch (_) {
+        // Cache storage is an optimization; it must not block the network.
+        cache = undefined;
+      }
+      try {
+        const response = await fetch(request);
+        // gstatic can be returned as an opaque response in some browser modes.
+        // It is still a valid cache entry for the browser's font loader.
+        if (cache && (response.ok || response.type === 'opaque')) {
+          await cache.put(request, response.clone()).catch(() => {});
+        }
+        return response;
+      } catch (_) {
+        try {
+          const cached = await caches.match(request);
+          if (cached) return cached;
+        } catch (_) {}
+        return new Response('', {status: 503, statusText: 'Offline'});
+      }
+    })());
     return;
   }
   if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;

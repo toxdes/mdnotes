@@ -151,3 +151,29 @@ test('caches Google Fonts CSS and font binaries for offline reloads', async () =
   expect(await (await worker.fetch(fontRequest)).text()).toBe('font binary');
   expect(fetchImpl).toHaveBeenCalledTimes(2);
 });
+
+test('returns a fetched font when browser cache storage rejects the cache write', async () => {
+  const caches = createCacheStorage();
+  const fonts = await caches.open('mdnotes-fonts');
+  fonts.put = vi.fn(async () => { throw new Error('cross-origin cache write rejected'); });
+  const fetchImpl = vi.fn(async () => new Response('font binary'));
+  const worker = loadWorker({caches, fetchImpl});
+  const fontRequest = {method: 'GET', url: 'https://fonts.gstatic.com/s/inter/test.woff2'};
+
+  const response = await worker.fetch(fontRequest);
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe('font binary');
+});
+
+test('fetches a font when browser cache lookup rejects', async () => {
+  const caches = createCacheStorage();
+  const fonts = await caches.open('mdnotes-fonts');
+  fonts.match = vi.fn(async () => { throw new Error('cross-origin cache lookup rejected'); });
+  const fetchImpl = vi.fn(async () => new Response('font binary'));
+  const worker = loadWorker({caches, fetchImpl});
+  const fontRequest = {method: 'GET', url: 'https://fonts.gstatic.com/s/inter/test.woff2'};
+
+  const response = await worker.fetch(fontRequest);
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe('font binary');
+});

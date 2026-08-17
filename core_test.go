@@ -40,7 +40,7 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	csp := result.Header().Get("Content-Security-Policy")
-	for _, directive := range []string{"script-src 'self'", "style-src 'self'", "connect-src 'self'", "worker-src 'self'", "object-src 'none'"} {
+	for _, directive := range []string{"script-src 'self'", "style-src 'self'", "connect-src 'self'", "connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com", "worker-src 'self'", "object-src 'none'"} {
 		if !strings.Contains(csp, directive) {
 			t.Fatalf("CSP %q is missing %q", csp, directive)
 		}
