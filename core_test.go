@@ -945,6 +945,10 @@ func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) 
 	if err := upsertNote(db, "pin-note", "Pinned", "pin-note.md", "work"); err != nil {
 		t.Fatalf("create note: %v", err)
 	}
+	before, err := getNote(db, "pin-note")
+	if err != nil {
+		t.Fatalf("read original note: %v", err)
+	}
 	a := &app{db: db, notesDir: t.TempDir()}
 	baseRevision := int64(1)
 	body, err := json.Marshal(syncPushRequest{DeviceID: "device_pin", Operations: []syncOperationRequest{{
@@ -972,7 +976,7 @@ func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) 
 	if !note.Pinned || note.PinOrder != response.Acknowledged[0].PinOrder || note.Revision != 2 {
 		t.Fatalf("pinned note = %#v", note)
 	}
-	if note.Title != "Pinned" || note.Tags != "work" {
+	if note.Title != "Pinned" || note.Tags != "work" || note.UpdatedAt != before.UpdatedAt {
 		t.Fatalf("pin changed note metadata unexpectedly = %#v", note)
 	}
 }

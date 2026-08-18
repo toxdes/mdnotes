@@ -353,7 +353,7 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 				return syncOperationResult{}, err
 			}
 		}
-		if _, err := tx.Exec("UPDATE notes SET pinned = ?, pin_order = ?, revision = revision + 1, updated_at = ? WHERE id = ?", operation.Pinned, result.PinOrder, now, operation.NoteID); err != nil {
+		if _, err := tx.Exec("UPDATE notes SET pinned = ?, pin_order = ?, revision = revision + 1 WHERE id = ?", operation.Pinned, result.PinOrder, operation.NoteID); err != nil {
 			return syncOperationResult{}, err
 		}
 		if _, err := tx.Exec("INSERT INTO sync_changes (note_id, revision, deleted, changed_at) VALUES (?, ?, 0, ?)", operation.NoteID, currentRevision+1, now); err != nil {

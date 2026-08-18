@@ -839,6 +839,12 @@ describe('note pinning', () => {
     await expect(app.hooks.pendingOperations()).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({type: 'note.pin', note_id: 'recent-work', pinned: true, base_revision: 2}),
     ]));
+
+    await app.hooks.toggleNotePin('recent-work');
+    const pinOperations = (await app.hooks.pendingOperations()).filter(operation => operation.note_id === 'recent-work' && operation.type === 'note.pin');
+    expect(pinOperations).toHaveLength(1);
+    expect(pinOperations[0].pinned).toBe(false);
+    expect(await app.hooks.getLocalNote('recent-work')).toMatchObject({content: 'recent', pinned: false, pin_order: 0});
   });
 });
 
