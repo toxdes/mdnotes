@@ -1759,8 +1759,11 @@ func TestMetadataSearchTracksNoteUpdatesAndDeletes(t *testing.T) {
 	if err := upsertNote(db, "beta", "Shopping list", "beta.md", "home"); err != nil {
 		t.Fatalf("insert beta: %v", err)
 	}
+	if _, err := db.Exec("UPDATE notes SET pinned = 1, pin_order = 7 WHERE id = ?", "alpha"); err != nil {
+		t.Fatalf("pin alpha: %v", err)
+	}
 	results, err := searchNotes(db, "auro", 50)
-	if err != nil || len(results) != 1 || results[0].ID != "alpha" {
+	if err != nil || len(results) != 1 || results[0].ID != "alpha" || !results[0].Pinned || results[0].PinOrder != 7 {
 		t.Fatalf("title search = %#v, %v", results, err)
 	}
 	results, err = searchNotes(db, "urgent", 50)

@@ -647,7 +647,7 @@ func searchNotes(db *sql.DB, query string, limit int) ([]note, error) {
 		return []note{}, nil
 	}
 	rows, err := db.Query(`
-		SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision
+		SELECT n.id, n.title, n.filename, n.tags, n.pinned, n.pin_order, n.created_at, n.updated_at, n.revision
 		FROM note_metadata_fts
 		JOIN notes n ON n.id = note_metadata_fts.note_id
 		WHERE note_metadata_fts MATCH ?
@@ -660,7 +660,7 @@ func searchNotes(db *sql.DB, query string, limit int) ([]note, error) {
 	var notes []note
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.Pinned, &n.PinOrder, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
