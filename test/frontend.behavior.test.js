@@ -899,6 +899,40 @@ describe('note pinning', () => {
     expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pinned: true, pin_order: 11, revision: 2});
   });
 
+  test('does not let an older pin acknowledgement undo a newer toggle', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Note', content: 'body', revision: 1, pinned: true, pin_order: 10, pending: true, base_revision: 1});
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 1, pinned: true, pin_order: 10});
+    const firstPin = (await app.hooks.pendingOperations())[0];
+    await app.hooks.claimQueueOperation(firstPin.id);
+    await app.hooks.toggleNotePin('note-a');
+
+    await app.hooks.applySyncAcknowledgement(firstPin, {status: 'applied', revision: 2, pin_order: 11});
+
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pinned: false, pin_order: 0, revision: 2, pending: true, base_revision: 2});
+    await expect(app.hooks.pendingOperations()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({type: 'note.pin', pinned: false, base_revision: 2}),
+    ]));
+  });
+
+  test('does not retry a stale pin over a newer toggle after conflict', async () => {
+    const remote = {id: 'note-a', title: 'Remote', tags: '', content: 'body', revision: 3, pinned: false, pin_order: 0};
+    const app = track(await createApp({fetchImpl: async path => String(path) === '/api/notes/note-a' ? response(200, JSON.stringify(remote)) : response(200, '{}')}));
+    await app.hooks.putLocalNote({...remote, revision: 2, pinned: true, pin_order: 10, pending: true, base_revision: 2});
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true, pin_order: 10});
+    const firstPin = (await app.hooks.pendingOperations())[0];
+    await app.hooks.claimQueueOperation(firstPin.id);
+    await app.hooks.toggleNotePin('note-a');
+
+    await app.hooks.applySyncAcknowledgement(firstPin, {status: 'conflict', current_revision: 3});
+
+    const remaining = await app.hooks.pendingOperations();
+    expect(remaining.filter(operation => operation.type === 'note.pin')).toEqual([
+      expect.objectContaining({pinned: false, base_revision: 3}),
+    ]);
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pinned: false, pin_order: 0, revision: 3, pending: true});
+  });
+
   test('retries a stale pin against the latest remote revision', async () => {
     let pushCount = 0;
     let lastOperationID = '';

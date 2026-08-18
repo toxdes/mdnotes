@@ -473,6 +473,12 @@ function pendingOperationsForNote(noteID) {
   return withOfflineStore(['queue'], 'readonly', stores => requestValue(stores.queue.index('note_id').getAll(noteID)));
 }
 
+function latestLaterOperation(operations, current, type) {
+  return operations
+    .filter(operation => operation.client_sequence > current.client_sequence && operation.type === type)
+    .sort((left, right) => right.client_sequence - left.client_sequence)[0];
+}
+
 async function claimQueueOperation(id) {
   return withOfflineStore(['queue'], 'readwrite', async stores => {
     const operation = await requestValue(stores.queue.get(id));
@@ -1753,21 +1759,26 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
         return;
       }
       const queued = await pendingOperationsForNote(operation.note_id);
-      const hasLaterSave = queued.some(item => item.client_sequence > operation.client_sequence && item.type === 'note.save');
+      const hasLaterSave = Boolean(latestLaterOperation(queued, operation, 'note.save'));
+      const laterPin = latestLaterOperation(queued, operation, 'note.pin');
+      const desiredPinned = laterPin ? Boolean(laterPin.pinned) : Boolean(operation.pinned);
+      await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
       await removePendingOperationIfIdentityMatches(operation.id, operation);
       const local = await getLocalNote(operation.note_id);
       const preserveLocalContent = hasLaterSave || (currentNoteId === operation.note_id && isDirty);
       const next = {
         ...remote,
         ...(preserveLocalContent ? local : {}),
-        pinned: Boolean(operation.pinned),
-        pin_order: Boolean(operation.pinned) ? (local?.pin_order || 0) : 0,
+        pinned: desiredPinned,
+        pin_order: desiredPinned ? (local?.pin_order || 0) : 0,
         revision: remote.revision,
         pending: true,
         base_revision: remote.revision,
       };
       await putLocalNote(next);
-      await queueOperation({type: 'note.pin', note_id: operation.note_id, base_revision: remote.revision, pinned: Boolean(operation.pinned)});
+      if (!laterPin) {
+        await queueOperation({type: 'note.pin', note_id: operation.note_id, base_revision: remote.revision, pinned: desiredPinned, pin_order: next.pin_order});
+      }
       updateOpenNote(next);
       await refreshDashboard();
       return;
@@ -1805,8 +1816,13 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
   if (operation.type === 'note.pin') {
     const local = await getLocalNote(operation.note_id);
     if (local) {
+      const queued = await pendingOperationsForNote(operation.note_id);
+      const laterPin = latestLaterOperation(queued, operation, 'note.pin');
       const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, local);
-      await putLocalNote({...local, revision: acknowledgement.revision, pinned: Boolean(operation.pinned), pin_order: operation.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null});
+      const pinned = laterPin ? Boolean(local.pinned) : Boolean(operation.pinned);
+      const pinOrder = laterPin ? local.pin_order : (pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0);
+      const remainsPending = hasLater || Boolean(laterPin);
+      await putLocalNote({...local, revision: acknowledgement.revision, pinned, pin_order: pinOrder, pending: remainsPending, base_revision: remainsPending ? acknowledgement.revision : null});
       await refreshDashboard();
     }
   }
