@@ -838,6 +838,25 @@ describe('note pinning', () => {
     expect(await app.hooks.getLocalNote(note.id)).toMatchObject({pinned: true, pending: true});
   });
 
+  test('keeps a newer pin made after an initial save was claimed', async () => {
+    const app = track(await createApp());
+    const note = {id: 'new-note', title: 'New', tags: '', content: 'body', revision: 0, base_revision: 0, pending: true, pinned: false, pin_order: 0};
+    await app.hooks.putLocalNote(note);
+    await app.hooks.queueOperation({type: 'note.save', note_id: note.id, base_revision: 0, note});
+    const save = (await app.hooks.pendingOperations())[0];
+    await app.hooks.claimQueueOperation(save.id);
+    await app.hooks.toggleNotePin(note.id);
+    const pinnedLocally = await app.hooks.getLocalNote(note.id);
+
+    await app.hooks.applySyncAcknowledgement(save, {status: 'applied', revision: 1});
+
+    expect(await app.hooks.getLocalNote(note.id)).toMatchObject({pinned: true, pin_order: pinnedLocally.pin_order, revision: 1, pending: true, base_revision: 1});
+    await expect(app.hooks.pendingOperations()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({type: 'note.pin', pinned: true, base_revision: 1}),
+    ]));
+  });
+
+
   test('filters before sorting and queues an offline pin without changing content', async () => {
     const app = track(await createApp());
     await app.hooks.putLocalNote({id: 'pinned-work', title: 'Pinned work', tags: 'work', content: 'keep', updated_at: '2026-01-01T00:00:00Z', revision: 2, pinned: true, pin_order: 10});

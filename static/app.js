@@ -1803,10 +1803,13 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
   }
   if (operation.type === 'note.save') {
     const acknowledgedNote = operation.note;
+    const queued = await pendingOperationsForNote(operation.note_id);
+    const laterPin = latestLaterOperation(queued, operation, 'note.pin');
     const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
     const local = await getLocalNote(operation.note_id);
     if (local) {
-      await putLocalNote({...local, revision: acknowledgement.revision, pin_order: acknowledgedNote.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+      const pinOrder = laterPin ? local.pin_order : (acknowledgedNote.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0);
+      await putLocalNote({...local, revision: acknowledgement.revision, pin_order: pinOrder, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
     }
     if (currentNoteId === operation.note_id) {
       currentRevision = acknowledgement.revision || 0;
