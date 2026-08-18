@@ -979,6 +979,22 @@ func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) 
 	if note.Title != "Pinned" || note.Tags != "work" || note.UpdatedAt != before.UpdatedAt {
 		t.Fatalf("pin changed note metadata unexpectedly = %#v", note)
 	}
+	unpinRevision := note.Revision
+	unpinBody, err := json.Marshal(syncPushRequest{DeviceID: "device_unpin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "unpin_operation", Type: "note.pin", NoteID: "pin-note", BaseRevision: &unpinRevision, Pinned: false,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal unpin request: %v", err)
+	}
+	unpinRecord := httptest.NewRecorder()
+	a.handleSyncPush(unpinRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(unpinBody))))
+	if unpinRecord.Code != http.StatusOK {
+		t.Fatalf("unpin status = %d: %s", unpinRecord.Code, unpinRecord.Body.String())
+	}
+	note, err = getNote(db, "pin-note")
+	if err != nil || note.Pinned || note.PinOrder != 0 {
+		t.Fatalf("unpinned note = %#v, %v", note, err)
+	}
 }
 
 func TestMigrationsAreRecordedAndIdempotent(t *testing.T) {

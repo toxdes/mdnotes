@@ -846,6 +846,29 @@ describe('note pinning', () => {
     expect(pinOperations[0].pinned).toBe(false);
     expect(await app.hooks.getLocalNote('recent-work')).toMatchObject({content: 'recent', pinned: false, pin_order: 0});
   });
+
+  test('does not let a remote pin update replace a pending local pin', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Local', content: 'keep', revision: 2, pending: true, base_revision: 2, pinned: true, pin_order: 42});
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
+
+    await app.hooks.applyRemoteChangePage(
+      [{note_id: 'note-a', revision: 3, deleted: false}],
+      new Map([['note-a', {id: 'note-a', title: 'Remote', content: 'replace', revision: 3, pinned: false, pin_order: 0}]]),
+      3,
+    );
+
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({content: 'keep', pinned: true, pin_order: 42, pending: true});
+  });
+
+  test('does not accept remote deletion while a pin operation is queued', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Pinned locally', content: 'keep', revision: 2, pinned: true, pin_order: 9});
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
+
+    await expect(app.hooks.applyRemoteDeletion('note-a')).resolves.toBe(false);
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({content: 'keep', pinned: true});
+  });
 });
 
 describe('offline database migrations', () => {
