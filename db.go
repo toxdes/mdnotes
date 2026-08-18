@@ -21,6 +21,8 @@ type note struct {
 	Title     string `json:"title"`
 	Filename  string `json:"filename"`
 	Tags      string `json:"tags"`
+	Pinned    bool   `json:"pinned"`
+	PinOrder  int64  `json:"pin_order,omitempty"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 	Revision  int64  `json:"revision"`
@@ -102,6 +104,7 @@ var migrations = []migration{
 	{version: 14, up: migrateSyncOperationCompactionSchema},
 	{version: 15, up: migratePreferenceRevisionSchema},
 	{version: 16, up: migrateRepairSyncOperationStats},
+	{version: 17, up: migrateNotePinningSchema},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -248,6 +251,14 @@ func migrateInitialSchema(tx *sql.Tx) error {
 		);
 		INSERT OR IGNORE INTO prefs (id, data) VALUES (1, '{"autoSave":true}');
 	`)
+	return err
+}
+
+func migrateNotePinningSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE notes ADD COLUMN pin_order INTEGER NOT NULL DEFAULT 0;
+		CREATE INDEX IF NOT EXISTS idx_notes_pin_order ON notes(pinned, pin_order);`)
 	return err
 }
 
@@ -531,13 +542,13 @@ func listNotes(db *sql.DB, tag string) ([]note, error) {
 	var err error
 	if tag != "" {
 		rows, err = db.Query(`
-			SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision
+			SELECT n.id, n.title, n.filename, n.tags, n.pinned, n.pin_order, n.created_at, n.updated_at, n.revision
 			FROM notes n
 			JOIN note_tags nt ON nt.note_id = n.id
 			WHERE nt.tag = ?
 			ORDER BY n.updated_at DESC`, tag)
 	} else {
-		rows, err = db.Query("SELECT id, title, filename, tags, created_at, updated_at, revision FROM notes ORDER BY updated_at DESC")
+		rows, err = db.Query("SELECT id, title, filename, tags, pinned, pin_order, created_at, updated_at, revision FROM notes ORDER BY updated_at DESC")
 	}
 	if err != nil {
 		return nil, err
@@ -547,7 +558,7 @@ func listNotes(db *sql.DB, tag string) ([]note, error) {
 	notes := make([]note, 0)
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.Pinned, &n.PinOrder, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -585,7 +596,7 @@ func listNotesPage(db *sql.DB, tag, cursor string, limit int) (notesPage, error)
 		}
 	}
 
-	query := "SELECT n.id, n.title, n.filename, n.tags, n.created_at, n.updated_at, n.revision FROM notes n"
+	query := "SELECT n.id, n.title, n.filename, n.tags, n.pinned, n.pin_order, n.created_at, n.updated_at, n.revision FROM notes n"
 	args := make([]any, 0, 4)
 	where := make([]string, 0, 2)
 	if tag != "" {
@@ -612,7 +623,7 @@ func listNotesPage(db *sql.DB, tag, cursor string, limit int) (notesPage, error)
 	page := notesPage{Notes: make([]note, 0, limit)}
 	for rows.Next() {
 		var n note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
+		if err := rows.Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.Pinned, &n.PinOrder, &n.CreatedAt, &n.UpdatedAt, &n.Revision); err != nil {
 			return notesPage{}, err
 		}
 		page.Notes = append(page.Notes, n)
@@ -715,8 +726,8 @@ func metadataSearchQuery(raw string) string {
 func getNote(db *sql.DB, id string) (*note, error) {
 	var n note
 	err := db.QueryRow(
-		"SELECT id, title, filename, tags, created_at, updated_at, revision FROM notes WHERE id = ?", id,
-	).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision)
+		"SELECT id, title, filename, tags, pinned, pin_order, created_at, updated_at, revision FROM notes WHERE id = ?", id,
+	).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.Pinned, &n.PinOrder, &n.CreatedAt, &n.UpdatedAt, &n.Revision)
 	if err != nil {
 		return nil, err
 	}
