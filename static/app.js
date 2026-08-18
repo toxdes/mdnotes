@@ -1112,16 +1112,8 @@ function updateOpenNote(note) {
   $('#note-title').value = savedSnapshot.title;
   $('#note-tags').value = savedSnapshot.tags;
   $('#note-content').value = savedSnapshot.content;
-  updatePinControl(note);
   renderedPreviewSource = null;
   updatePreview();
-}
-
-function updatePinControl(note) {
-  const control = $('#note-pinned');
-  if (!control) return;
-  control.checked = Boolean(note?.pinned);
-  control.setAttribute('aria-label', control.checked ? 'Unpin note' : 'Pin note');
 }
 
 async function loadConflictRemoteNote(noteID) {
@@ -1793,7 +1785,6 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
     if (local) {
       const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, local);
       await putLocalNote({...local, revision: acknowledgement.revision, pinned: Boolean(operation.pinned), pin_order: operation.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null});
-      if (currentNoteId === operation.note_id) updatePinControl({...local, pinned: Boolean(operation.pinned)});
       await refreshDashboard();
     }
   }
@@ -2256,7 +2247,7 @@ function renderDashboard(notes, conflicts) {
         <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
         ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
       </button>
-      <button type="button" class="note-pin" data-id="${esc(n.id)}" aria-pressed="${Boolean(n.pinned)}" aria-label="${n.pinned ? 'Unpin' : 'Pin'} note" title="${n.pinned ? 'Unpin' : 'Pin'} note"><svg class="icon" aria-hidden="true"><use href="#icon-${n.pinned ? 'pinned' : 'pin'}"></use></svg></button>
+      <button type="button" class="note-pin" data-id="${esc(n.id)}" aria-pressed="${Boolean(n.pinned)}" aria-label="${n.pinned ? 'Unpin' : 'Pin'} note" title="${n.pinned ? 'Unpin' : 'Pin'} note"><svg class="icon pin-icon" aria-hidden="true"><use href="#icon-${n.pinned ? 'pinned' : 'pin'}"></use></svg><svg class="icon unpin-icon" aria-hidden="true"><use href="#icon-pinned-off"></use></svg></button>
     </li>
   `).join('');
   list.querySelectorAll('.note-item').forEach(el => {
@@ -2356,7 +2347,6 @@ function showNoteInEditor(data) {
   $('#note-title').value = data.title || '';
   $('#note-tags').value = data.tags || '';
   $('#note-content').value = data.content || '';
-  updatePinControl(data);
   setIdleSyncStatus();
   applyEditorPrefs();
   show(screens.editor);
@@ -2576,7 +2566,6 @@ async function toggleNotePin(noteID) {
   const baseRevision = local.pending ? (local.base_revision ?? local.revision ?? 0) : (local.revision ?? 0);
   const next = {...local, pinned, pin_order: pinned ? await nextLocalPinOrder() : 0, pending: true, base_revision: baseRevision};
   await saveLocalNoteAndQueue(next, {type: 'note.pin', note_id: noteID, base_revision: baseRevision, pinned});
-  if (currentNoteId === noteID) updatePinControl(next);
   await refreshDashboard();
   scheduleSync();
   return true;
@@ -3007,12 +2996,6 @@ function highlightBlock() {
 }
 
 // --- Delete ---
-$('#note-pinned').addEventListener('change', event => {
-  if (!currentNoteId) return;
-  event.target.disabled = true;
-  void toggleNotePin(currentNoteId).finally(() => { event.target.disabled = false; });
-});
-
 $('#delete-btn').addEventListener('click', async () => {
   if (!currentNoteId) return;
   if (!confirm('Delete this note?')) return;
