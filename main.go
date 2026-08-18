@@ -59,6 +59,10 @@ func embeddedAppRevision() string {
 
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-MDNotes-Shell") == "1" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		// Keep dynamic endpoints cheap and do not recompress already-compressed
 		// assets. Range responses must stay uncompressed for correct byte ranges.
 		if r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/api/") {
@@ -103,7 +107,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; img-src 'self' https: data:; connect-src 'self' https://fonts.googleapis.com; worker-src 'self'; manifest-src 'self'; font-src 'self' https://fonts.gstatic.com")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; img-src 'self' https: data:; connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; worker-src 'self'; manifest-src 'self'; font-src 'self' https://fonts.gstatic.com")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -258,7 +262,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      securityHeaders(gzipMiddleware(rl.banCheckMiddleware(mux))),
+		Handler:      securityHeaders(gzipMiddleware(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

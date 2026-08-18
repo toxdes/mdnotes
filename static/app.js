@@ -18,7 +18,8 @@ let currentTag = null;
 let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
-const DEFAULT_PREFS = {autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, collapseDetails:false, hideCursorHighlight:false, theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
+let editorSessionGeneration = 0;
+const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
 const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
 const FONT_CACHE_NAME = 'mdnotes-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
@@ -27,6 +28,7 @@ const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Li
 const SYSTEM_FONT_OPTIONS = [{value:'system-sans',label:'System (Sans)'}, {value:'system-serif',label:'System (Serif)'}, {value:'system-monospace',label:'System (Monospace)'}];
 let prefs = {...DEFAULT_PREFS};
 let fontAvailability = 'checking';
+let fontAvailabilityPromise = null;
 let fontLoadGeneration = 0;
 let fontApplyQueue = Promise.resolve();
 let renderedPreviewSource = null;
@@ -42,16 +44,21 @@ let activeSyncControllers = new Set();
 let syncCancellationRequested = false;
 let lastSuccessfulSyncAt = 0;
 let syncNetworkRequestsInFlight = 0;
-let syncingQueueOperationID = null;
 let offlineStorageFailureReported = false;
 let lastSyncProblem = '';
 let lastSyncDiagnostic = '';
 let lastSyncResponseStatus = 0;
 let authenticationRequired = false;
+const syncTabID = `tab_${newLocalNoteID()}`;
+const syncLeaseKey = 'syncLease';
+const syncLeaseDurationMs = 60000;
+let syncCoordinationChannel = null;
+let syncLeaseRenewTimer = null;
 let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
 let panelWide = false;
 let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
 let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
+let registeredServiceWorkerRevision = null;
 let updateToast = null;
 
 const httpRequestTimeoutMs = 15000;
@@ -64,6 +71,7 @@ const unhealthySseFallbackSyncAgeMs = 30 * 1000;
 // the app shell available, while IndexedDB holds the user's working set and a
 // durable queue of mutations to replay after connectivity returns.
 const offlineDBName = 'mdnotes-offline';
+const offlineDBVersion = 3;
 let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
@@ -95,17 +103,30 @@ function openOfflineDB() {
     // Do not request a fixed database version here. A browser may have a
     // newer local schema from a prior build; opening it with an older version
     // fails before the app can read its offline notes.
-    const request = indexedDB.open(offlineDBName);
-    request.onupgradeneeded = () => {
+    const request = indexedDB.open(offlineDBName, offlineDBVersion);
+    request.onupgradeneeded = event => {
       const db = request.result;
-      if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', {keyPath: 'id'});
-      if (!db.objectStoreNames.contains('queue')) {
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('notes')) {
+        db.createObjectStore('notes', {keyPath: 'id'});
+      }
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('queue')) {
         const queue = db.createObjectStore('queue', {keyPath: 'id', autoIncrement: true});
         queue.createIndex('note_id', 'note_id', {unique: false});
       }
-      if (!db.objectStoreNames.contains('state')) db.createObjectStore('state', {keyPath: 'key'});
+      if (event.oldVersion < 1 && !db.objectStoreNames.contains('state')) {
+        db.createObjectStore('state', {keyPath: 'key'});
+      }
+      if (event.oldVersion < 3 && db.objectStoreNames.contains('queue')) {
+        const queue = event.target.transaction.objectStore('queue');
+        if (!queue.indexNames.contains('note_id')) queue.createIndex('note_id', 'note_id', {unique: false});
+        if (!queue.indexNames.contains('client_sequence')) queue.createIndex('client_sequence', 'client_sequence', {unique: false});
+      }
     };
     request.onsuccess = async () => {
+      request.result.onversionchange = () => {
+        request.result.close();
+        offlineDBPromise = undefined;
+      };
       try {
         await repairOfflineQueue(request.result);
         resolve(request.result);
@@ -118,9 +139,13 @@ function openOfflineDB() {
     };
     request.onerror = () => {
       offlineDBPromise = undefined;
-      reportOfflineStorageFailure(request.error);
-      reject(request.error);
+      const error = request.error?.name === 'VersionError'
+        ? new Error('offline data was created by a newer app version')
+        : request.error;
+      reportOfflineStorageFailure(error);
+      reject(error);
     };
+    request.onblocked = () => showToast('Close other app tabs to update local storage.', 'warning');
   });
   return offlineDBPromise;
 }
@@ -238,6 +263,14 @@ function getLocalNote(id) {
   return withOfflineStore(['notes'], 'readonly', stores => requestValue(stores.notes.get(id)));
 }
 
+async function getOfflineDatabaseInfo() {
+  const db = await openOfflineDB();
+  return {
+    version: db.version,
+    queueIndexes: [...db.transaction('queue', 'readonly').objectStore('queue').indexNames],
+  };
+}
+
 function putLocalNote(note) {
   return withOfflineStore(['notes'], 'readwrite', stores => requestValue(stores.notes.put(note)));
 }
@@ -270,6 +303,10 @@ function unresolvedConflictKey(noteID) {
   return `unresolvedConflict:${noteID}`;
 }
 
+function rejectedSyncKey(noteID) {
+  return `rejectedSync:${noteID}`;
+}
+
 function getUnresolvedConflict(noteID) {
   return getOfflineState(unresolvedConflictKey(noteID));
 }
@@ -278,16 +315,43 @@ function setUnresolvedConflict(conflict) {
   return setOfflineState(unresolvedConflictKey(conflict.note_id), conflict);
 }
 
+function mergeQueuedPreferencePayload(existing, operation) {
+  const existingPatch = existing.prefs?._sync_patch;
+  const nextPatch = operation.prefs?._sync_patch;
+  if (!existingPatch || !nextPatch) {
+    existing.base_revision = operation.base_revision;
+    existing.prefs = operation.prefs;
+    return;
+  }
+  const patch = {...existingPatch};
+  const base = {...(existing.prefs?._sync_base || {})};
+  const nextBase = operation.prefs?._sync_base || {};
+  Object.entries(nextPatch).forEach(([key, value]) => {
+    if (!(key in base)) base[key] = nextBase[key];
+    patch[key] = value;
+  });
+  existing.prefs = {...operation.prefs, _sync_patch: patch, _sync_base: base};
+}
+
 async function queueOperationInStores(stores, operation) {
+  if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'prefs.save') {
+    await requestValue(stores.state.delete(rejectedSyncKey(operation.note_id)));
+  }
   if (operation.type === 'note.save' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
     const existing = queued
-      .filter(item => item.id !== syncingQueueOperationID && item.type === operation.type)
+      // Once a request has been attempted, its op_id/client_sequence and
+      // payload are immutable. A later edit must get a new queue identity so
+      // an acknowledgement for the old payload cannot remove the new edit.
+      .filter(item => !item.attempted_at && item.type === operation.type)
       .sort((left, right) => right.client_sequence - left.client_sequence)[0];
     if (existing) {
-      existing.base_revision = operation.base_revision;
-      existing.note = operation.note;
-      existing.prefs = operation.prefs;
+      if (operation.type === 'prefs.save') mergeQueuedPreferencePayload(existing, operation);
+      else {
+        existing.base_revision = operation.base_revision;
+        existing.note = operation.note;
+        existing.prefs = operation.prefs;
+      }
       await requestValue(stores.queue.put(existing));
       return;
     }
@@ -301,21 +365,26 @@ async function queueOperationInStores(stores, operation) {
 }
 
 function queueOperation(operation) {
-  return withOfflineStore(['queue', 'state'], 'readwrite', stores => queueOperationInStores(stores, operation));
+  return withOfflineStore(['queue', 'state'], 'readwrite', stores => queueOperationInStores(stores, operation)).then(result => {
+    notifySyncRequested();
+    return result;
+  });
 }
 
-function saveLocalNoteAndQueue(note, operation) {
-  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+async function saveLocalNoteAndQueue(note, operation) {
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
     await requestValue(stores.notes.put(note));
     await queueOperationInStores(stores, operation);
   });
+  notifySyncRequested();
 }
 
-function removeLocalNoteAndQueue(id, operation) {
-  return withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+async function removeLocalNoteAndQueue(id, operation) {
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
     await requestValue(stores.notes.delete(id));
     await queueOperationInStores(stores, operation);
   });
+  notifySyncRequested();
 }
 
 function removeLocalNoteAndSupersede(id, afterSequence) {
@@ -323,7 +392,7 @@ function removeLocalNoteAndSupersede(id, afterSequence) {
     await requestValue(stores.notes.delete(id));
     const operations = await requestValue(stores.queue.index('note_id').getAll(id));
     operations.forEach(operation => {
-      if (operation.client_sequence > afterSequence) {
+      if (operation.client_sequence > afterSequence && !operation.attempted_at) {
         operation.type = 'noop';
         stores.queue.put(operation);
       }
@@ -347,8 +416,12 @@ async function repairSyncSequenceGap(expectedSequence) {
     if (!unsent.length) return false;
     let sequence = expectedSequence;
     for (const operation of unsent) {
-      if (operation.client_sequence !== sequence) {
+      // The server returned 409 before applying this request, so these rows
+      // are safe to re-arm and close the local sequence gap. A normal
+      // acknowledgement never changes an attempted row.
+      if (operation.client_sequence !== sequence || operation.attempted_at) {
         operation.client_sequence = sequence;
+        delete operation.attempted_at;
         await requestValue(stores.queue.put(operation));
       }
       sequence++;
@@ -362,14 +435,81 @@ async function repairSyncSequenceGap(expectedSequence) {
 }
 
 async function hasPendingOperation(noteID) {
-  return withOfflineStore(['queue'], 'readonly', async stores => {
+  return withOfflineStore(['queue', 'state'], 'readonly', async stores => {
     const item = await requestValue(stores.queue.index('note_id').get(noteID));
-    return Boolean(item);
+    if (item) return true;
+    return Boolean(await requestValue(stores.state.get(rejectedSyncKey(noteID))));
   });
 }
 
-function removePendingOperation(id) {
-  return withOfflineStore(['queue'], 'readwrite', stores => requestValue(stores.queue.delete(id)));
+function pendingOperationsForNote(noteID) {
+  return withOfflineStore(['queue'], 'readonly', stores => requestValue(stores.queue.index('note_id').getAll(noteID)));
+}
+
+async function claimQueueOperation(id) {
+  return withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operation = await requestValue(stores.queue.get(id));
+    if (!operation) return null;
+    if (!operation.attempted_at) {
+      operation.attempted_at = new Date().toISOString();
+      await requestValue(stores.queue.put(operation));
+    }
+    return operation;
+  });
+}
+
+function queueOperationPayload(operation) {
+  return JSON.stringify({
+    type: operation.type,
+    note_id: operation.note_id,
+    base_revision: operation.base_revision,
+    note: operation.note && {
+      id: operation.note.id,
+      title: operation.note.title,
+      tags: operation.note.tags,
+      content: operation.note.content,
+      base_revision: operation.note.base_revision,
+      base_content: operation.note.base_content,
+      base_title: operation.note.base_title,
+      base_tags: operation.note.base_tags,
+    },
+    prefs: operation.prefs || null,
+  });
+}
+
+function removePendingOperationIfIdentityMatches(id, expectedOperation) {
+  return withOfflineStore(['queue'], 'readwrite', async stores => {
+    const operation = await requestValue(stores.queue.get(id));
+    if (!operation || operation.op_id !== expectedOperation.op_id || operation.client_sequence !== expectedOperation.client_sequence || queueOperationPayload(operation) !== queueOperationPayload(expectedOperation)) return false;
+    await requestValue(stores.queue.delete(id));
+    return true;
+  });
+}
+
+async function quarantineQueueOperation(operation, reason) {
+  return withOfflineStore(['queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) return false;
+    await requestValue(stores.state.put({
+      key: rejectedSyncKey(operation.note_id),
+      value: {
+        op_id: operation.op_id,
+        client_sequence: operation.client_sequence,
+        note_id: operation.note_id,
+        type: operation.type,
+        reason: reason || 'server rejected the operation',
+        rejected_at: new Date().toISOString(),
+      },
+    }));
+    queued.type = 'noop';
+    delete queued.note;
+    delete queued.prefs;
+    delete queued.base_revision;
+    queued.rejected = true;
+    queued.rejected_reason = reason || 'server rejected the operation';
+    await requestValue(stores.queue.put(queued));
+    return true;
+  });
 }
 
 async function syncDeviceID() {
@@ -386,7 +526,7 @@ async function rebaseQueuedNoteOperations(noteID, acknowledgedID, revision, base
     const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
     let hasLater = false;
     operations.forEach(operation => {
-      if (operation.id === acknowledgedID || operation.client_sequence < 1) return;
+      if (operation.id === acknowledgedID || operation.client_sequence < 1 || operation.attempted_at) return;
       if (operation.type === 'note.save' || operation.type === 'note.delete') {
         operation.base_revision = revision;
         if (operation.note) {
@@ -407,7 +547,7 @@ async function supersedeQueuedNoteOperations(noteID, afterSequence) {
   await withOfflineStore(['queue'], 'readwrite', async stores => {
     const operations = await requestValue(stores.queue.index('note_id').getAll(noteID));
     operations.forEach(operation => {
-      if (operation.client_sequence > afterSequence) {
+      if (operation.client_sequence > afterSequence && !operation.attempted_at) {
         operation.type = 'noop';
         stores.queue.put(operation);
       }
@@ -416,21 +556,58 @@ async function supersedeQueuedNoteOperations(noteID, afterSequence) {
 }
 
 async function clearOfflineData() {
-  const db = await openOfflineDB();
-  db.close();
+  try {
+    syncCoordinationChannel?.postMessage({type: 'logout', sender: syncTabID});
+  } catch (_) {}
+  const dbPromise = offlineDBPromise;
   offlineDBPromise = undefined;
+  if (dbPromise) {
+    try { (await dbPromise).close(); } catch (_) {}
+  }
   await new Promise((resolve, reject) => {
     const request = indexedDB.deleteDatabase(offlineDBName);
-    request.onsuccess = resolve;
-    request.onerror = () => reject(request.error);
-    request.onblocked = resolve;
+    const timeout = setTimeout(() => reject(new Error('local data cleanup is blocked by another app tab')), 5000);
+    request.onerror = () => {
+      clearTimeout(timeout);
+      reject(request.error);
+    };
+    request.onsuccess = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
   });
+}
+
+async function closeOfflineDatabaseConnection() {
+  const dbPromise = offlineDBPromise;
+  offlineDBPromise = undefined;
+  if (!dbPromise) return;
+  try { (await dbPromise).close(); } catch (_) {}
 }
 
 function newLocalNoteID() {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+try {
+  if (typeof BroadcastChannel !== 'undefined') {
+    syncCoordinationChannel = new BroadcastChannel('mdnotes-sync');
+    syncCoordinationChannel.addEventListener('message', event => {
+      if (!event.data || event.data.sender === syncTabID) return;
+      if (event.data.type === 'sync-request') scheduleSync({}, 0);
+      if (event.data.type === 'logout') void closeOfflineDatabaseConnection();
+    });
+  }
+} catch (_) {
+  syncCoordinationChannel = null;
+}
+
+function notifySyncRequested() {
+  try {
+    syncCoordinationChannel?.postMessage({type: 'sync-request', sender: syncTabID});
+  } catch (_) {}
 }
 
 const syncStates = {
@@ -531,6 +708,7 @@ function cacheAppVersion(response) {
   if (response?.revision) {
     if (!appRevisionAtLoad) appRevisionAtLoad = response.revision;
     localStorage.setItem('mdnotes-revision', response.revision);
+    registerServiceWorker(response.revision);
   }
   const version = response?.version || localStorage.getItem('mdnotes-version') || 'dev';
   $('#app-version').textContent = `v${version}`;
@@ -542,6 +720,7 @@ function show(screen) {
 }
 
 function clearCurrentNote() {
+  editorSessionGeneration++;
   currentNoteId = null;
   currentRevision = 0;
   currentBaseRevision = null;
@@ -567,7 +746,7 @@ async function fetchWithTimeout(path, options = {}, {group = null, timeoutMs = h
 }
 
 function isAbortError(error) {
-  return error?.name === 'AbortError';
+  return error?.name === 'AbortError' || error?.kind === 'aborted';
 }
 
 function cancelActiveSyncRequests() {
@@ -583,6 +762,7 @@ function beginSyncNetworkRequest() {
 
 function endSyncNetworkRequest() {
   syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
+  if (syncNetworkRequestsInFlight === 0) setIdleSyncStatus();
 }
 
 function setIdleSyncStatus() {
@@ -590,35 +770,70 @@ function setIdleSyncStatus() {
   setSyncStatus(syncFailed ? 'offline' : 'online');
 }
 
+class APIError extends Error {
+  constructor(message, {status = 0, code = '', kind = 'http', retryable = null, cause = null} = {}) {
+    super(message);
+    this.name = 'APIError';
+    this.kind = kind;
+    this.code = code;
+    this.responseStatus = status;
+    this.retryable = retryable ?? (!status || status === 408 || status === 429 || status >= 500);
+    if (cause) this.cause = cause;
+  }
+}
+
+async function responseBody(response) {
+  const text = await response.text();
+  if (typeof text !== 'string') return text;
+  if (!text) return null;
+  try { return JSON.parse(text); } catch (_) { return text; }
+}
+
+function apiErrorFromPayload(payload, status, statusText = '') {
+  const message = typeof payload === 'string' ? payload : payload?.error || statusText || 'request failed';
+  const code = typeof payload === 'object' && payload ? String(payload.code || '') : '';
+  return new APIError(message, {status, code});
+}
+
+function apiErrorFromTransport(error) {
+  if (error instanceof APIError) return error;
+  const timedOut = error?.name === 'TimeoutError';
+  const aborted = error?.name === 'AbortError';
+  return new APIError(timedOut ? 'request timed out' : aborted ? 'request aborted' : 'network request failed', {
+    kind: timedOut ? 'timeout' : aborted ? 'aborted' : 'network',
+    retryable: !aborted,
+    cause: error,
+  });
+}
+
 async function api(path, opts) {
   const method = opts?.method || 'GET';
   const syncRequest = opts?.syncRequest === true;
+  const throwOnError = opts?.throwOnError === true;
   const requestOpts = {...opts};
   delete requestOpts.syncRequest;
+  delete requestOpts.throwOnError;
   if (syncRequest) beginSyncNetworkRequest();
   try {
     const res = await fetchWithTimeout(path, {
       credentials: 'same-origin',
       headers: requestOpts?.body ? {'Content-Type':'application/json'} : {},
       ...requestOpts,
-    });
-    if (res.status === 401) {
-      setSyncDiagnostic(`${method} ${path} returned HTTP 401`, 401);
-      requireAuthentication();
-      return null;
-    }
+    }, {group: syncRequest ? activeSyncControllers : null});
     if (res.status === 204) return true;
+    const body = await responseBody(res);
     if (!res.ok) {
-      const text = await res.text();
-      const error = new Error(text || res.statusText);
-      error.responseStatus = res.status;
+      const error = apiErrorFromPayload(body, res.status, res.statusText);
+      if (res.status === 401) requireAuthentication();
       throw error;
     }
-    return await res.json();
+    if (body === null) throw new APIError('invalid server response', {kind: 'protocol', retryable: false});
+    return body;
   } catch(e) {
-    setSyncDiagnostic(`${method} ${path} ${e?.responseStatus ? `returned HTTP ${e.responseStatus}` : 'failed'}: ${e?.message || 'unknown error'}`, e?.responseStatus);
-    console.error(e);
-    return null;
+    const error = apiErrorFromTransport(e);
+    setSyncDiagnostic(`${method} ${path} ${error?.responseStatus ? `returned HTTP ${error.responseStatus}` : 'failed'}: ${error?.message || 'unknown error'}`, error?.responseStatus);
+    console.error(error);
+    throw error;
   } finally {
     if (syncRequest) endSyncNetworkRequest();
   }
@@ -641,8 +856,9 @@ async function syncFetch(path, options) {
     if (!response.ok) setSyncDiagnostic(`${method} ${path} returned HTTP ${response.status}: ${typeof data === 'string' ? data : response.statusText}`, response.status);
     return {response, data};
   } catch (error) {
-    setSyncDiagnostic(`${method} ${path} failed: ${error?.message || 'unknown error'}`);
-    throw error;
+    const typed = apiErrorFromTransport(error);
+    setSyncDiagnostic(`${method} ${path} failed: ${typed.message}`);
+    throw typed;
   } finally {
     endSyncNetworkRequest();
   }
@@ -667,12 +883,20 @@ async function cacheRemoteNote(note) {
 }
 
 async function applyRemoteDeletion(noteID) {
-  await removeLocalNote(noteID);
-  if (currentNoteId === noteID && !isDirty) {
+  const removed = await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const pending = await requestValue(stores.queue.index('note_id').getAll(noteID));
+    const conflict = await requestValue(stores.state.get(unresolvedConflictKey(noteID)));
+    const rejected = await requestValue(stores.state.get(rejectedSyncKey(noteID)));
+    if (pending.length || conflict || rejected) return false;
+    await requestValue(stores.notes.delete(noteID));
+    return true;
+  });
+  if (removed && currentNoteId === noteID && !isDirty) {
     clearCurrentNote();
     await loadDashboard({sync: false});
     setDashboardRoute({replace: true});
   }
+  return removed;
 }
 
 async function bulkRemoteNotes(noteIDs) {
@@ -680,7 +904,7 @@ async function bulkRemoteNotes(noteIDs) {
   const notes = new Map();
   for (let index = 0; index < noteIDs.length; index += bulkNoteBatchSize) {
     const batch = noteIDs.slice(index, index + bulkNoteBatchSize);
-    const response = await api(`/api/sync/notes?ids=${encodeURIComponent(batch.join(','))}`);
+    const response = await api(`/api/sync/notes?ids=${encodeURIComponent(batch.join(','))}`, {syncRequest: true});
     if (!response || !Array.isArray(response.notes) || !Array.isArray(response.missing)) {
       throw new Error('could not download changed notes');
     }
@@ -690,11 +914,108 @@ async function bulkRemoteNotes(noteIDs) {
   return notes;
 }
 
+async function loadSyncGuards() {
+  return withOfflineStore(['queue', 'state'], 'readonly', async stores => {
+    const [operations, records] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+    ]);
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    return guarded;
+  });
+}
+
+async function applyRemoteChangePage(changes, downloaded, nextSequence) {
+  let activeNote = null;
+  let activeDeleted = false;
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const [operations, records] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+    ]);
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    for (const change of changes) {
+      if (guarded.has(change.note_id)) continue;
+      const remote = change.deleted ? null : downloaded.get(change.note_id);
+      const local = await requestValue(stores.notes.get(change.note_id));
+      if (local?.pending || (currentNoteId === change.note_id && isDirty)) continue;
+      if (!remote) {
+        await requestValue(stores.notes.delete(change.note_id));
+        if (currentNoteId === change.note_id) activeDeleted = true;
+        continue;
+      }
+      const next = {...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null};
+      await requestValue(stores.notes.put(next));
+      if (currentNoteId === change.note_id && !isDirty) activeNote = next;
+    }
+    await requestValue(stores.state.put({key: 'syncSequence', value: nextSequence}));
+  });
+  if (activeNote) updateOpenNote(activeNote);
+  if (activeDeleted && currentNoteId && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
+async function applyRemoteSnapshot(remoteNotes, remoteIDs, sequence = null) {
+  let activeNote = null;
+  let activeDeleted = false;
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const [operations, records, locals] = await Promise.all([
+      requestValue(stores.queue.getAll()),
+      requestValue(stores.state.getAll()),
+      requestValue(stores.notes.getAll()),
+    ]);
+    const localByID = new Map(locals.map(note => [note.id, note]));
+    const guarded = new Set(operations.map(operation => operation.note_id).filter(Boolean));
+    records.forEach(record => {
+      if (record.key.startsWith('unresolvedConflict:') || record.key.startsWith('rejectedSync:')) {
+        const noteID = record.value?.note_id || record.key.split(':').slice(1).join(':');
+        if (noteID) guarded.add(noteID);
+      }
+    });
+    for (const [id, remote] of remoteNotes) {
+      if (guarded.has(id)) continue;
+      const local = localByID.get(id);
+      if (local?.pending || (currentNoteId === id && isDirty)) continue;
+      const next = {...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null};
+      await requestValue(stores.notes.put(next));
+      if (currentNoteId === id && !isDirty) activeNote = next;
+    }
+    for (const local of locals) {
+      if (remoteIDs.has(local.id) || guarded.has(local.id)) continue;
+      await requestValue(stores.notes.delete(local.id));
+      if (currentNoteId === local.id) activeDeleted = true;
+    }
+    if (sequence !== null) await requestValue(stores.state.put({key: 'syncSequence', value: sequence}));
+  });
+  if (activeNote) updateOpenNote(activeNote);
+  if (activeDeleted && currentNoteId && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
 async function pullRemoteChanges() {
   let since = Number(await getOfflineState('syncSequence') || 0);
   const fetchedNotes = new Map();
+  const guards = await loadSyncGuards();
   for (;;) {
-    const page = await api(`/api/sync?since=${since}&limit=100`);
+    const page = await api(`/api/sync?since=${since}&limit=100`, {syncRequest: true});
     if (!page) throw new Error('could not fetch sync changes');
     if (page.resetRequired) {
       await resetLocalNotesFromRemote(Number(page.nextSequence || 0));
@@ -703,63 +1024,38 @@ async function pullRemoteChanges() {
     const downloadIDs = [];
     for (const change of page.changes) {
       if (change.deleted || fetchedNotes.has(change.note_id)) continue;
-      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
+      if (guards.has(change.note_id)) continue;
       downloadIDs.push(change.note_id);
     }
     const downloaded = await bulkRemoteNotes([...new Set(downloadIDs)]);
     downloaded.forEach((remote, id) => fetchedNotes.set(id, remote));
-
-    for (const change of page.changes) {
-      if (await hasPendingOperation(change.note_id) || await getUnresolvedConflict(change.note_id)) continue;
-      if (change.deleted) {
-        await applyRemoteDeletion(change.note_id);
-        continue;
-      }
-      const remote = fetchedNotes.get(change.note_id);
-      if (!remote) {
-        // The feed records history. A save entry can therefore be followed by
-        // a later deletion before this device asks for the current note. A
-        // missing entry is the authoritative final state, not a sync failure.
-        await applyRemoteDeletion(change.note_id);
-        continue;
-      }
-      await cacheRemoteNote(remote);
-    }
     const nextSince = Number(page.nextSequence || since);
     if (page.hasMore && nextSince <= since) {
       throw new Error(`sync cursor did not advance (since ${since}, next ${nextSince})`);
     }
+    await applyRemoteChangePage(page.changes, fetchedNotes, nextSince);
     since = nextSince;
-    await setOfflineState('syncSequence', since);
     if (!page.hasMore) return;
   }
 }
 
 async function resetLocalNotesFromRemote(sequence) {
-  const summaries = await api('/api/notes');
+  const summaries = await api('/api/notes', {syncRequest: true});
   if (!Array.isArray(summaries)) throw new Error('could not refresh notes after sync compaction');
   const remoteIDs = new Set(summaries.map(note => note.id));
   const remoteNotes = new Map();
   const downloadIDs = [];
+  const guards = await loadSyncGuards();
   for (const summary of summaries) {
-    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
+    if (guards.has(summary.id)) continue;
     downloadIDs.push(summary.id);
   }
   for (let index = 0; index < downloadIDs.length; index += 100) {
     const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
     page.forEach((remote, id) => remoteNotes.set(id, remote));
   }
-  for (const id of downloadIDs) {
-    const remote = remoteNotes.get(id);
-    if (!remote) throw new Error('could not download refreshed note');
-    await cacheRemoteNote(remote);
-  }
-  for (const local of await getAllLocalNotes()) {
-    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id)) {
-      await removeLocalNote(local.id);
-    }
-  }
-  await setOfflineState('syncSequence', sequence);
+  for (const id of downloadIDs) if (!remoteNotes.get(id)) throw new Error('could not download refreshed note');
+  await applyRemoteSnapshot(remoteNotes, remoteIDs, sequence);
 }
 
 // A sync cursor records that this browser has observed the change feed, but a
@@ -767,28 +1063,26 @@ async function resetLocalNotesFromRemote(sequence) {
 // storage repair). Reconcile against note summaries at session start so a
 // valid-but-stale cursor cannot leave the dashboard incomplete forever.
 async function reconcileLocalNotes() {
-  const summaries = await api('/api/notes');
+  const summaries = await api('/api/notes', {syncRequest: true});
   if (!Array.isArray(summaries)) throw new Error('could not reconcile local notes');
   const remoteIDs = new Set(summaries.map(note => note.id));
   const downloadIDs = [];
+  const remoteNotes = new Map();
+  const guards = await loadSyncGuards();
+  const locals = await getAllLocalNotes();
+  const localByID = new Map(locals.map(note => [note.id, note]));
   for (const summary of summaries) {
-    if (await hasPendingOperation(summary.id) || await getUnresolvedConflict(summary.id)) continue;
-    const local = await getLocalNote(summary.id);
+    if (guards.has(summary.id)) continue;
+    const local = localByID.get(summary.id);
     if (local && local.revision === summary.revision) continue;
     downloadIDs.push(summary.id);
   }
   for (let index = 0; index < downloadIDs.length; index += 100) {
     const page = await bulkRemoteNotes(downloadIDs.slice(index, index + 100));
-    for (const [id, remote] of page) {
-      if (!remote) throw new Error('could not download reconciled note');
-      await cacheRemoteNote(remote);
-    }
+    page.forEach((remote, id) => remoteNotes.set(id, remote));
   }
-  for (const local of await getAllLocalNotes()) {
-    if (!remoteIDs.has(local.id) && !await hasPendingOperation(local.id) && !await getUnresolvedConflict(local.id)) {
-      await removeLocalNote(local.id);
-    }
-  }
+  for (const id of downloadIDs) if (!remoteNotes.get(id)) throw new Error('could not download reconciled note');
+  await applyRemoteSnapshot(remoteNotes, remoteIDs);
 }
 
 function updateOpenNote(note) {
@@ -803,14 +1097,24 @@ function updateOpenNote(note) {
   updatePreview();
 }
 
-async function mergeConflictedNote(operation) {
+async function loadConflictRemoteNote(noteID) {
+  try {
+    return await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true});
+  } catch (error) {
+    // A 404 is authoritative: the remote note was deleted. Other failures
+    // must abort conflict handling so the original operation can be retried.
+    if (error?.responseStatus === 404) return null;
+    throw error;
+  }
+}
+
+async function mergeConflictedNote(operation, remote) {
   if (operation.type !== 'note.save' || !operation.note || !window.MDNotesMerge) return false;
   // A network response can arrive while the user is still typing. Capture that
   // newer local state before deriving the merge, rather than merging an older
   // queued snapshot and accidentally omitting the last keystrokes.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
   if (!local || !remote) return false;
   // Queued edits created before three-way metadata existed cannot be merged
   // safely for title/tags; the durable resolver handles them instead.
@@ -840,7 +1144,7 @@ async function mergeConflictedNote(operation) {
   // snapshots have the old base, so replace them with ordered no-ops and a
   // single merged save after them; that preserves the device event sequence.
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
   await queueOperation({type: 'note.save', note_id: mergedLocal.id, base_revision: remote.revision, note: mergedLocal});
   updateOpenNote(mergedLocal);
   return true;
@@ -875,7 +1179,7 @@ async function preserveConflictCopy(operation, local, remote) {
     }
   }
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
 }
 
 function conflictBase(local, operation) {
@@ -884,6 +1188,40 @@ function conflictBase(local, operation) {
     tags: local.base_tags ?? operation.note?.base_tags ?? operation.note?.tags ?? '',
     content: local.base_content ?? operation.note?.base_content ?? '',
   };
+}
+
+async function createRemoteDeletionConflict(operation, local) {
+  const preserved = {
+    ...local,
+    id: operation.note_id,
+    title: local.title || 'Untitled',
+    tags: local.tags || '',
+    content: local.content || '',
+  };
+  const conflict = {
+    kind: 'remote-deleted',
+    note_id: operation.note_id,
+    created_at: new Date().toISOString(),
+    base: conflictBase(preserved, operation),
+    local: preserved,
+    remote: null,
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('conflicting sync operation changed before deletion resolution');
+    }
+    await requestValue(stores.notes.put({...preserved, pending: false}));
+    await requestValue(stores.state.put({key: unresolvedConflictKey(operation.note_id), value: conflict}));
+    const laterOperations = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    for (const later of laterOperations) {
+      if (later.id !== operation.id && later.client_sequence > operation.client_sequence && !later.attempted_at) {
+        later.type = 'noop';
+        await requestValue(stores.queue.put(later));
+      }
+    }
+    await requestValue(stores.queue.delete(operation.id));
+  });
 }
 
 function renderConflictDiff(target, base, version, changedClass) {
@@ -908,23 +1246,71 @@ function renderConflictDiff(target, base, version, changedClass) {
 
 let activeConflictID = null;
 let activeConflictSelection = 'local';
+let activeConflictKind = 'edit';
 
 function closeConflictResolver() {
   activeConflictID = null;
   activeConflictSelection = 'local';
+  activeConflictKind = 'edit';
   closeModal($('#conflict-modal'));
 }
 
 function openModal(modal) {
+  if (!modal.__keyboardBound) {
+    modal.addEventListener('keydown', handleModalKeydown);
+    modal.__keyboardBound = true;
+  }
+  modal.__opener = document.activeElement && typeof document.activeElement.focus === 'function' ? document.activeElement : null;
   modal.classList.remove('hidden', 'is-closing');
+  modal.setAttribute('aria-hidden', 'false');
+  const initialFocus = modal.querySelector('[autofocus]') || modal.querySelector('.modal-close') || modalFocusableElements(modal)[0] || modal.querySelector('[role="dialog"]');
+  if (initialFocus) initialFocus.focus();
+}
+
+function modalFocusableElements(modal) {
+  return [...modal.querySelectorAll('button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])')].filter(element => {
+    if (element.disabled || element.hidden || element.closest('.hidden, [hidden]')) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  });
+}
+
+function handleModalKeydown(event) {
+  const modal = event.currentTarget;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    if (modal.id === 'conflict-modal') closeConflictResolver();
+    else closeModal(modal);
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = modalFocusableElements(modal);
+  if (!focusable.length) {
+    event.preventDefault();
+    modal.querySelector('[role="dialog"]')?.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function closeModal(modal) {
   if (modal.classList.contains('hidden') || modal.classList.contains('is-closing')) return;
   modal.classList.add('is-closing');
+  const opener = modal.__opener;
   const finish = () => {
     modal.classList.remove('is-closing');
     modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    modal.__opener = null;
+    if (opener?.isConnected) opener.focus();
   };
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     finish();
@@ -949,7 +1335,16 @@ function setConflictSelection(selection) {
 }
 
 function showConflictResolver(conflict) {
+  activeConflictKind = 'edit';
   activeConflictID = conflict.note_id;
+  $('#conflict-title').textContent = 'Resolve conflicting edits';
+  $('.conflict-intro').textContent = 'This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.';
+  $('#conflict-deleted-details').classList.add('hidden');
+  $$('.conflict-fields, .conflict-metadata-compare, .conflict-compare, #conflict-selection-status, .conflict-result, .conflict-base:not(#conflict-deleted-details)').forEach(element => element.classList.remove('hidden'));
+  $('#conflict-copy').className = 'btn-text';
+  $('#conflict-copy').textContent = 'Keep as copy';
+  $('#conflict-save').className = 'btn-primary';
+  $('#conflict-save').textContent = 'Save resolution';
   $('#conflict-note-title').value = conflict.local.title || '';
   $('#conflict-note-tags').value = conflict.local.tags || '';
   $('#conflict-note-content').value = conflict.local.content || '';
@@ -963,10 +1358,31 @@ function showConflictResolver(conflict) {
   $('#conflict-note-content').focus();
 }
 
+function showDeletedConflict(conflict) {
+  activeConflictKind = 'remote-deleted';
+  activeConflictID = conflict.note_id;
+  $('#conflict-title').textContent = 'Note deleted on another device';
+  $('.conflict-intro').textContent = 'Your changes are saved on this device. Choose whether to keep them as a new note or accept the deletion.';
+  $$('.conflict-fields, .conflict-metadata-compare, .conflict-compare, #conflict-selection-status, .conflict-result, .conflict-base').forEach(element => element.classList.add('hidden'));
+  $('#conflict-deleted-details').classList.remove('hidden');
+  $('#conflict-deleted-content').textContent = [
+    `Title: ${conflict.local.title || 'Untitled'}`,
+    `Tags: ${conflict.local.tags || 'None'}`,
+    '',
+    conflict.local.content || '(empty note)',
+  ].join('\n');
+  $('#conflict-copy').className = 'btn-primary';
+  $('#conflict-copy').textContent = 'Keep as new note';
+  $('#conflict-save').className = 'btn-text danger';
+  $('#conflict-save').textContent = 'Accept deletion';
+  openModal($('#conflict-modal'));
+}
+
 async function showConflictResolverFor(noteID) {
   const conflict = await getUnresolvedConflict(noteID);
   if (!conflict) return false;
-  showConflictResolver(conflict);
+  if (conflict.kind === 'remote-deleted') showDeletedConflict(conflict);
+  else showConflictResolver(conflict);
   return true;
 }
 
@@ -977,13 +1393,16 @@ function fillConflictResolution(version, selection) {
   setConflictSelection(selection);
 }
 
-async function createConflictResolution(operation) {
+async function createConflictResolution(operation, remote) {
   // Always capture fresh keystrokes before replacing the cached note. This is
   // especially important for notification-driven sync, which can arrive while
   // the 250ms local-save timer is still pending.
   if (currentNoteId === operation.note_id && isDirty) await saveCurrentNote(false);
   const local = await getLocalNote(operation.note_id);
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
+  if (!remote && operation.type === 'note.save' && (local || operation.note)) {
+    await createRemoteDeletionConflict(operation, local || operation.note);
+    return 'remote-deleted';
+  }
   if (!local || !remote || operation.type !== 'note.save') {
     await preserveConflictCopy(operation, local, remote);
     return false;
@@ -1001,7 +1420,7 @@ async function createConflictResolution(operation) {
   await setUnresolvedConflict(conflict);
   await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
-  await removePendingOperation(operation.id);
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
   // Bring the authoritative version into the normal editor before opening the
   // resolver, even if the conflict was discovered after navigating away. Any
   // note the user began editing during the request is saved locally first.
@@ -1081,6 +1500,60 @@ async function keepConflictAsCopy() {
   scheduleSync();
 }
 
+async function keepDeletedConflictAsCopy() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict || conflict.kind !== 'remote-deleted') return;
+  const conflictID = newLocalNoteID();
+  const now = new Date().toISOString();
+  const copy = {
+    ...conflict.local,
+    id: conflictID,
+    title: `${conflict.local.title || 'Untitled'} (conflict copy)`,
+    filename: `${conflictID}.md`,
+    created_at: conflict.local.created_at || now,
+    updated_at: now,
+    revision: 0,
+    base_revision: 0,
+    base_title: '',
+    base_tags: '',
+    base_content: '',
+    pending: true,
+  };
+  await withOfflineStore(['notes', 'queue', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.put(copy));
+    await queueOperationInStores(stores, {type: 'note.save', note_id: conflictID, base_revision: 0, note: copy});
+    await requestValue(stores.notes.delete(noteID));
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  currentNoteId = conflictID;
+  isDirty = false;
+  updateOpenNote(copy);
+  setNoteRoute(conflictID);
+  closeConflictResolver();
+  showToast('Your changes were saved as a new note.', 'success');
+  if (!screens.dashboard.classList.contains('hidden')) void refreshDashboard();
+  scheduleSync();
+}
+
+async function acceptDeletedConflict() {
+  const noteID = activeConflictID;
+  const conflict = noteID && await getUnresolvedConflict(noteID);
+  if (!conflict || conflict.kind !== 'remote-deleted') return;
+  await withOfflineStore(['notes', 'state'], 'readwrite', async stores => {
+    await requestValue(stores.notes.delete(noteID));
+    await requestValue(stores.state.delete(unresolvedConflictKey(noteID)));
+  });
+  if (currentNoteId === noteID) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+  closeConflictResolver();
+  showToast('The remote deletion was accepted.', 'success');
+  scheduleSync();
+}
+
 $('#conflict-use-local').addEventListener('click', async () => {
   const conflict = activeConflictID && await getUnresolvedConflict(activeConflictID);
   if (conflict) fillConflictResolution(conflict.local, 'local');
@@ -1097,68 +1570,196 @@ $('#conflict-use-remote').addEventListener('click', async () => {
   });
 });
 
-$('#conflict-save').addEventListener('click', () => { void saveConflictResolution(); });
-$('#conflict-copy').addEventListener('click', () => { void keepConflictAsCopy(); });
+$('#conflict-save').addEventListener('click', () => { void (activeConflictKind === 'remote-deleted' ? acceptDeletedConflict() : saveConflictResolution()); });
+$('#conflict-copy').addEventListener('click', () => { void (activeConflictKind === 'remote-deleted' ? keepDeletedConflictAsCopy() : keepConflictAsCopy()); });
 $('#conflict-later').addEventListener('click', closeConflictResolver);
 $('#conflict-close').addEventListener('click', closeConflictResolver);
 $('#conflict-modal .modal-backdrop').addEventListener('click', closeConflictResolver);
 
+async function reconcileCompactedOperationLocally(operation, remote) {
+  return withOfflineStore(['notes', 'queue'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('compacted sync operation changed before local reconciliation');
+    }
+
+    const operations = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    let hasLater = false;
+    for (const later of operations) {
+      if (later.id === operation.id || later.client_sequence < 1 || later.attempted_at) continue;
+      if (later.type !== 'note.save' && later.type !== 'note.delete') continue;
+      if (remote) {
+        later.base_revision = remote.revision;
+        if (later.note) {
+          later.note.base_revision = remote.revision;
+          later.note.base_content = remote.content;
+          later.note.base_title = remote.title;
+          later.note.base_tags = remote.tags;
+        }
+        await requestValue(stores.queue.put(later));
+      }
+      hasLater = true;
+    }
+
+    const local = await requestValue(stores.notes.get(operation.note_id));
+    if (remote && !hasLater) {
+      await requestValue(stores.notes.put({...local, ...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null}));
+    } else if (remote && hasLater) {
+      await requestValue(stores.notes.put({...remote, ...local, revision: remote.revision, pending: true, base_revision: remote.revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags}));
+    } else if (!remote && !hasLater) {
+      await requestValue(stores.notes.delete(operation.note_id));
+    }
+    await requestValue(stores.queue.delete(operation.id));
+    return hasLater;
+  });
+}
+
 async function acknowledgeCompactedOperation(operation) {
-  await removePendingOperation(operation.id);
-  if (operation.type !== 'note.save' && operation.type !== 'note.delete') return;
-  const remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`);
-  if (!remote) {
-    if (!await hasPendingOperation(operation.note_id)) await removeLocalNote(operation.note_id);
+  if (operation.type !== 'note.save' && operation.type !== 'note.delete') {
+    const removed = await removePendingOperationIfIdentityMatches(operation.id, operation);
+    if (!removed) throw new Error('compacted sync operation changed before acknowledgement');
     return;
   }
-  const hasLater = await rebaseQueuedNoteOperations(operation.note_id, -1, remote.revision, remote);
-  const local = await getLocalNote(operation.note_id);
-  if (!hasLater) {
-    await cacheRemoteNote(remote);
+
+  let remote = null;
+  try {
+    remote = await api(`/api/notes/${encodeURIComponent(operation.note_id)}`, {syncRequest: true, throwOnError: true});
+  } catch (error) {
+    // Only an explicit 404 proves that the note is absent. Timeouts, server
+    // errors, authentication failures, and other errors must leave the queue
+    // entry intact so the next sync can retry reconciliation.
+    if (error?.responseStatus !== 404) throw error;
+  }
+
+  const hasLater = await reconcileCompactedOperationLocally(operation, remote);
+  if (!hasLater && remote) updateOpenNote(remote);
+  if (!hasLater && !remote && currentNoteId === operation.note_id && !isDirty) {
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  }
+}
+
+const syncPushBatchLimit = 100;
+const syncPushBatchByteLimit = 3 * 1024 * 1024;
+
+function outgoingSyncOperation(operation) {
+  const outgoing = {
+    client_sequence: operation.client_sequence,
+    op_id: operation.op_id,
+    type: operation.type,
+    note_id: operation.note_id,
+    base_revision: operation.base_revision,
+  };
+  if (operation.type === 'note.save') {
+    outgoing.title = operation.note.title;
+    outgoing.tags = operation.note.tags;
+    outgoing.content = operation.note.content;
+    outgoing.base_content = operation.note.base_content || '';
+  } else if (operation.type === 'prefs.save') {
+    outgoing.prefs = operation.prefs;
+  }
+  return outgoing;
+}
+
+function encodedByteLength(value) {
+  const encoded = JSON.stringify(value);
+  return typeof TextEncoder === 'function' ? new TextEncoder().encode(encoded).byteLength : encoded.length;
+}
+
+function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
+  return withOfflineStore(['queue'], 'readwrite', stores => new Promise((resolve, reject) => {
+    const batch = [];
+    const request = stores.queue.index('client_sequence').openCursor();
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve(batch);
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor || batch.length >= maxOperations) {
+        finish();
+        return;
+      }
+      const operation = cursor.value;
+      const candidate = [...batch.map(item => outgoingSyncOperation(item)), outgoingSyncOperation(operation)];
+      const requestBytes = encodedByteLength({device_id: deviceID, operations: candidate});
+      if (batch.length && requestBytes > maxBytes) {
+        finish();
+        return;
+      }
+      if (!operation.attempted_at) {
+        operation.attempted_at = new Date().toISOString();
+        cursor.update(operation);
+      }
+      batch.push(operation);
+      if (batch.length >= maxOperations) finish();
+      else cursor.continue();
+    };
+  }));
+}
+
+async function applySyncAcknowledgement(operation, acknowledgement) {
+  if (acknowledgement.status === 'compacted') {
+    await acknowledgeCompactedOperation(operation);
     return;
   }
-  if (local) {
-    await putLocalNote({...local, revision: remote.revision, pending: true, base_revision: remote.revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags});
+  if (acknowledgement.status === 'conflict') {
+    if (operation.type === 'prefs.save') {
+      await resolvePreferenceConflict(operation);
+      return;
+    }
+    const remote = await loadConflictRemoteNote(operation.note_id);
+    if (await mergeConflictedNote(operation, remote)) {
+      showToast('Merged your non-overlapping changes.', 'success');
+    } else {
+      const resolverReady = await createConflictResolution(operation, remote);
+      if (resolverReady === 'remote-deleted') {
+        await showConflictResolverFor(operation.note_id);
+      } else if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
+      else showToast('A conflict copy was created so your changes are safe.', 'warning');
+    }
+    return;
   }
+  if (acknowledgement.status !== 'applied') throw new Error('unknown sync acknowledgement');
+  if (operation.type === 'prefs.save') {
+    prefs = normalizePrefs({...prefs, revision: acknowledgement.revision || prefs.revision});
+    localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    applyPrefs();
+  }
+  if (operation.type === 'note.save') {
+    const acknowledgedNote = operation.note;
+    const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
+    const local = await getLocalNote(operation.note_id);
+    if (local) {
+      await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+    }
+    if (currentNoteId === operation.note_id) {
+      currentRevision = acknowledgement.revision || 0;
+      currentBaseRevision = hasLater ? acknowledgement.revision : null;
+    }
+  }
+  await removePendingOperationIfIdentityMatches(operation.id, operation);
 }
 
 async function flushPendingChanges() {
   let pushed = false;
+  let maxOperations = syncPushBatchLimit;
   for (;;) {
-    const operations = await pendingOperations();
+    const deviceID = await syncDeviceID();
+    const operations = await claimPendingOperationBatch(deviceID, maxOperations, syncPushBatchByteLimit);
     if (!operations.length) return pushed;
-    const operation = operations[0];
-    const outgoing = {
-      client_sequence: operation.client_sequence,
-      op_id: operation.op_id,
-      type: operation.type,
-      note_id: operation.note_id,
-      base_revision: operation.base_revision,
-    };
-    if (operation.type === 'note.save') {
-      outgoing.title = operation.note.title;
-      outgoing.tags = operation.note.tags;
-      outgoing.content = operation.note.content;
-      outgoing.base_content = operation.note.base_content || '';
-    } else if (operation.type === 'prefs.save') {
-      outgoing.prefs = operation.prefs;
-    }
-    syncingQueueOperationID = operation.id;
-    let result;
-    try {
-      result = await syncFetch('/api/sync/push', {
-        method: 'POST',
-        body: JSON.stringify({device_id: await syncDeviceID(), operations: [outgoing]}),
-      });
-    } finally {
-      syncingQueueOperationID = null;
-    }
+    const result = await syncFetch('/api/sync/push', {
+      method: 'POST',
+      body: JSON.stringify({device_id: deviceID, operations: operations.map(outgoingSyncOperation)}),
+    });
     pushed = true;
     if (result.response.status === 401) {
       requireAuthentication();
-      const error = new Error('sign in required to sync');
-      error.responseStatus = 401;
-      throw error;
+      throw apiErrorFromPayload(result.data, 401, 'Unauthorized');
     }
     if (result.response.status === 409) {
       const expected = Number(result.data?.expected_sequence);
@@ -1166,43 +1767,78 @@ async function flushPendingChanges() {
         showToast('Recovered a local sync gap. Retrying your changes.', 'warning');
         continue;
       }
-      throw new Error(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict');
+      throw new APIError(expected ? `sync sequence gap; expected ${expected}` : 'sync sequence conflict', {
+        status: 409,
+        code: 'sync_sequence_conflict',
+        retryable: false,
+      });
     }
     if (!result.response.ok) {
-      const error = new Error(typeof result.data === 'string' ? result.data : 'sync failed');
-      error.responseStatus = result.response.status;
-      throw error;
-    }
-    const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
-    if (!acknowledgement) throw new Error('sync acknowledgement missing');
-    if (acknowledgement.status === 'compacted') {
-      await acknowledgeCompactedOperation(operation);
-      continue;
-    }
-    if (acknowledgement.status === 'conflict') {
-      if (await mergeConflictedNote(operation)) {
-        showToast('Merged your non-overlapping changes.', 'success');
-      } else {
-        const resolverReady = await createConflictResolution(operation);
-        if (resolverReady) showToast('Conflicting edits need your review.', 'warning');
-        else showToast('A conflict copy was created so your changes are safe.', 'warning');
+      const permanent = result.response.status === 400 || result.response.status === 413 || result.data?.permanent === true;
+      if (permanent) {
+        if (operations.length > 1) {
+          maxOperations = result.response.status === 413 ? Math.max(1, Math.floor(maxOperations / 2)) : 1;
+          continue;
+        }
+        if (await quarantineQueueOperation(operations[0], typeof result.data === 'string' ? result.data : result.data?.error)) {
+          showToast('A local change needs attention before it can sync.', 'warning');
+          continue;
+        }
       }
-      continue;
+      throw apiErrorFromPayload(result.data, result.response.status, result.response.statusText);
     }
-    if (operation.type === 'note.save') {
-      const acknowledgedNote = operation.note;
-      const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
-      const local = await getLocalNote(operation.note_id);
-      if (local) {
-        await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
-      }
-      if (currentNoteId === operation.note_id) {
-        currentRevision = acknowledgement.revision || 0;
-        currentBaseRevision = hasLater ? acknowledgement.revision : null;
-      }
+    for (const operation of operations) {
+      const acknowledgement = result.data?.acknowledged?.find(item => item.op_id === operation.op_id);
+      if (!acknowledgement) throw new Error('sync acknowledgement missing');
+      await applySyncAcknowledgement(operation, acknowledgement);
     }
-    await removePendingOperation(operation.id);
   }
+}
+
+function preferenceValuesEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function resolvePreferenceConflict(operation) {
+  const remote = await api('/api/prefs', {syncRequest: true});
+  const payload = operation.prefs || {};
+  const patch = payload._sync_patch || {};
+  const base = payload._sync_base || {};
+  const safePatch = {};
+  const conflicts = [];
+  Object.entries(patch).forEach(([key, desired]) => {
+    const current = remote[key];
+    if (!(key in base) || (!preferenceValuesEqual(current, base[key]) && !preferenceValuesEqual(current, desired))) {
+      conflicts.push(key);
+    } else if (!preferenceValuesEqual(current, desired)) {
+      safePatch[key] = desired;
+    }
+  });
+
+  const next = normalizePrefs({...remote, ...safePatch});
+  await withOfflineStore(['queue', 'state'], 'readwrite', async stores => {
+    const queued = await requestValue(stores.queue.get(operation.id));
+    if (!queued || queued.op_id !== operation.op_id || queued.client_sequence !== operation.client_sequence || queueOperationPayload(queued) !== queueOperationPayload(operation)) {
+      throw new Error('preference operation changed before conflict resolution');
+    }
+    await requestValue(stores.queue.delete(operation.id));
+    if (Object.keys(safePatch).length) {
+      const safeBase = Object.fromEntries(Object.keys(safePatch).map(key => [key, remote[key]]));
+      await queueOperationInStores(stores, {
+        type: 'prefs.save',
+        note_id: '__prefs__',
+        base_revision: remote.revision,
+        prefs: {...next, _sync_patch: safePatch, _sync_base: safeBase},
+      });
+    }
+  });
+  prefs = next;
+  localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+  applyPrefs();
+  if (conflicts.length) {
+    showToast('Some preferences changed on another device. Those settings were kept.', 'warning');
+  }
+  scheduleSync();
 }
 
 function mergeSyncScheduleOptions(options = {}) {
@@ -1213,18 +1849,93 @@ function mergeSyncScheduleOptions(options = {}) {
   };
 }
 
+async function acquireSyncLease() {
+  const now = Date.now();
+  return withOfflineStore(['state'], 'readwrite', async stores => {
+    const current = await requestValue(stores.state.get(syncLeaseKey));
+    const lease = current?.value;
+    if (lease && lease.owner !== syncTabID && Number(lease.expiresAt) > now) return false;
+    await requestValue(stores.state.put({
+      key: syncLeaseKey,
+      value: {owner: syncTabID, expiresAt: now + syncLeaseDurationMs},
+    }));
+    return true;
+  });
+}
+
+async function renewSyncLease() {
+  const now = Date.now();
+  try {
+    await withOfflineStore(['state'], 'readwrite', async stores => {
+      const current = await requestValue(stores.state.get(syncLeaseKey));
+      if (current?.value?.owner !== syncTabID) return;
+      await requestValue(stores.state.put({
+        key: syncLeaseKey,
+        value: {owner: syncTabID, expiresAt: now + syncLeaseDurationMs},
+      }));
+    });
+  } catch (error) {
+    console.warn('could not renew sync lease', error);
+  }
+}
+
+async function releaseSyncLease() {
+  if (syncLeaseRenewTimer) {
+    clearInterval(syncLeaseRenewTimer);
+    syncLeaseRenewTimer = null;
+  }
+  await withOfflineStore(['state'], 'readwrite', async stores => {
+    const current = await requestValue(stores.state.get(syncLeaseKey));
+    if (current?.value?.owner === syncTabID) await requestValue(stores.state.delete(syncLeaseKey));
+  });
+}
+
+async function withSyncLeadership(work) {
+  if (navigator.locks && typeof navigator.locks.request === 'function') {
+    let acquired = false;
+    let result;
+    try {
+      await navigator.locks.request('mdnotes-sync', {ifAvailable: true}, async lock => {
+        if (!lock) return;
+        acquired = true;
+        result = await work();
+      });
+      if (acquired) return result;
+      // A normal null result means another tab owns the Web Lock. That owner
+      // does not also hold the IndexedDB fallback lease, so falling through
+      // would allow both tabs to synchronize concurrently.
+      scheduleSync({}, 500);
+      return false;
+    } catch (error) {
+      if (acquired) throw error;
+      console.warn('Web Locks unavailable; using IndexedDB sync lease', error);
+    }
+  }
+
+  if (!await acquireSyncLease()) {
+    scheduleSync({}, 500);
+    return false;
+  }
+  syncLeaseRenewTimer = setInterval(() => { void renewSyncLease(); }, syncLeaseDurationMs / 3);
+  try {
+    return await work();
+  } finally {
+    await releaseSyncLease();
+  }
+}
+
 function scheduleSync(options = {}, delayMs = 75) {
   mergeSyncScheduleOptions(options);
+  if (document.visibilityState === 'hidden') return;
   if (syncScheduleTimer) return;
   const delay = Math.max(delayMs, syncRetryDelayMs);
   syncScheduleTimer = setTimeout(async () => {
     syncScheduleTimer = null;
-    const requested = syncScheduleOptions;
-    syncScheduleOptions = {};
     if (document.visibilityState === 'hidden') {
-      scheduleSync(requested, 1000);
       return;
     }
+    const requested = syncScheduleOptions;
+    syncScheduleOptions = {};
     if (syncInFlight) {
       scheduleSync(requested, 100);
       return;
@@ -1243,7 +1954,7 @@ function scheduleSync(options = {}, delayMs = 75) {
   }, delay);
 }
 
-async function syncNow(options = {}) {
+async function performSync(options = {}) {
   const preserveSnackbar = Boolean(options.preserveSnackbar);
   let reconcile = Boolean(options.reconcile);
   if (syncScheduleTimer) {
@@ -1316,6 +2027,11 @@ async function syncNow(options = {}) {
   } finally {
     syncInFlight = false;
   }
+}
+
+async function syncNow(options = {}) {
+  if (syncInFlight) return false;
+  return withSyncLeadership(() => performSync(options));
 }
 
 const sseStaleAfterMs = 70000;
@@ -1411,24 +2127,34 @@ $('#login-form').addEventListener('submit', async e => {
   authenticationRequired = false;
   clearSyncDiagnostic();
   const pw = e.target.password.value;
-  const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
-  if (res) {
+  try {
+    const res = await api('/api/login', {method:'POST', body:JSON.stringify({password:pw})});
     $('#login-error').textContent = '';
     cacheAppVersion(res);
     await loadPrefs();
     await restoreRoute();
     connectServerEvents();
     scheduleSync({reconcile: true});
-  } else {
-    $('#login-error').textContent = 'Wrong password';
+  } catch (error) {
+    $('#login-error').textContent = error.code === 'invalid_credentials' ? 'Wrong password' : error.code === 'login_rate_limited' ? 'Too many attempts. Please try again later.' : 'Could not sign in. Please try again.';
   }
 });
 
 $('#logout-btn').addEventListener('click', async () => {
   cancelActiveSyncRequests();
   disconnectServerEvents();
-  await api('/api/logout', {method:'POST'});
-  await clearOfflineData();
+  try {
+    await api('/api/logout', {method:'POST'});
+  } catch (error) {
+    console.warn('server logout failed; clearing local session data', error);
+  }
+  try {
+    await clearOfflineData();
+  } catch (error) {
+    console.error('could not clear local data during logout', error);
+    showToast('Close other app tabs, then try signing out again.', 'warning');
+    return;
+  }
   localStorage.removeItem('mdnotes-offline-ready');
   localStorage.removeItem('mdnotes-prefs');
   show(screens.login);
@@ -1450,10 +2176,10 @@ function renderDashboard(notes, conflicts) {
   const tags = [...new Set(notes.flatMap(note => (note.tags || '').split(',').map(tag => tag.trim()).filter(Boolean)))].sort((a, b) => a.localeCompare(b));
   if (currentTag && !tags.includes(currentTag)) currentTag = null;
   const bar = $('#tag-bar');
-  let html = '<span class="tag'+(currentTag?'':' active')+'" data-tag="">All</span>';
+  let html = '<button type="button" class="tag'+(currentTag?'':' active')+'" data-tag="" aria-pressed="'+(currentTag ? 'false' : 'true')+'">All</button>';
   tags.forEach(t => {
     const active = t === currentTag ? ' active' : '';
-    html += `<span class="tag${active}" data-tag="${esc(t)}">${esc(t)}</span>`;
+    html += `<button type="button" class="tag${active}" data-tag="${esc(t)}" aria-pressed="${active ? 'true' : 'false'}">${esc(t)}</button>`;
   });
   bar.innerHTML = html;
   bar.querySelectorAll('.tag').forEach(el => {
@@ -1465,15 +2191,17 @@ function renderDashboard(notes, conflicts) {
   if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
-    list.innerHTML = '<div class="note-empty">No notes yet</div>';
+    list.innerHTML = '<li class="note-empty">No notes yet</li>';
     return;
   }
   list.innerHTML = notes.map(n => `
-    <div class="note-item" data-id="${esc(n.id)}">
+    <li>
+      <button type="button" class="note-item" data-id="${esc(n.id)}">
       <div class="note-title">${esc(n.title || 'Untitled')}${conflicts.has(n.id) ? '<span class="note-conflict">Conflict</span>' : ''}</div>
       <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
       ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
-    </div>
+      </button>
+    </li>
   `).join('');
   list.querySelectorAll('.note-item').forEach(el => {
     el.addEventListener('click', () => openNote(el.dataset.id));
@@ -1503,8 +2231,12 @@ async function loadDashboard({sync = true} = {}) {
 }
 
 function applyEditorPrefs() {
-  $('.meta-pane').classList.toggle('collapsed', prefs.collapseDetails);
+  const collapsed = Boolean(prefs.collapseDetails);
+  $('.meta-pane').classList.toggle('collapsed', collapsed);
+  $('.meta-toggle').setAttribute('aria-expanded', String(!collapsed));
   $('#editor').classList.toggle('header-hidden', prefs.hideHeaderOnFullscreen && panelState !== 'both');
+  document.documentElement.dataset.statusDisplay = prefs.statusDisplay;
+  $('#editor').classList.toggle('hide-save-button', Boolean(prefs.hideSaveButton));
   if (prefs.hideToolbar) {
     $('.fmt-bar').classList.add('hidden');
   } else {
@@ -1518,6 +2250,7 @@ function startNewNote(title = '') {
   if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
+  editorSessionGeneration++;
   currentNoteId = newLocalNoteID();
   currentRevision = 0;
   currentBaseRevision = null;
@@ -1552,6 +2285,7 @@ $('#back-btn').addEventListener('click', async () => {
 
 function showNoteInEditor(data) {
   setPanelState(prefs.hidePreview ? 'editor' : 'both');
+  editorSessionGeneration++;
   currentNoteId = data.id;
   currentRevision = data.revision || 0;
   currentBaseRevision = data.base_revision ?? null;
@@ -1568,7 +2302,12 @@ function showNoteInEditor(data) {
 
 async function openNote(id, {route = 'push'} = {}) {
   if (saveTimer) clearTimeout(saveTimer);
+  if (localSaveTimer) clearTimeout(localSaveTimer);
   if (previewTimer) clearTimeout(previewTimer);
+  if (!screens.editor.classList.contains('hidden') && currentNoteId !== id && (isDirty || localSavePromise)) {
+    const saved = await saveCurrentNote(false);
+    if (saved === false) return;
+  }
   const data = await getLocalNote(id);
   if (!data) return;
   showNoteInEditor(data);
@@ -1597,12 +2336,22 @@ async function followWikiLink(title) {
   scheduleSync();
 }
 
-async function restoreRoute() {
+async function restoreRoute({fetchRemote = false} = {}) {
   const noteID = noteIDFromLocation();
   if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
   if (noteID && await getLocalNote(noteID)) {
     await openNote(noteID, {route: 'none'});
     return;
+  }
+  if (noteID && fetchRemote && !await hasPendingOperation(noteID) && !await getUnresolvedConflict(noteID)) {
+    try {
+      const remote = await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true, throwOnError: true});
+      await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+      await openNote(noteID, {route: 'none'});
+      return;
+    } catch (error) {
+      if (error?.responseStatus !== 404) return;
+    }
   }
   if (noteID) {
     setDashboardRoute({replace: true});
@@ -1612,6 +2361,19 @@ async function restoreRoute() {
   await loadDashboard({sync: false});
 }
 
+async function restoreCachedStartup() {
+  const noteID = noteIDFromLocation();
+  if (noteID && await getLocalNote(noteID)) {
+    await openNote(noteID, {route: 'none'});
+    return;
+  }
+  await loadDashboard({sync: false});
+  const conflicts = await unresolvedConflictIDs();
+  for (const conflictID of conflicts) {
+    if (await getLocalNote(conflictID) && await showConflictResolverFor(conflictID)) break;
+  }
+}
+
 // --- Autosave ---
 function markDirty() {
   if (!isDirty) {
@@ -1619,32 +2381,46 @@ function markDirty() {
   }
 }
 
-async function saveCurrentNote(trySync = true) {
-  const title = $('#note-title').value.trim() || 'Untitled';
-  const tags = $('#note-tags').value.trim();
-  const content = $('#note-content').value;
+function readEditorSnapshot() {
+  return {
+    title: $('#note-title').value.trim() || 'Untitled',
+    tags: $('#note-tags').value.trim(),
+    content: $('#note-content').value,
+  };
+}
 
-  const data = {title, tags, content};
-  if (currentNoteId) data.id = currentNoteId;
+function editorSnapshotIsCurrent(snapshot) {
+  return editorSessionGeneration === snapshot.sessionGeneration &&
+    currentNoteId === snapshot.noteID &&
+    readEditorSnapshot().title === snapshot.title &&
+    readEditorSnapshot().tags === snapshot.tags &&
+    readEditorSnapshot().content === snapshot.content;
+}
 
-  if (currentNoteId && data.title === savedSnapshot.title && data.tags === savedSnapshot.tags && data.content === savedSnapshot.content) {
+async function persistEditorSnapshot(snapshot, trySync) {
+  if (editorSnapshotIsCurrent(snapshot) &&
+      snapshot.title === savedSnapshot.title &&
+      snapshot.tags === savedSnapshot.tags &&
+      snapshot.content === savedSnapshot.content) {
     isDirty = false;
     if (trySync) await syncNow();
-    return;
+    return true;
   }
-  if (!currentNoteId) currentNoteId = newLocalNoteID();
-  const existing = await getLocalNote(currentNoteId);
-  const baseRevision = existing?.pending ? existing.base_revision : (currentBaseRevision ?? currentRevision ?? 0);
+
+  const existing = await getLocalNote(snapshot.noteID);
+  const baseRevision = existing?.pending ? existing.base_revision : (snapshot.baseRevision ?? 0);
   const baseContent = existing?.pending ? (existing.base_content ?? '') : (existing?.content || '');
   const baseTitle = existing?.pending ? (existing.base_title ?? existing.title ?? '') : (existing?.title || '');
   const baseTags = existing?.pending ? (existing.base_tags ?? existing.tags ?? '') : (existing?.tags || '');
   const now = new Date().toISOString();
   const local = {
     ...existing,
-    ...data,
-    id: currentNoteId,
-    filename: existing?.filename || `${currentNoteId}.md`,
-    revision: existing?.revision ?? currentRevision ?? 0,
+    title: snapshot.title,
+    tags: snapshot.tags,
+    content: snapshot.content,
+    id: snapshot.noteID,
+    filename: existing?.filename || `${snapshot.noteID}.md`,
+    revision: existing?.revision ?? snapshot.revision ?? 0,
     base_revision: baseRevision,
     base_content: baseContent,
     base_title: baseTitle,
@@ -1653,33 +2429,100 @@ async function saveCurrentNote(trySync = true) {
     created_at: existing?.created_at || now,
     updated_at: now,
   };
+  const unresolved = await getUnresolvedConflict(snapshot.noteID);
+  if (unresolved?.kind === 'remote-deleted') {
+    const conflictLocal = {...local, pending: false};
+    try {
+      await withOfflineStore(['notes', 'state'], 'readwrite', async stores => {
+        await requestValue(stores.notes.put(conflictLocal));
+        await requestValue(stores.state.put({
+          key: unresolvedConflictKey(snapshot.noteID),
+          value: {...unresolved, local: conflictLocal},
+        }));
+      });
+    } catch (error) {
+      console.error('local conflict update failed', error);
+      showToast('Could not save locally. Free browser storage and try again.', 'warning');
+      return false;
+    }
+    if (editorSnapshotIsCurrent(snapshot)) {
+      currentBaseRevision = null;
+      savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
+      isDirty = false;
+      if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+      setIdleSyncStatus();
+    }
+    return true;
+  }
   try {
-    await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: currentNoteId, base_revision: baseRevision, note: local});
+    await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});
   } catch (error) {
     console.error('local save failed', error);
     showToast('Could not save locally. Free browser storage and try again.', 'warning');
     return false;
   }
-  currentBaseRevision = baseRevision;
-  savedSnapshot = { title: data.title, tags: data.tags, content: data.content };
-  isDirty = false;
-  if (noteIDFromLocation() !== currentNoteId) setNoteRoute(currentNoteId);
-  setIdleSyncStatus();
+
+  // The IndexedDB write may have completed after another editor session was
+  // opened or after more text was entered. Only this exact session/snapshot
+  // may update the live editor state.
+  if (editorSnapshotIsCurrent(snapshot)) {
+    currentBaseRevision = baseRevision;
+    savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
+    isDirty = false;
+    if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+    setIdleSyncStatus();
+  }
   if (trySync) await syncNow();
+  return true;
+}
+
+function saveCurrentNote(trySync = true) {
+  localSaveRequested = true;
+  localSaveTrySync = localSaveTrySync || trySync;
+  if (localSavePromise) return localSavePromise;
+
+  localSavePromise = (async () => {
+    let result = true;
+    while (localSaveRequested) {
+      localSaveRequested = false;
+      const requestedTrySync = localSaveTrySync;
+      localSaveTrySync = false;
+      const noteID = currentNoteId || newLocalNoteID();
+      if (!currentNoteId) currentNoteId = noteID;
+      const data = readEditorSnapshot();
+      const snapshot = {
+        ...data,
+        noteID,
+        revision: currentRevision,
+        baseRevision: currentBaseRevision ?? currentRevision ?? 0,
+        sessionGeneration: editorSessionGeneration,
+      };
+      result = await persistEditorSnapshot(snapshot, requestedTrySync);
+    }
+    return result;
+  })().finally(() => {
+    localSavePromise = null;
+  });
+  return localSavePromise;
 }
 
 let saveTimer = null;
 let localSaveTimer = null;
 let previewTimer = null;
+let localSavePromise = null;
+let localSaveRequested = false;
+let localSaveTrySync = false;
 
 function scheduleSave() {
   if (localSaveTimer) clearTimeout(localSaveTimer);
   localSaveTimer = setTimeout(() => {
-    if (isDirty) saveCurrentNote(false);
+    localSaveTimer = null;
+    if (isDirty) void saveCurrentNote(false);
   }, 250);
   if (!prefs.autoSave) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    saveTimer = null;
     // The 250ms timer may already have durably saved this edit to IndexedDB
     // and cleared isDirty. Still call saveCurrentNote: its unchanged-note path
     // replays the queued operation, which is the intended 2s idle sync.
@@ -1687,7 +2530,7 @@ function scheduleSave() {
   }, 2000);
 }
 
-$('#save-btn').addEventListener('click', () => { if (saveTimer) clearTimeout(saveTimer); saveCurrentNote(); });
+$('#save-btn').addEventListener('click', () => { if (saveTimer) clearTimeout(saveTimer); void saveCurrentNote(); });
 $('#note-title').addEventListener('input', () => { markDirty(); scheduleSave(); });
 $('#note-tags').addEventListener('input', () => { markDirty(); scheduleSave(); });
 
@@ -1697,7 +2540,7 @@ tablePicker.id = 'table-picker';
 tablePicker.className = 'table-picker hidden';
 tablePicker.setAttribute('role', 'dialog');
 tablePicker.setAttribute('aria-label', 'Choose table size');
-tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="grid"></div>';
+tablePicker.innerHTML = '<div class="table-picker-label" aria-live="polite">Table</div><div class="table-grid" role="group" aria-label="Table size options"></div>';
 document.body.append(tablePicker);
 
 const tableGrid = tablePicker.querySelector('.table-grid');
@@ -1712,7 +2555,6 @@ for (let row = 1; row <= tablePickerRows; row++) {
     cell.className = 'table-grid-cell';
     cell.dataset.rows = String(row);
     cell.dataset.columns = String(column);
-    cell.setAttribute('role', 'gridcell');
     cell.setAttribute('aria-label', `${column} columns by ${row} rows`);
     tableGrid.append(cell);
   }
@@ -1913,7 +2755,9 @@ $('#note-content').addEventListener('keydown', e => {
 
 // --- Meta pane toggle ---
 $('.meta-toggle')?.addEventListener('click', () => {
-  $('.meta-pane').classList.toggle('collapsed');
+  const pane = $('.meta-pane');
+  const collapsed = pane.classList.toggle('collapsed');
+  $('.meta-toggle').setAttribute('aria-expanded', String(!collapsed));
 });
 
 // --- Panel toggle ---
@@ -1948,6 +2792,10 @@ function setPanelState(state) {
     button.setAttribute('aria-label', label);
     button.setAttribute('aria-pressed', String(panelWide));
     button.querySelector('use').setAttribute('href', panelWide ? '#icon-width-reading' : '#icon-width-full');
+  });
+  document.querySelectorAll('.panel-switch').forEach(button => {
+    const targetVisible = state === 'both' || state === button.dataset.panelSwitch;
+    button.setAttribute('aria-expanded', String(targetVisible));
   });
   applyPanelRatio();
   if (state !== 'editor') schedulePreviewCheck();
@@ -2015,6 +2863,7 @@ applyPanelRatio();
 
 // --- Cursor preview highlight ---
 let previewBlocks = [];
+let previewBlockRanges = [];
 function isPreviewVisible() {
   return !screens.editor.classList.contains('hidden') && panelState !== 'editor';
 }
@@ -2035,6 +2884,24 @@ function scheduleHighlight() {
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
+  previewBlockRanges = [];
+  const source = $('#note-content').value;
+  if (!source || typeof marked === 'undefined' || typeof marked.lexer !== 'function') return;
+  try {
+    const ranges = [];
+    let offset = 0;
+    for (const token of marked.lexer(source, markdownRenderOptions())) {
+      const raw = typeof token.raw === 'string' ? token.raw : '';
+      if (!raw) continue;
+      const start = source.indexOf(raw, offset);
+      if (start < 0) continue;
+      ranges.push({start, end: start + raw.length});
+      offset = start + raw.length;
+    }
+    if (ranges.length === previewBlocks.length) previewBlockRanges = ranges;
+  } catch (_) {
+    previewBlockRanges = [];
+  }
 }
 function highlightBlock() {
   if (!isPreviewVisible()) return;
@@ -2050,9 +2917,15 @@ function highlightBlock() {
   const text = ta.value;
   const pos = ta.selectionStart;
   if (!text.trim() || !previewBlocks.length) return;
-  const before = text.slice(0, pos);
-  const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
-  let idx = Math.max(0, nonEmpty.length - 1);
+  let idx = -1;
+  if (previewBlockRanges.length === previewBlocks.length) {
+    idx = previewBlockRanges.findIndex(range => pos <= range.end);
+    if (idx < 0) idx = previewBlockRanges.length - 1;
+  } else {
+    const before = text.slice(0, pos);
+    const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
+    idx = Math.max(0, nonEmpty.length - 1);
+  }
   if (idx >= previewBlocks.length) idx = previewBlocks.length - 1;
   previewBlocks[idx]?.classList.add('highlight');
 }
@@ -2061,14 +2934,21 @@ function highlightBlock() {
 $('#delete-btn').addEventListener('click', async () => {
   if (!currentNoteId) return;
   if (!confirm('Delete this note?')) return;
-  const local = await getLocalNote(currentNoteId);
-  if (!local) return;
-  const pending = await hasPendingOperation(currentNoteId);
-  if (pending && (local.base_revision || 0) === 0) {
-    await removeLocalNoteAndSupersede(currentNoteId, 0);
-  } else {
-    await removeLocalNoteAndQueue(currentNoteId, {type: 'note.delete', note_id: currentNoteId, base_revision: local.base_revision ?? local.revision});
+  const noteID = currentNoteId;
+  if (isDirty || localSavePromise) {
+    const saved = await saveCurrentNote(false);
+    if (saved === false || currentNoteId !== noteID) return;
   }
+  const local = await getLocalNote(noteID);
+  if (!local) return;
+  const pending = await pendingOperationsForNote(noteID);
+  const hasAttemptedOperation = pending.some(operation => Boolean(operation.attempted_at));
+  if (pending.length && !hasAttemptedOperation && (local.base_revision || 0) === 0) {
+    await removeLocalNoteAndSupersede(noteID, 0);
+  } else {
+    await removeLocalNoteAndQueue(noteID, {type: 'note.delete', note_id: noteID, base_revision: local.base_revision ?? local.revision});
+  }
+  editorSessionGeneration++;
   currentNoteId = null;
   currentRevision = 0;
   currentBaseRevision = null;
@@ -2127,6 +3007,65 @@ function linkifyWikiLinks(container) {
   }
 }
 
+const previewAllowedElements = new Set([
+  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HR', 'IMG', 'INPUT', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'SUB', 'SUP', 'TABLE',
+  'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL',
+]);
+const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'title', 'type']);
+
+function safePreviewURL(value, allowMailto = false) {
+  if (!value || /[\u0000-\u001f]/.test(value)) return false;
+  try {
+    const url = new URL(value, window.location.href);
+    return ['http:', 'https:'].includes(url.protocol) || (allowMailto && url.protocol === 'mailto:');
+  } catch (_) {
+    return false;
+  }
+}
+
+function sanitizePreview(container) {
+  [...container.querySelectorAll('*')].forEach(element => {
+    if (!previewAllowedElements.has(element.tagName)) {
+      element.remove();
+      return;
+    }
+    const attributeNames = [];
+    for (let index = 0; index < element.attributes.length; index++) {
+      const attribute = element.attributes.item(index);
+      if (attribute?.name) attributeNames.push(attribute.name);
+    }
+    attributeNames.forEach(attributeName => {
+      const name = attributeName.toLowerCase();
+      if (!previewAllowedAttributes.has(name) || name.startsWith('on')) element.removeAttribute(attributeName);
+    });
+    if (element.tagName === 'A') {
+      const href = element.getAttribute('href');
+      if (href && !safePreviewURL(href, true)) element.removeAttribute('href');
+    }
+    if (element.tagName === 'IMG') {
+      const src = element.getAttribute('src');
+      if (!src || !safePreviewURL(src)) {
+        element.remove();
+        return;
+      }
+      element.setAttribute('loading', 'lazy');
+      element.setAttribute('decoding', 'async');
+    }
+    if (element.tagName === 'INPUT' && element.getAttribute('type') !== 'checkbox') element.remove();
+  });
+}
+
+function markdownRenderOptions() {
+  const options = {breaks:true, gfm:true};
+  if (typeof marked.Renderer === 'function') {
+    const renderer = new marked.Renderer();
+    renderer.html = token => esc(token.text ?? token.raw ?? '');
+    options.renderer = renderer;
+  }
+  return options;
+}
+
 $('#preview').addEventListener('click', event => {
   const link = event.target.closest('a[data-wiki-title]');
   if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -2142,7 +3081,8 @@ function updatePreview() {
     return;
   }
   if (typeof marked !== 'undefined' && marked.parse) {
-    $('#preview').innerHTML = marked.parse(md, {breaks:true,gfm:true});
+    $('#preview').innerHTML = marked.parse(md, markdownRenderOptions());
+    sanitizePreview($('#preview'));
     linkifyWikiLinks($('#preview'));
   } else {
     $('#preview').innerHTML = '<p><em>loading parser...</em></p>';
@@ -2186,6 +3126,8 @@ function legacyThemeID() {
 
 function normalizePrefs(value = {}, fallback = {}) {
   const merged = {...DEFAULT_PREFS, ...fallback, ...value};
+  merged.revision = Number.isSafeInteger(Number(merged.revision)) && Number(merged.revision) > 0 ? Number(merged.revision) : 1;
+  if (!['normal', 'compact', 'off'].includes(merged.statusDisplay)) merged.statusDisplay = DEFAULT_PREFS.statusDisplay;
   if (!value.theme && !fallback.theme) merged.theme = legacyThemeID();
   if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
   if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
@@ -2257,7 +3199,8 @@ async function applyFontsNow(clearCache = false) {
         link.addEventListener('error', reject, {once:true});
         setTimeout(() => reject(new Error('font load timed out')), 5000);
       });
-      await document.fonts.load(`1rem "${fontFamily}"`);
+      const loadedFaces = await document.fonts.load(`1rem "${fontFamily}"`);
+      if (!loadedFaces || loadedFaces.length === 0) throw new Error('font face unavailable');
       loaded.set(fontFamily, true);
     } catch (error) {
       link.remove();
@@ -2320,14 +3263,17 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-hidepreview').checked = prefs.hidePreview;
   $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
   $('#pref-hidetoolbar').checked = prefs.hideToolbar;
+  $('#pref-hidesave').checked = prefs.hideSaveButton;
   $('#pref-collapse').checked = prefs.collapseDetails;
   $('#pref-hidecursor').checked = prefs.hideCursorHighlight;
+  $('#pref-status').value = prefs.statusDisplay;
   $('#pref-theme').value = prefs.theme;
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
   $('#pref-font').value = prefs.fontFamily;
   $('#pref-editor-font').value = prefs.editorFontFamily;
   $('#pref-preview-font').value = prefs.previewFontFamily;
   openModal($('#prefs-modal'));
+  void checkFontAvailability(fontAvailability === 'unavailable');
 });
 
 $('#prefs-close').addEventListener('click', () => {
@@ -2339,9 +3285,19 @@ $('#prefs-modal .modal-backdrop').addEventListener('click', () => {
 });
 
 async function savePref(key, value) {
+  const previous = {...prefs};
   prefs = normalizePrefs({...prefs, [key]: value});
   localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
-  await queueOperation({type: 'prefs.save', note_id: '__prefs__', prefs: {...prefs}});
+  await queueOperation({
+    type: 'prefs.save',
+    note_id: '__prefs__',
+    base_revision: previous.revision || 1,
+    prefs: {
+      ...prefs,
+      _sync_patch: {[key]: prefs[key]},
+      _sync_base: {[key]: previous[key]},
+    },
+  });
   if (key === 'theme' || key === 'accentColor') applyTheme(prefs.theme);
   if (['fontFamily', 'editorFontFamily', 'previewFontFamily'].includes(key)) void applyFonts(true);
   applyEditorPrefs();
@@ -2360,6 +3316,9 @@ $('#pref-hideheader').addEventListener('change', function () {
 $('#pref-hidetoolbar').addEventListener('change', function () {
   savePref('hideToolbar', this.checked);
 });
+$('#pref-hidesave').addEventListener('change', function () {
+  savePref('hideSaveButton', this.checked);
+});
 $('#pref-collapse').addEventListener('change', function () {
   savePref('collapseDetails', this.checked);
 });
@@ -2371,6 +3330,7 @@ $('#pref-accent').addEventListener('change', function () { void savePref('accent
 $('#pref-font').addEventListener('change', function () { void savePref('fontFamily', this.value); });
 $('#pref-editor-font').addEventListener('change', function () { void savePref('editorFontFamily', this.value); });
 $('#pref-preview-font').addEventListener('change', function () { void savePref('previewFontFamily', this.value); });
+$('#pref-status').addEventListener('change', function () { void savePref('statusDisplay', this.value); });
 
 $$('.prefs-nav').forEach(button => button.addEventListener('click', () => {
   const section = button.dataset.prefSection;
@@ -2398,32 +3358,58 @@ $$('.prefs-nav').forEach(button => button.addEventListener('keydown', event => {
   tabs[next].click();
 }));
 
-async function checkFontAvailability() {
-  const probe = document.createElement('link');
-  probe.rel = 'stylesheet';
-  probe.href = fontCSSURL('Inter');
-  const loaded = await new Promise(resolve => {
-    const timeout = setTimeout(() => resolve(false), 5000);
-    probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
-    probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
-    document.head.append(probe);
-  });
-  probe.remove();
-  fontAvailability = loaded ? 'available' : 'unavailable';
-  $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
+async function checkFontAvailability(force = false) {
+  if (!force && (fontAvailability === 'available' || fontAvailability === 'unavailable')) return fontAvailability;
+  if (fontAvailabilityPromise) return fontAvailabilityPromise;
+  fontAvailability = 'checking';
+  $('#font-availability').textContent = 'Checking Google Fonts...';
   renderFontOptions();
-  if (fontAvailability === 'available') void applyFonts();
+
+  fontAvailabilityPromise = (async () => {
+    const probe = document.createElement('link');
+    probe.rel = 'stylesheet';
+    probe.href = fontCSSURL('Inter');
+    const stylesheetLoaded = await new Promise(resolve => {
+      const timeout = setTimeout(() => resolve(false), 5000);
+      probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
+      probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
+      document.head.append(probe);
+    });
+    probe.remove();
+    let faceLoaded = false;
+    if (stylesheetLoaded) {
+      try {
+        const loadedFaces = await document.fonts.load('1rem "Inter"');
+        faceLoaded = Boolean(loadedFaces && loadedFaces.length);
+      } catch (_) {}
+    }
+    fontAvailability = stylesheetLoaded && faceLoaded ? 'available' : 'unavailable';
+    $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
+    renderFontOptions();
+    if (fontAvailability === 'available') void applyFonts();
+    return fontAvailability;
+  })().finally(() => { fontAvailabilityPromise = null; });
+  return fontAvailabilityPromise;
+}
+
+function hasSelectedWebFont() {
+  return FONT_SLOTS.some(slot => prefs[slot.preference] && !isSystemFont(prefs[slot.preference]));
 }
 
 async function loadPrefs() {
-  const p = await api('/api/prefs');
+  let p = null;
+  try {
+    p = await api('/api/prefs');
+  } catch (error) {
+    console.warn('preferences unavailable; using cached preferences', error);
+  }
   if (p && !await hasPendingOperation('__prefs__')) {
     let cached = {};
     try { cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}'); } catch (_) {}
     prefs = normalizePrefs(p, cached);
     localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
     applyPrefs();
-    void checkFontAvailability();
+    if (hasSelectedWebFont()) void checkFontAvailability();
     return;
   }
   try {
@@ -2431,37 +3417,42 @@ async function loadPrefs() {
     if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
   applyPrefs();
-  void checkFontAvailability();
+  if (hasSelectedWebFont()) void checkFontAvailability();
 }
 
 // --- Init ---
 async function init() {
+  let localStartupReady = false;
   try {
+    await restoreCachedStartup();
+    localStartupReady = true;
+    $('#app').classList.remove('booting');
+
     const res = await api('/api/check');
     if (res) {
       cacheAppVersion(res);
-      await loadPrefs();
-      await restoreRoute();
+      void loadPrefs();
+      await restoreRoute({fetchRemote: true});
       connectServerEvents();
       scheduleSync({reconcile: true});
     } else if (authenticationRequired) {
       // api() has already displayed the sign-in screen. A cached offline copy
       // must never override that when the server explicitly returned 401.
-    } else if (localStorage.getItem('mdnotes-offline-ready') === '1') {
+    } else {
       cacheAppVersion();
-      await loadPrefs();
       setSyncStatus('offline');
       showOfflineNotice();
-      await restoreRoute();
-    } else {
-      show(screens.login);
-      $('#login-form input').focus();
     }
   } catch (error) {
     console.error('initialization failed', error);
-    show(screens.login);
-    $('#login-error').textContent = 'Could not start the app. Please reload.';
-    $('#login-form input').focus();
+    if (error?.responseStatus === 401) return;
+    if (localStartupReady) {
+      markServerOffline();
+    } else {
+      show(screens.login);
+      $('#login-error').textContent = 'Could not start the app. Please reload.';
+      $('#login-form input').focus();
+    }
   } finally {
     $('#app').classList.remove('booting');
   }
@@ -2476,20 +3467,35 @@ $$('.offline-retry').forEach(retry => retry.addEventListener('click', async () =
 }));
 
 // Service worker
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(error => console.warn('service worker registration failed', error));
+function registerServiceWorker(revision = appRevisionAtLoad) {
+  if (!('serviceWorker' in navigator)) return;
+  const requestedRevision = /^[A-Za-z0-9._-]{1,128}$/.test(revision || '') ? revision : 'legacy';
+  if (registeredServiceWorkerRevision === requestedRevision) return;
+  registeredServiceWorkerRevision = requestedRevision;
+  navigator.serviceWorker.register(`/sw.js?revision=${encodeURIComponent(requestedRevision)}`, {updateViaCache: 'none'}).catch(error => {
+    registeredServiceWorkerRevision = null;
+    console.warn('service worker registration failed', error);
+  });
 }
 
 window.addEventListener('popstate', () => { void restoreRoute(); });
 
 window.addEventListener('online', async () => {
   connectServerEvents();
+  if (hasSelectedWebFont()) {
+    fontAvailability = 'checking';
+    void checkFontAvailability();
+  }
   scheduleSync({reconcile: true});
 });
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     if (isDirty) saveCurrentNote(false);
+    if (syncScheduleTimer) {
+      clearTimeout(syncScheduleTimer);
+      syncScheduleTimer = null;
+    }
     cancelActiveSyncRequests();
   }
   if (document.visibilityState === 'visible') {

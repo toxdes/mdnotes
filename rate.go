@@ -113,6 +113,39 @@ func (rl *rateLimiter) recordLoginAttempt(ip string, success bool) error {
 	return nil
 }
 
+func (rl *rateLimiter) loginRetryAfter(ip string) (int, error) {
+	var count int
+	var updatedAt string
+	err := rl.db.QueryRow("SELECT count, updated_at FROM rate_limits WHERE ip = ? AND typ = 'login'", ip).Scan(&count, &updatedAt)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	updated, err := time.Parse(time.RFC3339, updatedAt)
+	if err != nil || time.Since(updated) >= loginAttemptWindow {
+		if _, deleteErr := rl.db.Exec("DELETE FROM rate_limits WHERE ip = ? AND typ = 'login'", ip); deleteErr != nil {
+			return 0, deleteErr
+		}
+		return 0, nil
+	}
+	if count < 5 {
+		return 0, nil
+	}
+	backoffSeconds := 1 << min(count-5, 8)
+	if backoffSeconds > 300 {
+		backoffSeconds = 300
+	}
+	remaining := time.Until(updated.Add(time.Duration(backoffSeconds) * time.Second))
+	if remaining <= 0 {
+		return 0, nil
+	}
+	// Retry-After is an integer number of seconds and must not round down to a
+	// time at which the request would still be rejected.
+	return int((remaining + time.Second - 1) / time.Second), nil
+}
+
 func (rl *rateLimiter) banCheckMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := rl.realIP(r)

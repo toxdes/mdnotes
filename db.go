@@ -62,17 +62,22 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 type prefs struct {
-	AutoSave               bool   `json:"autoSave"`
-	HidePreview            bool   `json:"hidePreview"`
-	HideHeaderOnFullscreen bool   `json:"hideHeaderOnFullscreen"`
-	HideToolbar            bool   `json:"hideToolbar"`
-	CollapseDetails        bool   `json:"collapseDetails"`
-	HideCursorHighlight    bool   `json:"hideCursorHighlight"`
-	Theme                  string `json:"theme,omitempty"`
-	AccentColor            string `json:"accentColor,omitempty"`
-	FontFamily             string `json:"fontFamily,omitempty"`
-	EditorFontFamily       string `json:"editorFontFamily,omitempty"`
-	PreviewFontFamily      string `json:"previewFontFamily,omitempty"`
+	Revision               int64                      `json:"revision,omitempty"`
+	AutoSave               bool                       `json:"autoSave"`
+	HidePreview            bool                       `json:"hidePreview"`
+	HideHeaderOnFullscreen bool                       `json:"hideHeaderOnFullscreen"`
+	HideToolbar            bool                       `json:"hideToolbar"`
+	HideSaveButton         bool                       `json:"hideSaveButton"`
+	CollapseDetails        bool                       `json:"collapseDetails"`
+	HideCursorHighlight    bool                       `json:"hideCursorHighlight"`
+	StatusDisplay          string                     `json:"statusDisplay,omitempty"`
+	Theme                  string                     `json:"theme,omitempty"`
+	AccentColor            string                     `json:"accentColor,omitempty"`
+	FontFamily             string                     `json:"fontFamily,omitempty"`
+	EditorFontFamily       string                     `json:"editorFontFamily,omitempty"`
+	PreviewFontFamily      string                     `json:"previewFontFamily,omitempty"`
+	SyncPatch              map[string]json.RawMessage `json:"_sync_patch,omitempty"`
+	SyncBase               map[string]json.RawMessage `json:"_sync_base,omitempty"`
 }
 
 type migration struct {
@@ -92,6 +97,11 @@ var migrations = []migration{
 	{version: 9, up: migrateSyncOperationPayloadSchema},
 	{version: 10, up: migrateFileOperationSchema},
 	{version: 11, up: migrateClearLegacyIPBans},
+	{version: 12, up: migrateFileOperationHashSchema},
+	{version: 13, up: migrateFileOperationRecoverySchema},
+	{version: 14, up: migrateSyncOperationCompactionSchema},
+	{version: 15, up: migratePreferenceRevisionSchema},
+	{version: 16, up: migrateRepairSyncOperationStats},
 }
 
 func initDB(db *sql.DB, databasePaths ...string) error {
@@ -412,26 +422,108 @@ func migrateFileOperationSchema(tx *sql.Tx) error {
 	return err
 }
 
+func migrateFileOperationHashSchema(tx *sql.Tx) error {
+	_, err := tx.Exec("ALTER TABLE file_operations ADD COLUMN expected_hash TEXT NOT NULL DEFAULT ''")
+	return err
+}
+
+func migrateFileOperationRecoverySchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		ALTER TABLE file_operations ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE file_operations ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+		ALTER TABLE file_operations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;`)
+	return err
+}
+
+func migrateSyncOperationCompactionSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE sync_operation_stats (
+			id              INTEGER PRIMARY KEY CHECK (id = 1),
+			operation_count INTEGER NOT NULL DEFAULT 0,
+			payload_bytes   INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO sync_operation_stats (id, operation_count, payload_bytes)
+		SELECT 1, COUNT(*), COALESCE(SUM(length(operation)), 0) FROM sync_operations;
+		CREATE INDEX idx_sync_operations_applied_at ON sync_operations(applied_at, device_id, client_sequence);`)
+	return err
+}
+
+func migratePreferenceRevisionSchema(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE prefs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`)
+	return err
+}
+
+func migrateRepairSyncOperationStats(tx *sql.Tx) error {
+	_, err := tx.Exec(`UPDATE sync_operation_stats
+		SET operation_count = (SELECT COUNT(*) FROM sync_operations),
+		    payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations)
+		WHERE id = 1`)
+	return err
+}
+
 func getPrefs(db *sql.DB) (*prefs, error) {
-	var data string
-	err := db.QueryRow("SELECT data FROM prefs WHERE id = 1").Scan(&data)
+	dbTx, err := db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	p := &prefs{AutoSave: true}
-	if err := json.Unmarshal([]byte(data), p); err != nil {
-		return nil, fmt.Errorf("decode preferences: %w", err)
+	defer dbTx.Rollback()
+	p, err := getPrefsTx(dbTx)
+	if err != nil {
+		return nil, err
 	}
 	return p, nil
 }
 
-func savePrefs(db *sql.DB, p *prefs) error {
-	b, err := json.Marshal(p)
+func getPrefsTx(tx *sql.Tx) (*prefs, error) {
+	var data string
+	var revision int64
+	if err := tx.QueryRow("SELECT data, revision FROM prefs WHERE id = 1").Scan(&data, &revision); err != nil {
+		return nil, err
+	}
+	p := &prefs{AutoSave: true, Revision: revision}
+	if err := json.Unmarshal([]byte(data), p); err != nil {
+		return nil, fmt.Errorf("decode preferences: %w", err)
+	}
+	p.Revision = revision
+	p.SyncPatch = nil
+	p.SyncBase = nil
+	return p, nil
+}
+
+func savePrefsTx(tx *sql.Tx, p *prefs, expectedRevision *int64) error {
+	current, err := getPrefsTx(tx)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec("UPDATE prefs SET data = ? WHERE id = 1", string(b))
-	return err
+	if expectedRevision != nil && *expectedRevision != current.Revision {
+		return errRevisionConflict
+	}
+	stored := *p
+	stored.Revision = 0
+	stored.SyncPatch = nil
+	stored.SyncBase = nil
+	b, err := json.Marshal(&stored)
+	if err != nil {
+		return err
+	}
+	nextRevision := current.Revision + 1
+	if _, err := tx.Exec("UPDATE prefs SET data = ?, revision = ? WHERE id = 1", string(b), nextRevision); err != nil {
+		return err
+	}
+	p.Revision = nextRevision
+	return nil
+}
+
+func savePrefs(db *sql.DB, p *prefs, expectedRevision *int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := savePrefsTx(tx, p, expectedRevision); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func listNotes(db *sql.DB, tag string) ([]note, error) {

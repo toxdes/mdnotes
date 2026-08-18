@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,10 +40,28 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	csp := result.Header().Get("Content-Security-Policy")
-	for _, directive := range []string{"script-src 'self'", "style-src 'self'", "connect-src 'self'", "worker-src 'self'", "object-src 'none'"} {
+	for _, directive := range []string{"script-src 'self'", "style-src 'self'", "connect-src 'self'", "connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com", "worker-src 'self'", "object-src 'none'"} {
 		if !strings.Contains(csp, directive) {
 			t.Fatalf("CSP %q is missing %q", csp, directive)
 		}
+	}
+}
+
+func TestAPIValidationErrorsUseStableJSONCodes(t *testing.T) {
+	a := &app{}
+	request := httptest.NewRequest(http.MethodGet, "/api/search?q="+strings.Repeat("x", 257), nil)
+	result := httptest.NewRecorder()
+	a.handleSearchNotes(result, request)
+
+	if result.Code != http.StatusBadRequest || !strings.Contains(result.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("validation response = status %d, content type %q", result.Code, result.Header().Get("Content-Type"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(result.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode validation response: %v", err)
+	}
+	if body["code"] != "search_query_too_long" || body["error"] != "search query is too long" {
+		t.Fatalf("validation body = %#v", body)
 	}
 }
 
@@ -71,6 +90,21 @@ func TestGzipMiddlewareCompressesErrorResponsesCorrectly(t *testing.T) {
 	}
 }
 
+func TestGzipMiddlewareLeavesServiceWorkerShellUncompressed(t *testing.T) {
+	handler := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("shell"))
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	request.Header.Set("X-MDNotes-Shell", "1")
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, request)
+
+	if result.Code != http.StatusOK || result.Header().Get("Content-Encoding") != "" || result.Body.String() != "shell" {
+		t.Fatalf("service worker shell response = status %d, encoding %q, body %q", result.Code, result.Header().Get("Content-Encoding"), result.Body.String())
+	}
+}
+
 func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {
@@ -83,7 +117,7 @@ func TestLegacyIPBansAreClearedByMigration(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("create migration table: %v", err)
 	}
-	for _, migration := range migrations[:len(migrations)-1] {
+	for _, migration := range migrations[:10] {
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin migration %d: %v", migration.version, err)
@@ -150,6 +184,111 @@ func TestRateLimiterBanIsTemporaryAndLoginWindowResets(t *testing.T) {
 	var count int
 	if err := db.QueryRow("SELECT count FROM rate_limits WHERE ip = ? AND typ = 'login'", "203.0.113.8").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("expired-window login count = %d, %v; want 1", count, err)
+	}
+}
+
+func TestLoginRateLimitExpiresAfterAdvertisedBackoff(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	updated := time.Now().UTC().Add(-2 * time.Second).Format(time.RFC3339)
+	if _, err := db.Exec("INSERT INTO rate_limits (ip, typ, count, updated_at) VALUES (?, 'login', 5, ?)", "203.0.113.10", updated); err != nil {
+		t.Fatalf("seed login limit: %v", err)
+	}
+
+	retryAfter, err := rl.loginRetryAfter("203.0.113.10")
+	if err != nil {
+		t.Fatalf("check login retry: %v", err)
+	}
+	if retryAfter != 0 {
+		t.Fatalf("retry after elapsed one-second backoff = %d; want 0", retryAfter)
+	}
+}
+
+func TestLoginRateLimitDoesNotBlockAuthenticatedRoutes(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	for range 5 {
+		if err := rl.recordLoginAttempt("203.0.113.9", false); err != nil {
+			t.Fatalf("record failed login: %v", err)
+		}
+	}
+	a := &app{db: db, password: "correct", sessions: newSessionStore(db), rl: rl}
+	login := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"wrong"}`))
+	login.RemoteAddr = "203.0.113.9:1234"
+	login.Header.Set("Content-Type", "application/json")
+	loginResult := httptest.NewRecorder()
+	a.handleLogin(loginResult, login)
+	if loginResult.Code != http.StatusTooManyRequests || loginResult.Header().Get("Retry-After") == "" {
+		t.Fatalf("rate-limited login = %d, retry-after %q", loginResult.Code, loginResult.Header().Get("Retry-After"))
+	}
+	var attempts int
+	if err := db.QueryRow("SELECT count FROM rate_limits WHERE ip = ? AND typ = 'login'", "203.0.113.9").Scan(&attempts); err != nil || attempts != 5 {
+		t.Fatalf("attempts after rate-limited request = %d, %v; want 5", attempts, err)
+	}
+
+	token, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	check := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	check.RemoteAddr = "203.0.113.9:1234"
+	check.AddCookie(&http.Cookie{Name: "session", Value: token})
+	checkResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(checkResult, check)
+	if checkResult.Code != http.StatusOK {
+		t.Fatalf("authenticated route after login limit = %d: %s", checkResult.Code, checkResult.Body.String())
+	}
+}
+
+func TestSuccessfulLoginReturnsAuthoritativeAppRevision(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	a := &app{db: db, password: "correct", sessions: newSessionStore(db), rl: rl}
+	request := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"correct"}`))
+	request.RemoteAddr = "203.0.113.11:1234"
+	response := httptest.NewRecorder()
+
+	a.handleLogin(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("login status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if body["ok"] != true || body["version"] != version || body["revision"] != appRevision {
+		t.Fatalf("login app identity = %#v; want version %q revision %q", body, version, appRevision)
 	}
 }
 
@@ -470,6 +609,21 @@ func TestSaveRejectsStaleOfflineRevisionBeforeReplacingFile(t *testing.T) {
 		t.Fatalf("first save status = %d: %s", firstResult.Code, firstResult.Body.String())
 	}
 
+	missingRevision := httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"id":"offline-note","title":"Unsafe","content":"unsafe body","tags":""}`))
+	missingRevision.Header.Set("Content-Type", "application/json")
+	missingRevisionResult := httptest.NewRecorder()
+	a.handleSaveNote(missingRevisionResult, missingRevision)
+	if missingRevisionResult.Code != http.StatusBadRequest {
+		t.Fatalf("missing save revision status = %d: %s", missingRevisionResult.Code, missingRevisionResult.Body.String())
+	}
+
+	missingDeleteRevision := httptest.NewRequest(http.MethodDelete, "/api/notes/offline-note", nil)
+	missingDeleteResult := httptest.NewRecorder()
+	a.handleDeleteNote(missingDeleteResult, missingDeleteRevision)
+	if missingDeleteResult.Code != http.StatusBadRequest {
+		t.Fatalf("missing delete revision status = %d: %s", missingDeleteResult.Code, missingDeleteResult.Body.String())
+	}
+
 	stale := httptest.NewRequest(http.MethodPost, "/api/notes", strings.NewReader(`{"id":"offline-note","title":"Stale","content":"stale body","tags":"","base_revision":0}`))
 	stale.Header.Set("Content-Type", "application/json")
 	staleResult := httptest.NewRecorder()
@@ -477,9 +631,72 @@ func TestSaveRejectsStaleOfflineRevisionBeforeReplacingFile(t *testing.T) {
 	if staleResult.Code != http.StatusConflict {
 		t.Fatalf("stale save status = %d: %s", staleResult.Code, staleResult.Body.String())
 	}
+	var conflict map[string]any
+	if err := json.Unmarshal(staleResult.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("decode stale save conflict: %v", err)
+	}
+	if conflict["code"] != "note_revision_conflict" || conflict["note_id"] != "offline-note" || conflict["current_revision"] != float64(1) {
+		t.Fatalf("stale save conflict = %#v", conflict)
+	}
 	data, err := os.ReadFile(filepath.Join(notesDir, "offline-note.md"))
 	if err != nil || string(data) != "first body" {
 		t.Fatalf("note file after stale save = %q, %v", data, err)
+	}
+}
+
+func TestNoteContentReadWaitsForNoteWriteLock(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(filepath.Join(dir, "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	config, err := newEncryptionConfig(dir, "test password", "")
+	if err != nil {
+		t.Fatalf("create encryption config: %v", err)
+	}
+	if err := upsertNote(db, "read-lock-note", "Read lock", "read-lock-note.md", ""); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	ciphertext, err := config.encryptNote([]byte("consistent content"), "read-lock-note")
+	if err != nil {
+		t.Fatalf("encrypt note: %v", err)
+	}
+	if err := writeNoteFile(filepath.Join(dir, "read-lock-note.md"), ciphertext); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	a := &app{db: db, notesDir: dir, encryption: config, noteCache: newNoteCache()}
+
+	a.noteMu.Lock()
+	result := make(chan struct {
+		data noteWithContent
+		err  error
+	}, 1)
+	go func() {
+		data, err := a.loadNoteWithContent("read-lock-note")
+		result <- struct {
+			data noteWithContent
+			err  error
+		}{data: data, err: err}
+	}()
+
+	select {
+	case <-result:
+		t.Fatal("note content read passed through the write lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	a.noteMu.Unlock()
+
+	select {
+	case read := <-result:
+		if read.err != nil || read.data.Revision != 1 || read.data.Content != "consistent content" {
+			t.Fatalf("note read = %#v, %v", read.data, read.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("note content read did not complete after releasing the lock")
 	}
 }
 
@@ -510,6 +727,84 @@ func TestSessionsPersistAcrossStoreRestart(t *testing.T) {
 	first.remove(token)
 	if newSessionStore(db).valid(token) {
 		t.Fatal("removed session remained valid")
+	}
+}
+
+func TestAuthenticatedActivityRenewsNearExpirySessions(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	a := &app{db: db, sessions: newSessionStore(db), rl: rl}
+
+	nearToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create near-expiry session: %v", err)
+	}
+	nearExpiry := time.Now().UTC().Add(sessionRenewalThreshold - time.Hour).Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", nearExpiry, sessionTokenHash(nearToken)); err != nil {
+		t.Fatalf("set near expiry: %v", err)
+	}
+	nearRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	nearRequest.AddCookie(&http.Cookie{Name: "session", Value: nearToken})
+	nearResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(nearResult, nearRequest)
+	if nearResult.Code != http.StatusOK {
+		t.Fatalf("near-expiry authenticated request = %d: %s", nearResult.Code, nearResult.Body.String())
+	}
+	refreshedCookie := nearResult.Result().Cookies()
+	if len(refreshedCookie) != 1 || refreshedCookie[0].MaxAge != int(sessionLifetime.Seconds()) {
+		t.Fatalf("renewal cookie = %#v; want max-age %d", refreshedCookie, int(sessionLifetime.Seconds()))
+	}
+	var renewedExpiry string
+	if err := db.QueryRow("SELECT expires_at FROM sessions WHERE token_hash = ?", sessionTokenHash(nearToken)).Scan(&renewedExpiry); err != nil {
+		t.Fatalf("read renewed expiry: %v", err)
+	}
+	renewedAt, err := time.Parse(time.RFC3339, renewedExpiry)
+	if err != nil || renewedAt.Before(time.Now().UTC().Add(sessionLifetime-2*time.Minute)) {
+		t.Fatalf("renewed expiry = %q; want approximately 180 days from now", renewedExpiry)
+	}
+
+	farToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create far-expiry session: %v", err)
+	}
+	farExpiry := time.Now().UTC().Add(sessionRenewalThreshold + time.Hour).Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", farExpiry, sessionTokenHash(farToken)); err != nil {
+		t.Fatalf("set far expiry: %v", err)
+	}
+	farRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	farRequest.AddCookie(&http.Cookie{Name: "session", Value: farToken})
+	farResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(farResult, farRequest)
+	if farResult.Code != http.StatusOK {
+		t.Fatalf("far-expiry authenticated request = %d: %s", farResult.Code, farResult.Body.String())
+	}
+	if got := farResult.Header().Get("Set-Cookie"); got != "" {
+		t.Fatalf("far-expiry request refreshed cookie %q", got)
+	}
+
+	expiredToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create expired session: %v", err)
+	}
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), sessionTokenHash(expiredToken)); err != nil {
+		t.Fatalf("set expired session: %v", err)
+	}
+	expiredRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	expiredRequest.AddCookie(&http.Cookie{Name: "session", Value: expiredToken})
+	expiredResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(expiredResult, expiredRequest)
+	if expiredResult.Code != http.StatusUnauthorized {
+		t.Fatalf("expired session status = %d: %s", expiredResult.Code, expiredResult.Body.String())
 	}
 }
 
@@ -803,6 +1098,9 @@ func TestCompactSyncOperationPayloadsPreservesAcknowledgements(t *testing.T) {
 			t.Fatalf("insert operation %d: %v", sequence, err)
 		}
 	}
+	if _, err := tx.Exec("UPDATE sync_operation_stats SET operation_count = 2, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1"); err != nil {
+		t.Fatalf("update sync operation stats: %v", err)
+	}
 	if err := compactSyncOperationPayloads(tx); err != nil {
 		t.Fatalf("compact payloads: %v", err)
 	}
@@ -818,6 +1116,130 @@ func TestCompactSyncOperationPayloadsPreservesAcknowledgements(t *testing.T) {
 	}
 	if compactedCount == 0 || resultCount != 2 {
 		t.Fatalf("compacted = %d, acknowledgements = %d", compactedCount, resultCount)
+	}
+	var trackedBytes, actualBytes int64
+	if err := db.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&trackedBytes); err != nil {
+		t.Fatalf("read tracked payload bytes: %v", err)
+	}
+	if err := db.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&actualBytes); err != nil || trackedBytes != actualBytes {
+		t.Fatalf("tracked payload bytes = %d, actual = %d, %v", trackedBytes, actualBytes, err)
+	}
+}
+
+func TestCompactSyncOperationAcknowledgementsKeepsPayloadStatsExact(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	previousLimit := maxSyncOperationAcknowledgements
+	maxSyncOperationAcknowledgements = 1
+	t.Cleanup(func() { maxSyncOperationAcknowledgements = previousLimit })
+	for sequence, payload := range []string{"first-payload", "second-payload"} {
+		if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)", "device", sequence+1, "op"+strconv.Itoa(sequence+1), "noop", `{"status":"applied"}`, payload, fmt.Sprintf("2026-01-01T00:00:0%dZ", sequence)); err != nil {
+			t.Fatalf("insert operation %d: %v", sequence, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = 2, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1"); err != nil {
+		t.Fatalf("seed sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin compaction: %v", err)
+	}
+	if err := compactSyncOperationAcknowledgements(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("compact acknowledgements: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit compaction: %v", err)
+	}
+
+	var trackedBytes, actualBytes int64
+	if err := db.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&trackedBytes); err != nil {
+		t.Fatalf("read tracked payload bytes: %v", err)
+	}
+	if err := db.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&actualBytes); err != nil {
+		t.Fatalf("read actual payload bytes: %v", err)
+	}
+	if trackedBytes != actualBytes {
+		t.Fatalf("tracked payload bytes = %d, actual = %d", trackedBytes, actualBytes)
+	}
+}
+
+func TestCompactSyncOperationAcknowledgementsBoundsDeletionBatch(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	previousLimit := maxSyncOperationAcknowledgements
+	maxSyncOperationAcknowledgements = 1
+	t.Cleanup(func() { maxSyncOperationAcknowledgements = previousLimit })
+	total := syncOperationCompactionBatchSize + 2
+	for sequence := 1; sequence <= total; sequence++ {
+		if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, 'noop', '{}', '{}', ?)", "device", sequence, "op"+strconv.Itoa(sequence), fmt.Sprintf("2026-01-01T00:00:%02dZ", sequence)); err != nil {
+			t.Fatalf("insert operation %d: %v", sequence, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = ?, payload_bytes = (SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations) WHERE id = 1", total); err != nil {
+		t.Fatalf("seed sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin compaction: %v", err)
+	}
+	if err := compactSyncOperationAcknowledgements(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("compact acknowledgements: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit compaction: %v", err)
+	}
+	var remaining int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sync_operations").Scan(&remaining); err != nil || remaining != 2 {
+		t.Fatalf("remaining operations = %d, %v; want 2", remaining, err)
+	}
+}
+
+func TestRepairSyncOperationStatsMigrationRecountsExistingRows(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES ('device', 1, 'op1', 'noop', '{}', 'existing-payload', '2026-01-01T00:00:00Z')"); err != nil {
+		t.Fatalf("insert existing operation: %v", err)
+	}
+	if _, err := db.Exec("UPDATE sync_operation_stats SET operation_count = 99, payload_bytes = 999 WHERE id = 1"); err != nil {
+		t.Fatalf("corrupt sync operation stats: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin repair: %v", err)
+	}
+	if err := migrateRepairSyncOperationStats(tx); err != nil {
+		tx.Rollback()
+		t.Fatalf("repair sync operation stats: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit repair: %v", err)
+	}
+	var count, bytes int64
+	if err := db.QueryRow("SELECT operation_count, payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&count, &bytes); err != nil {
+		t.Fatalf("read repaired stats: %v", err)
+	}
+	if count != 1 || bytes != int64(len("existing-payload")) {
+		t.Fatalf("repaired stats = count %d bytes %d", count, bytes)
 	}
 }
 
@@ -852,6 +1274,186 @@ func TestSyncPushAcknowledgesCompactedReplay(t *testing.T) {
 	}
 }
 
+func TestSyncPushReportsPermanentValidationErrors(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	baseRevision := int64(0)
+	body, err := json.Marshal(syncPushRequest{
+		DeviceID: "device_a",
+		Operations: []syncOperationRequest{{
+			ClientSequence: 1,
+			OpID:           "operation_1",
+			Type:           "note.save",
+			NoteID:         "note-a",
+			BaseRevision:   &baseRevision,
+			Title:          strings.Repeat("x", maxTitleBytes+1),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body)))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	(&app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}).handleSyncPush(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("validation status = %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode validation response: %v", err)
+	}
+	if response["code"] != "invalid_sync_operation" || response["permanent"] != true || response["op_id"] != "operation_1" {
+		t.Fatalf("validation response = %#v", response)
+	}
+}
+
+func TestPreferenceSyncMergesDisjointChangesAndConflictsSameField(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}
+	push := func(device string, sequence int64, opID string, patch, base map[string]json.RawMessage, revision int64) syncPushResponse {
+		body, err := json.Marshal(syncPushRequest{
+			DeviceID: device,
+			Operations: []syncOperationRequest{{
+				ClientSequence: sequence,
+				OpID:           opID,
+				Type:           "prefs.save",
+				BaseRevision:   &revision,
+				Prefs:          &prefs{SyncPatch: patch, SyncBase: base},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("marshal preference push: %v", err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body)))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		a.handleSyncPush(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("preference push status = %d: %s", w.Code, w.Body.String())
+		}
+		var response syncPushResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode preference push: %v", err)
+		}
+		return response
+	}
+	raw := func(value string) json.RawMessage { return json.RawMessage(strconv.Quote(value)) }
+
+	first := push("device_a", 1, "pref_a", map[string]json.RawMessage{"theme": raw("default-dark"), "statusDisplay": raw("compact"), "hideSaveButton": json.RawMessage("true")}, map[string]json.RawMessage{"theme": raw("default-light"), "statusDisplay": raw("normal"), "hideSaveButton": json.RawMessage("false")}, 1)
+	if first.Acknowledged[0].Status != "applied" || first.Acknowledged[0].Revision != 2 {
+		t.Fatalf("first preference result = %#v", first.Acknowledged)
+	}
+	second := push("device_b", 1, "pref_b", map[string]json.RawMessage{"accentColor": raw("#123456")}, map[string]json.RawMessage{"accentColor": raw("")}, 1)
+	if second.Acknowledged[0].Status != "applied" || second.Acknowledged[0].Revision != 3 {
+		t.Fatalf("disjoint preference result = %#v", second.Acknowledged)
+	}
+	p, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("load merged preferences: %v", err)
+	}
+	if p.Theme != "default-dark" || p.AccentColor != "#123456" || p.StatusDisplay != "compact" || !p.HideSaveButton || p.Revision != 3 {
+		t.Fatalf("merged preferences = %#v", p)
+	}
+	conflict := push("device_c", 1, "pref_c", map[string]json.RawMessage{"theme": raw("default-light")}, map[string]json.RawMessage{"theme": raw("default-light")}, 1)
+	if conflict.Acknowledged[0].Status != "conflict" || conflict.Acknowledged[0].CurrentRevision != 3 {
+		t.Fatalf("same-field preference result = %#v", conflict.Acknowledged)
+	}
+}
+
+func TestDirectPreferencePatchUsesRevisionAndPublishesChange(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	events := newEventBroker()
+	a := &app{db: db, events: events}
+	p, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("load initial preferences: %v", err)
+	}
+	subscriber := events.subscribe()
+	defer events.unsubscribe(subscriber)
+	p.Theme = "default-dark"
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal preferences: %v", err)
+	}
+	initial := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	initial.Header.Set("Content-Type", "application/json")
+	initialResult := httptest.NewRecorder()
+	a.handleSavePrefs(initialResult, initial)
+	if initialResult.Code != http.StatusOK {
+		t.Fatalf("initial preference status = %d: %s", initialResult.Code, initialResult.Body.String())
+	}
+	<-subscriber
+
+	p.Theme = "default-light"
+	body, err = json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal stale preferences: %v", err)
+	}
+	stale := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	stale.Header.Set("Content-Type", "application/json")
+	stale.Header.Set("If-Match", `"1"`)
+	staleResult := httptest.NewRecorder()
+	a.handleSavePrefs(staleResult, stale)
+	if staleResult.Code != http.StatusConflict {
+		t.Fatalf("stale preference status = %d: %s", staleResult.Code, staleResult.Body.String())
+	}
+
+	current, err := getPrefs(db)
+	if err != nil {
+		t.Fatalf("reload preferences: %v", err)
+	}
+	body, err = json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal current preferences: %v", err)
+	}
+	current.Theme = "default-dark"
+	body, err = json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal updated preferences: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/prefs", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `"2"`)
+	result := httptest.NewRecorder()
+	a.handleSavePrefs(result, request)
+	if result.Code != http.StatusOK {
+		t.Fatalf("direct preference status = %d: %s", result.Code, result.Body.String())
+	}
+	select {
+	case kind := <-subscriber:
+		if kind != "preferences" {
+			t.Fatalf("preference event kind = %q", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for preference event")
+	}
+	updated, err := getPrefs(db)
+	if err != nil || updated.Theme != "default-dark" || updated.Revision != 3 {
+		t.Fatalf("updated preferences = %#v, %v", updated, err)
+	}
+}
+
 func TestRecoverFileOperationsCompletesCommittedReplacement(t *testing.T) {
 	notesDir := t.TempDir()
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
@@ -880,6 +1482,122 @@ func TestRecoverFileOperationsCompletesCommittedReplacement(t *testing.T) {
 	var count int
 	if err := db.QueryRow("SELECT count(*) FROM file_operations").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("remaining file operations = %d, %v", count, err)
+	}
+}
+
+func TestRecoverFileOperationsRejectsOldTargetWhenStageIsMissing(t *testing.T) {
+	notesDir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(notesDir, "note-a.md"), []byte("old body"), 0600); err != nil {
+		t.Fatalf("write old target: %v", err)
+	}
+	stageName, err := stageNoteFile(notesDir, []byte("new body"))
+	if err != nil {
+		t.Fatalf("stage replacement: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO file_operations (id, action, note_id, stage_name, expected_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)", "replace-op", fileOperationReplace, "note-a", stageName, fileContentHash([]byte("new body")), "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("record file operation: %v", err)
+	}
+	if err := os.Remove(filepath.Join(notesDir, stageName)); err != nil {
+		t.Fatalf("remove stage: %v", err)
+	}
+	a := &app{db: db, notesDir: notesDir, noteCache: newNoteCache()}
+	if err := a.recoverFileOperations(); err != nil {
+		t.Fatalf("recovery returned an unrelated failure: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(notesDir, "note-a.md"))
+	if err != nil || string(data) != "old body" {
+		t.Fatalf("target after failed recovery = %q, %v", data, err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM file_operations").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("remaining file operations = %d, %v; want 1", count, err)
+	}
+	blocked, err := a.fileOperationBlocked("note-a")
+	if err != nil || !blocked {
+		t.Fatalf("failed recovery blocked note = %t, %v; want true", blocked, err)
+	}
+}
+
+func TestRecoverFileOperationsIsolatesFailedNote(t *testing.T) {
+	notesDir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(notesDir, "note-a.md"), []byte("old body"), 0600); err != nil {
+		t.Fatalf("write old target: %v", err)
+	}
+	stageName, err := stageNoteFile(notesDir, []byte("unrelated new body"))
+	if err != nil {
+		t.Fatalf("stage unrelated replacement: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO file_operations (id, action, note_id, stage_name, expected_hash, created_at) VALUES
+		('failed-op', ?, 'note-a', 'missing-stage', ?, '2026-01-01T00:00:00Z'),
+		('healthy-op', ?, 'note-b', ?, ?, '2026-01-01T00:00:01Z')`, fileOperationReplace, fileContentHash([]byte("new body")), fileOperationReplace, stageName, fileContentHash([]byte("unrelated new body"))); err != nil {
+		t.Fatalf("record file operations: %v", err)
+	}
+	a := &app{db: db, notesDir: notesDir, noteCache: newNoteCache()}
+	if err := a.recoverFileOperations(); err != nil {
+		t.Fatalf("recover file operations: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(notesDir, "note-b.md"))
+	if err != nil || string(data) != "unrelated new body" {
+		t.Fatalf("unrelated note after recovery = %q, %v", data, err)
+	}
+	blocked, err := a.fileOperationBlocked("note-a")
+	if err != nil || !blocked {
+		t.Fatalf("failed note blocked = %t, %v; want true", blocked, err)
+	}
+	blocked, err = a.fileOperationBlocked("note-b")
+	if err != nil || blocked {
+		t.Fatalf("healthy note blocked = %t, %v; want false", blocked, err)
+	}
+	for range 2 {
+		if err := a.recoverFileOperations(); err != nil {
+			t.Fatalf("repeat recovery: %v", err)
+		}
+	}
+	var quarantined int
+	if err := db.QueryRow("SELECT quarantined FROM file_operations WHERE id = 'failed-op'").Scan(&quarantined); err != nil || quarantined != 1 {
+		t.Fatalf("failed operation quarantine = %d, %v; want 1", quarantined, err)
+	}
+}
+
+func TestUnreadableNoteFileIsNotReportedAsMissing(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := upsertNote(db, "unreadable", "Unreadable", "unreadable.md", ""); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "unreadable.md"), 0700); err != nil {
+		t.Fatalf("create unreadable note path: %v", err)
+	}
+	a := &app{db: db, notesDir: dir, noteCache: newNoteCache()}
+	r := httptest.NewRequest(http.MethodGet, "/api/notes/unreadable", nil)
+	r.SetPathValue("id", "unreadable")
+	w := httptest.NewRecorder()
+	a.handleGetNote(w, r)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("unreadable note status = %d: %s", w.Code, w.Body.String())
 	}
 }
 

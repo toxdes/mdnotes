@@ -79,7 +79,8 @@ SOFTWARE.
   <div id="login-screen">
     <form id="login-form">
       <h1>mdnotes</h1>
-      <input type="password" name="password" placeholder="password" required autocomplete="current-password">
+      <label class="sr-only" for="login-password">Password</label>
+      <input type="password" id="login-password" name="password" placeholder="password" required autocomplete="current-password">
       <button type="submit">Sign in</button>
       <p id="login-error" class="error"></p>
     </form>
@@ -90,7 +91,7 @@ SOFTWARE.
       <h1>mdnotes</h1>
       <div class="header-right">
         <span id="sync-status" class="sync-indicator" data-state="online" role="status" aria-live="polite"><span class="sync-indicator-dot" aria-hidden="true"></span><span class="sync-indicator-label">Saved</span></span>
-        <button id="prefs-btn" class="prefs-btn" title="Preferences" aria-label="Preferences"><svg class="icon" aria-hidden="true"><use href="#icon-settings-2"></use></svg></button>
+        <button id="prefs-btn" class="prefs-btn" type="button" title="Preferences" aria-label="Preferences"><svg class="icon" aria-hidden="true"><use href="#icon-settings-2"></use></svg></button>
       </div>
     </header>
     <div class="offline-notice hidden" role="status" aria-live="polite">
@@ -99,18 +100,18 @@ SOFTWARE.
     </div>
     <div class="dashboard-body">
       <div class="toolbar">
-        <button id="new-note-btn" class="btn-primary">+ New</button>
+        <button id="new-note-btn" class="btn-primary" type="button">+ New</button>
       </div>
-      <div id="tag-bar"></div>
-      <div id="note-list"></div>
+      <div id="tag-bar" role="group" aria-label="Filter notes"></div>
+      <ul id="note-list" aria-label="Notes"></ul>
     </div>
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
-  <div id="prefs-modal" class="modal hidden">
+  <div id="prefs-modal" class="modal hidden" aria-hidden="true">
     <div class="modal-backdrop"></div>
-    <div class="modal-body prefs-modal-body" role="dialog" aria-modal="true" aria-labelledby="prefs-title">
+    <div class="modal-body prefs-modal-body" role="dialog" aria-modal="true" aria-labelledby="prefs-title" aria-describedby="prefs-description" tabindex="-1">
       <aside class="prefs-sidebar">
         <div class="prefs-sidebar-title">Preferences</div>
         <nav class="prefs-tabs" role="tablist" aria-label="Preference sections">
@@ -126,7 +127,7 @@ SOFTWARE.
           <button id="prefs-close" class="modal-close" type="button" aria-label="Close preferences"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg></button>
         </div>
         <section id="prefs-panel-appearance" class="prefs-section active" role="tabpanel" aria-labelledby="prefs-tab-appearance" data-pref-panel="appearance">
-          <p class="prefs-section-intro">Personalize the colors and typeface used across the app.</p>
+          <p id="prefs-description" class="prefs-section-intro">Personalize the colors and typeface used across the app.</p>
           <label class="pref-control"><span><strong>Theme</strong><small>Choose a preset color scheme.</small></span><select id="pref-theme"></select></label>
           <label class="pref-control"><span><strong>Accent color</strong><small>Used for buttons, links, and focus states.</small></span><input type="color" id="pref-accent" value="#ae2448" aria-label="Accent color"></label>
           <label class="pref-control"><span><strong>Interface font</strong><small id="font-availability">System fonts</small></span><select id="pref-font"><option value="system-sans">System (Sans)</option></select></label>
@@ -139,8 +140,10 @@ SOFTWARE.
           <label class="pref-row"><span>Hide Preview by default</span><input type="checkbox" id="pref-hidepreview"></label>
           <label class="pref-row"><span>Fullscreen in editor hides header</span><input type="checkbox" id="pref-hideheader"></label>
           <label class="pref-row"><span>Hide Editor Toolbar</span><input type="checkbox" id="pref-hidetoolbar"></label>
+          <label class="pref-row"><span>Hide Save button</span><input type="checkbox" id="pref-hidesave"></label>
           <label class="pref-row"><span>Collapse Details by default</span><input type="checkbox" id="pref-collapse"></label>
           <label class="pref-row"><span>Hide cursor position preview</span><input type="checkbox" id="pref-hidecursor"></label>
+          <label class="pref-control"><span><strong>Status</strong><small>Choose how sync status is shown.</small></span><select id="pref-status"><option value="normal">Normal</option><option value="compact">Compact</option><option value="off">Off</option></select></label>
         </section>
         <section id="prefs-panel-account" class="prefs-section" role="tabpanel" aria-labelledby="prefs-tab-account" data-pref-panel="account" hidden>
           <p class="prefs-section-intro">Manage this signed-in session.</p>
@@ -150,10 +153,10 @@ SOFTWARE.
           <p class="prefs-section-intro">Information about this installation.</p>
           <div class="about-list">
             <a class="about-row" href="https://github.com/toxdes/mdnotes" target="_blank" rel="noopener noreferrer">
-              <span><strong>Source code</strong><small>View the project on GitHub</small></span><span class="about-row-arrow" aria-hidden="true">↗</span>
+              <span><strong>Source code</strong><small>View the project on GitHub</small></span>
             </a>
             <a class="about-row" href="https://github.com/toxdes/mdnotes/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">
-              <span><strong>License</strong><small>MIT License</small></span><span class="about-row-arrow" aria-hidden="true">↗</span>
+              <span><strong>License</strong><small>MIT License</small></span>
             </a>
             <div class="about-row about-row-static">
               <span><strong>Version</strong><small>Installed application version</small></span><span id="app-version" class="app-version" aria-label="Application version">vdev</span>
@@ -164,11 +167,15 @@ SOFTWARE.
     </div>
   </div>
 
-  <div id="conflict-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+  <div id="conflict-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="conflict-title" aria-describedby="conflict-intro" aria-hidden="true" tabindex="-1">
     <div class="modal-backdrop"></div>
     <div class="modal-body conflict-modal-body">
       <div class="modal-heading"><h3 id="conflict-title">Resolve conflicting edits</h3><button id="conflict-close" class="modal-close" type="button" aria-label="Close conflict resolver"><svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg></button></div>
-      <p class="conflict-intro">This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.</p>
+      <p id="conflict-intro" class="conflict-intro">This note changed on another device while you were editing it. Review both versions, then save the result you want to keep.</p>
+      <div id="conflict-deleted-details" class="conflict-base hidden">
+        <strong>Changes saved on this device</strong>
+        <pre id="conflict-deleted-content"></pre>
+      </div>
       <div class="conflict-fields">
         <label class="meta-field">
           <span class="input-label">Title to save</span>
@@ -215,10 +222,10 @@ SOFTWARE.
 
   <div id="editor" class="hidden">
     <header>
-      <button id="back-btn" class="btn-text"><svg class="icon" aria-hidden="true"><use href="#icon-arrow-left"></use></svg>Back</button>
+      <button id="back-btn" class="btn-text" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-arrow-left"></use></svg>Back</button>
       <div class="header-right">
         <span id="editor-status" class="sync-indicator" data-state="online" role="status" aria-live="polite"><span class="sync-indicator-dot" aria-hidden="true"></span><span class="sync-indicator-label">Saved</span></span>
-        <button id="save-btn" class="btn-primary">Save</button>
+        <button id="save-btn" class="btn-primary" type="button">Save</button>
       </div>
     </header>
     <div class="offline-notice hidden" role="status" aria-live="polite">
@@ -227,11 +234,11 @@ SOFTWARE.
     </div>
     <div class="editor-body">
       <div class="meta-pane">
-        <button class="meta-toggle" type="button" title="Toggle details">
+        <button class="meta-toggle" type="button" title="Toggle details" aria-expanded="true" aria-controls="note-details">
           <svg class="icon" aria-hidden="true"><use href="#icon-chevron-down"></use></svg>
           <span>Details</span>
         </button>
-        <div class="meta-body">
+        <div id="note-details" class="meta-body">
           <div class="meta-fields">
             <div class="meta-field">
               <label class="input-label" for="note-title">Title</label>
@@ -248,7 +255,7 @@ SOFTWARE.
         </div>
       </div>
       <div class="editor-panels" id="editor-panels">
-        <div class="panel panel-editor">
+        <div id="editor-panel" class="panel panel-editor">
           <div class="panel-header">
             <span class="panel-label">Editor</span>
             <div class="panel-header-actions">
@@ -258,7 +265,7 @@ SOFTWARE.
               <button type="button" class="panel-width" title="Use full width" aria-label="Use full width">
                 <svg class="icon" aria-hidden="true"><use href="#icon-width-full"></use></svg>
               </button>
-              <button type="button" class="panel-switch" data-panel-switch="preview" title="Show preview" aria-label="Show preview">
+              <button type="button" class="panel-switch" data-panel-switch="preview" title="Show preview" aria-label="Show preview" aria-controls="preview-panel" aria-expanded="false">
                 <svg class="icon" aria-hidden="true"><use href="#icon-eye-bolt"></use></svg>
               </button>
             </div>
@@ -287,10 +294,11 @@ SOFTWARE.
             <button type="button" data-fmt="hr" title="Horizontal rule" aria-label="Horizontal rule"><svg class="icon" aria-hidden="true"><use href="#icon-minus"></use></svg></button>
             <button type="button" data-fmt="table" title="Insert table" aria-label="Insert table" aria-haspopup="dialog" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-table"></use></svg></button>
           </div>
+          <label class="sr-only" for="note-content">Markdown note content</label>
           <textarea id="note-content" placeholder="Write markdown here..."></textarea>
         </div>
         <div id="panel-resizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize editor and preview" aria-valuemin="20" aria-valuemax="80" aria-valuenow="50" tabindex="0"></div>
-        <div class="panel panel-preview">
+        <div id="preview-panel" class="panel panel-preview">
           <div class="panel-header">
             <span class="panel-label">Preview</span>
             <div class="panel-header-actions">
@@ -300,7 +308,7 @@ SOFTWARE.
               <button type="button" class="panel-width" title="Use full width" aria-label="Use full width">
                 <svg class="icon" aria-hidden="true"><use href="#icon-width-full"></use></svg>
               </button>
-              <button type="button" class="panel-switch" data-panel-switch="editor" title="Show editor" aria-label="Show editor">
+              <button type="button" class="panel-switch" data-panel-switch="editor" title="Show editor" aria-label="Show editor" aria-controls="editor-panel" aria-expanded="false">
                 <svg class="icon" aria-hidden="true"><use href="#icon-code"></use></svg>
               </button>
             </div>

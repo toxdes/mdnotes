@@ -57,6 +57,8 @@ Open notes use their note ID as the route (`/<note-id>`), so browser navigation 
 
 The preview recognizes `[[Wiki Links]]`: clicking a matching note title opens that note, while an unmatched title creates and opens a new note with that title.
 
+Markdown preview treats raw HTML as text rather than rendering it. Links are limited to HTTP, HTTPS, and mailto URLs, and images are limited to HTTP and HTTPS URLs. Remote images load lazily and asynchronously.
+
 While the signed-in app is open, it keeps an authenticated SSE stream to the server. A 25-second heartbeat drives the Online/Offline indicator, and content-free change hints trigger normal HTTP sync promptly on other open devices. A missing heartbeat for 70 seconds is treated as offline, and reconnection runs a full cache reconciliation before replaying local work.
 
 Sync history is bounded for small deployments: the server retains up to 100,000 change records and acknowledgements, and caps stored full operation payloads at 32 MiB. A device older than the retained change feed performs a full server refresh before replaying any local work; old acknowledged retries receive a safe compacted acknowledgement and rebase from the server state.
@@ -74,6 +76,10 @@ Cross-compile all targets (Linux binaries compressed with UPX):
 ```
 ./build.py
 ```
+
+## Tests
+
+Run the default frontend behavior suite with `npm run test:frontend`. The opt-in browser reliability suite uses the installed Chrome binary and a temporary Go server; run it with `npm run test:browser`. It covers offline cached startup, unchanged navigation request counts, a warm dashboard performance budget, keyboard navigation, and serious accessibility violations.
 
 ## Docker
 

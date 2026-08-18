@@ -7,11 +7,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const sessionLifetime = 180 * 24 * time.Hour
+const sessionRenewalInterval = 7 * 24 * time.Hour
+const sessionRenewalThreshold = sessionLifetime - sessionRenewalInterval
 
 type sessionStore struct {
 	db *sql.DB
@@ -40,16 +43,37 @@ func (s *sessionStore) create() (string, error) {
 }
 
 func (s *sessionStore) valid(token string) bool {
+	valid, _ := s.validAndRenew(token)
+	return valid
+}
+
+func (s *sessionStore) validAndRenew(token string) (bool, bool) {
 	var expiry string
 	if err := s.db.QueryRow("SELECT expires_at FROM sessions WHERE token_hash = ?", sessionTokenHash(token)).Scan(&expiry); err != nil {
-		return false
+		return false, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, expiry)
-	if err != nil || !time.Now().UTC().Before(expiresAt) {
+	now := time.Now().UTC()
+	if err != nil || !now.Before(expiresAt) {
 		s.remove(token)
-		return false
+		return false, false
 	}
-	return true
+	if expiresAt.Sub(now) >= sessionRenewalThreshold {
+		return true, false
+	}
+
+	nextExpiry := now.Add(sessionLifetime).Format(time.RFC3339)
+	result, err := s.db.Exec(
+		"UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND expires_at = ?",
+		nextExpiry, sessionTokenHash(token), expiry,
+	)
+	if err != nil {
+		// The existing session is still valid. A transient renewal failure must
+		// not turn an otherwise authenticated request into a logout.
+		return true, false
+	}
+	rows, err := result.RowsAffected()
+	return true, err == nil && rows > 0
 }
 
 func (s *sessionStore) remove(token string) {
@@ -86,12 +110,32 @@ func (a *app) isSecureRequest(r *http.Request) bool {
 func (a *app) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie("session")
-		if err != nil || !a.sessions.valid(c.Value) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if err != nil {
+			writeAPIError(w, http.StatusUnauthorized, "authentication_required", "unauthorized")
 			return
+		}
+		valid, renewed := a.sessions.validAndRenew(c.Value)
+		if !valid {
+			writeAPIError(w, http.StatusUnauthorized, "authentication_required", "unauthorized")
+			return
+		}
+		if renewed {
+			a.setSessionCookie(w, r, c.Value)
 		}
 		next(w, r)
 	}
+}
+
+func (a *app) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   a.isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionLifetime.Seconds()),
+	})
 }
 
 func (a *app) handleCheck(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +160,21 @@ func (a *app) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := a.rl.realIP(r)
+	retryAfter, err := a.rl.loginRetryAfter(ip)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "login_rate_limit_failed", "could not check login rate limit")
+		return
+	}
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSONStatus(w, http.StatusTooManyRequests, map[string]any{
+			"error":       "too many login attempts",
+			"code":        "login_rate_limited",
+			"retry_after": retryAfter,
+		})
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -123,24 +182,16 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.password)) != 1 {
-		a.rl.recordLoginAttempt(a.rl.realIP(r), false)
-		http.Error(w, "wrong password", http.StatusUnauthorized)
+		a.rl.recordLoginAttempt(ip, false)
+		writeAPIError(w, http.StatusUnauthorized, "invalid_credentials", "wrong password")
 		return
 	}
-	a.rl.recordLoginAttempt(a.rl.realIP(r), true)
+	a.rl.recordLoginAttempt(ip, true)
 	token, err := a.sessions.create()
 	if err != nil {
-		http.Error(w, "could not create session", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "create_session_failed", "could not create session")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   a.isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(sessionLifetime.Seconds()),
-	})
-	writeJSON(w, map[string]bool{"ok": true})
+	a.setSessionCookie(w, r, token)
+	writeJSON(w, map[string]any{"ok": true, "version": version, "revision": appRevision})
 }

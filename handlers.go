@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -56,16 +57,20 @@ func writeJSONStatus(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	writeJSONStatus(w, status, map[string]any{"error": message, "code": code})
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid request")
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid request")
 		return false
 	}
 	return true
@@ -120,16 +125,16 @@ func (a *app) handleListNotes(w http.ResponseWriter, r *http.Request) {
 	if limitParam != "" {
 		limit, err := strconv.Atoi(limitParam)
 		if err != nil || limit < 1 || limit > 100 {
-			http.Error(w, "invalid page limit", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid_page_limit", "invalid page limit")
 			return
 		}
 		page, err := listNotesPage(a.db, tag, r.URL.Query().Get("cursor"), limit)
 		if err != nil {
 			if errors.Is(err, errInvalidCursor) {
-				http.Error(w, "invalid cursor", http.StatusBadRequest)
+				writeAPIError(w, http.StatusBadRequest, "invalid_cursor", "invalid cursor")
 				return
 			}
-			http.Error(w, "could not list notes", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "list_notes_failed", "could not list notes")
 			return
 		}
 		writeJSON(w, page)
@@ -137,7 +142,7 @@ func (a *app) handleListNotes(w http.ResponseWriter, r *http.Request) {
 	}
 	notes, err := listNotes(a.db, tag)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "list_notes_failed", "could not list notes")
 		return
 	}
 	writeJSON(w, notes)
@@ -146,12 +151,12 @@ func (a *app) handleListNotes(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleSearchNotes(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if len(query) > 256 {
-		http.Error(w, "search query is too long", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "search_query_too_long", "search query is too long")
 		return
 	}
 	notes, err := searchNotes(a.db, query, 50)
 	if err != nil {
-		http.Error(w, "could not search notes", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "search_failed", "could not search notes")
 		return
 	}
 	writeJSON(w, notes)
@@ -163,7 +168,7 @@ func (a *app) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 		var err error
 		since, err = strconv.ParseInt(raw, 10, 64)
 		if err != nil || since < 0 {
-			http.Error(w, "invalid sync sequence", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid_sync_sequence", "invalid sync sequence")
 			return
 		}
 	}
@@ -172,13 +177,13 @@ func (a *app) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 		var err error
 		limit, err = strconv.Atoi(raw)
 		if err != nil || limit < 1 || limit > 500 {
-			http.Error(w, "invalid page limit", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid_page_limit", "invalid page limit")
 			return
 		}
 	}
 	page, err := listSyncChanges(a.db, since, limit)
 	if err != nil {
-		http.Error(w, "could not list sync changes", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "list_sync_changes_failed", "could not list sync changes")
 		return
 	}
 	writeJSON(w, page)
@@ -189,10 +194,10 @@ func (a *app) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	data, err := a.loadNoteWithContent(id)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "could not load note", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "load_note_failed", "could not load note")
 			return
 		}
-		http.Error(w, "not found", http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, "note_not_found", "not found")
 		return
 	}
 	writeJSON(w, data)
@@ -204,6 +209,9 @@ type noteWithContent struct {
 }
 
 func (a *app) loadNoteWithContent(id string) (noteWithContent, error) {
+	a.noteMu.Lock()
+	defer a.noteMu.Unlock()
+
 	n, err := getNote(a.db, id)
 	if err != nil {
 		return noteWithContent{}, err
@@ -220,7 +228,10 @@ func (a *app) loadNoteWithContent(id string) (noteWithContent, error) {
 	}
 	enc, err := os.ReadFile(path)
 	if err != nil {
-		return noteWithContent{}, sql.ErrNoRows
+		if errors.Is(err, os.ErrNotExist) {
+			return noteWithContent{}, sql.ErrNoRows
+		}
+		return noteWithContent{}, fmt.Errorf("read note file: %w", err)
 	}
 	plain, err := a.encryption.decryptNote(enc, id)
 	if err != nil {
@@ -242,14 +253,14 @@ func (a *app) handleBulkGetNotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(rawIDs) > maxBulkNotes {
-		http.Error(w, "too many note ids", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "too_many_note_ids", "too many note ids")
 		return
 	}
 	ids := make([]string, 0, len(rawIDs))
 	seen := make(map[string]struct{}, len(rawIDs))
 	for _, id := range rawIDs {
 		if !noteIDPattern.MatchString(id) {
-			http.Error(w, "invalid note id", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid_note_id", "invalid note id")
 			return
 		}
 		if _, ok := seen[id]; ok {
@@ -268,7 +279,7 @@ func (a *app) handleBulkGetNotes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err != nil {
-			http.Error(w, "could not load notes", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "load_notes_failed", "could not load notes")
 			return
 		}
 		notes = append(notes, data)
@@ -284,25 +295,44 @@ type saveRequest struct {
 	BaseRevision *int64 `json:"base_revision,omitempty"`
 }
 
-func checkNoteRevision(db *sql.DB, id string, expected int64) error {
+func currentNoteRevision(db *sql.DB, id string) (int64, error) {
 	n, err := getNote(db, id)
 	if err == nil {
-		if n.Revision != expected {
-			return errRevisionConflict
-		}
-		return nil
+		return n.Revision, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return 0, err
 	}
 	var latest int64
 	if err := db.QueryRow("SELECT COALESCE(MAX(revision), 0) FROM sync_changes WHERE note_id = ?", id).Scan(&latest); err != nil {
+		return 0, err
+	}
+	return latest, nil
+}
+
+func checkNoteRevision(db *sql.DB, id string, expected int64) error {
+	latest, err := currentNoteRevision(db, id)
+	if err != nil {
 		return err
 	}
-	if expected != 0 || latest != 0 {
+	if latest != expected {
 		return errRevisionConflict
 	}
 	return nil
+}
+
+func (a *app) writeNoteRevisionConflict(w http.ResponseWriter, noteID string) {
+	revision, err := currentNoteRevision(a.db, noteID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "read_note_revision_failed", "could not read current note revision")
+		return
+	}
+	writeJSONStatus(w, http.StatusConflict, map[string]any{
+		"error":            "note changed on another device",
+		"code":             "note_revision_conflict",
+		"note_id":          noteID,
+		"current_revision": revision,
+	})
 }
 
 func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
@@ -311,7 +341,7 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Title) > maxTitleBytes || len(req.Tags) > maxTagsBytes {
-		http.Error(w, "title or tags are too long", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "note_metadata_too_long", "title or tags are too long")
 		return
 	}
 
@@ -320,11 +350,17 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 		var err error
 		id, err = randID()
 		if err != nil {
-			http.Error(w, "could not create note", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "create_note_failed", "could not create note")
 			return
 		}
 	} else if !noteIDPattern.MatchString(id) {
-		http.Error(w, "invalid note id", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid_note_id", "invalid note id")
+		return
+	} else if req.BaseRevision == nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "base_revision is required for an existing note",
+			"code":  "base_revision_required",
+		})
 		return
 	}
 
@@ -333,16 +369,27 @@ func (a *app) handleSaveNote(w http.ResponseWriter, r *http.Request) {
 	a.noteMu.Lock()
 	defer a.noteMu.Unlock()
 	if err := a.recoverFileOperations(); err != nil {
-		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "recover_file_operations_failed", "could not recover pending file operations")
+		return
+	}
+	if blocked, err := a.fileOperationBlocked(id); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "inspect_file_operations_failed", "could not inspect pending file operations")
+		return
+	} else if blocked {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "note file recovery requires attention",
+			"code":    "note_file_recovery_blocked",
+			"note_id": id,
+		})
 		return
 	}
 	n, err := a.saveNoteWithFileOperation(id, req.Title, tags, req.Content, req.BaseRevision)
 	if errors.Is(err, errRevisionConflict) {
-		http.Error(w, "note changed on another device", http.StatusConflict)
+		a.writeNoteRevisionConflict(w, id)
 		return
 	}
 	if err != nil {
-		http.Error(w, "write failed", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "save_note_failed", "write failed")
 		return
 	}
 	a.publishChange("notes")
@@ -355,28 +402,45 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("base_revision"); raw != "" {
 		revision, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || revision < 1 {
-			http.Error(w, "invalid note revision", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid_note_revision", "invalid note revision")
 			return
 		}
 		expectedRevision = &revision
+	} else {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "base_revision is required for deletion",
+			"code":  "base_revision_required",
+		})
+		return
 	}
 	a.noteMu.Lock()
 	defer a.noteMu.Unlock()
 	if err := a.recoverFileOperations(); err != nil {
-		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "recover_file_operations_failed", "could not recover pending file operations")
+		return
+	}
+	if blocked, err := a.fileOperationBlocked(id); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "inspect_file_operations_failed", "could not inspect pending file operations")
+		return
+	} else if blocked {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "note file recovery requires attention",
+			"code":    "note_file_recovery_blocked",
+			"note_id": id,
+		})
 		return
 	}
 	err := a.deleteNoteWithFileOperation(id, expectedRevision)
 	if errors.Is(err, errRevisionConflict) {
-		http.Error(w, "note changed on another device", http.StatusConflict)
+		a.writeNoteRevisionConflict(w, id)
 		return
 	}
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "delete failed", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "delete_note_failed", "delete failed")
 			return
 		}
-		http.Error(w, "not found", http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, "note_not_found", "not found")
 		return
 	}
 	a.publishChange("notes")
@@ -386,7 +450,7 @@ func (a *app) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleListTags(w http.ResponseWriter, r *http.Request) {
 	tags, err := listTags(a.db)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "list_tags_failed", "could not list tags")
 		return
 	}
 	if tags == nil {
@@ -398,7 +462,7 @@ func (a *app) handleListTags(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleGetPrefs(w http.ResponseWriter, r *http.Request) {
 	p, err := getPrefs(a.db)
 	if err != nil {
-		http.Error(w, "could not load preferences", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "load_preferences_failed", "could not load preferences")
 		return
 	}
 	writeJSON(w, p)
@@ -409,9 +473,48 @@ func (a *app) handleSavePrefs(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &p, 16<<10) {
 		return
 	}
-	if err := savePrefs(a.db, &p); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	expectedRevision, err := ifMatchRevision(r)
+	if err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": "invalid preference revision",
+			"code":  "invalid_preferences_revision",
+		})
 		return
 	}
-	writeJSON(w, &p)
+	if err := savePrefs(a.db, &p, expectedRevision); errors.Is(err, errRevisionConflict) {
+		current, currentErr := getPrefs(a.db)
+		if currentErr != nil {
+			writeAPIError(w, http.StatusInternalServerError, "load_preferences_failed", "could not load preferences")
+			return
+		}
+		writeJSONStatus(w, http.StatusConflict, map[string]any{
+			"error":            "preferences changed on another device",
+			"code":             "preferences_revision_conflict",
+			"current_revision": current.Revision,
+		})
+		return
+	} else if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "save_preferences_failed", "could not save preferences")
+		return
+	}
+	saved, err := getPrefs(a.db)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "load_preferences_failed", "could not load preferences")
+		return
+	}
+	a.publishChange("preferences")
+	writeJSON(w, saved)
+}
+
+func ifMatchRevision(r *http.Request) (*int64, error) {
+	raw := strings.TrimSpace(r.Header.Get("If-Match"))
+	if raw == "" || raw == "*" {
+		return nil, nil
+	}
+	raw = strings.Trim(raw, `"`)
+	revision, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || revision < 1 {
+		return nil, errors.New("invalid preference revision")
+	}
+	return &revision, nil
 }

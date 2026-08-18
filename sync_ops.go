@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,8 +15,9 @@ import (
 )
 
 const (
-	maxSyncPushBytes          = 4 << 20
-	compactedOperationPayload = `{"compacted":true}`
+	maxSyncPushBytes                 = 4 << 20
+	syncOperationCompactionBatchSize = 100
+	compactedOperationPayload        = `{"compacted":true}`
 )
 
 var maxSyncOperationPayloadBytes int64 = 32 << 20
@@ -59,12 +62,19 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !syncIdentifierPattern.MatchString(request.DeviceID) || len(request.Operations) > 100 {
-		http.Error(w, "invalid sync request", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid_sync_request", "invalid sync request")
 		return
 	}
-	for _, operation := range request.Operations {
+	for index, operation := range request.Operations {
 		if err := validateSyncOperation(operation); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+				"error":           err.Error(),
+				"code":            "invalid_sync_operation",
+				"permanent":       true,
+				"operation_index": index,
+				"client_sequence": operation.ClientSequence,
+				"op_id":           operation.OpID,
+			})
 			return
 		}
 	}
@@ -72,13 +82,29 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 	a.noteMu.Lock()
 	defer a.noteMu.Unlock()
 	if err := a.recoverFileOperations(); err != nil {
-		http.Error(w, "could not recover pending file operations", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "recover_file_operations_failed", "could not recover pending file operations")
 		return
+	}
+	for _, operation := range request.Operations {
+		if operation.Type != "note.save" && operation.Type != "note.delete" {
+			continue
+		}
+		if blocked, err := a.fileOperationBlocked(operation.NoteID); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "inspect_file_operations_failed", "could not inspect pending file operations")
+			return
+		} else if blocked {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error":   "note file recovery requires attention",
+				"code":    "note_file_recovery_blocked",
+				"note_id": operation.NoteID,
+			})
+			return
+		}
 	}
 
 	lastSequence, err := syncDeviceSequence(a.db, request.DeviceID)
 	if err != nil {
-		http.Error(w, "could not read sync state", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "read_sync_state_failed", "could not read sync state")
 		return
 	}
 	response := syncPushResponse{Acknowledged: make([]syncOperationResult, 0, len(request.Operations)), ExpectedSequence: lastSequence + 1}
@@ -90,7 +116,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if err != nil {
-				http.Error(w, "invalid replayed operation", http.StatusConflict)
+				writeAPIError(w, http.StatusConflict, "invalid_replayed_operation", "invalid replayed operation")
 				return
 			}
 			response.Acknowledged = append(response.Acknowledged, stored)
@@ -102,7 +128,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := a.applySyncOperation(request.DeviceID, operation)
 		if err != nil {
-			http.Error(w, "could not apply sync operation", http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, "apply_sync_operation_failed", "could not apply sync operation")
 			return
 		}
 		if result.Status == "applied" {
@@ -167,6 +193,93 @@ func storedSyncOperation(db *sql.DB, deviceID string, sequence int64, opID strin
 	return result, nil
 }
 
+var preferenceFieldNames = map[string]struct{}{
+	"autoSave":               {},
+	"hidePreview":            {},
+	"hideHeaderOnFullscreen": {},
+	"hideToolbar":            {},
+	"hideSaveButton":         {},
+	"collapseDetails":        {},
+	"hideCursorHighlight":    {},
+	"statusDisplay":          {},
+	"theme":                  {},
+	"accentColor":            {},
+	"fontFamily":             {},
+	"editorFontFamily":       {},
+	"previewFontFamily":      {},
+}
+
+func preferenceFields(p *prefs) (map[string]json.RawMessage, error) {
+	encoded, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "revision")
+	delete(fields, "_sync_patch")
+	delete(fields, "_sync_base")
+	return fields, nil
+}
+
+func jsonValuesEqual(left, right json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(left), bytes.TrimSpace(right))
+}
+
+func preferencePatchConflicts(current *prefs, operation *prefs) (bool, error) {
+	currentFields, err := preferenceFields(current)
+	if err != nil {
+		return false, err
+	}
+	for key, desired := range operation.SyncPatch {
+		if _, ok := preferenceFieldNames[key]; !ok {
+			return false, fmt.Errorf("unknown preference field %q", key)
+		}
+		base, ok := operation.SyncBase[key]
+		if !ok {
+			return true, nil
+		}
+		currentValue, exists := currentFields[key]
+		if !exists {
+			currentValue = json.RawMessage(`""`)
+		}
+		if !jsonValuesEqual(currentValue, base) && !jsonValuesEqual(currentValue, desired) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func applyPreferencePatch(current *prefs, patch map[string]json.RawMessage) (*prefs, error) {
+	fields, err := preferenceFields(current)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range patch {
+		if _, ok := preferenceFieldNames[key]; !ok {
+			return nil, fmt.Errorf("unknown preference field %q", key)
+		}
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("invalid preference value for %q", key)
+		}
+		fields[key] = value
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	var next prefs
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&next); err != nil {
+		return nil, err
+	}
+	next.Revision = current.Revision
+	return &next, nil
+}
+
 func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest) (syncOperationResult, error) {
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -214,7 +327,7 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		if err != nil {
 			return syncOperationResult{}, err
 		}
-		pendingFileOperation = &fileOperation{ID: fileOperationID, Action: fileOperationReplace, NoteID: operation.NoteID, StageName: stagedName}
+		pendingFileOperation = &fileOperation{ID: fileOperationID, Action: fileOperationReplace, NoteID: operation.NoteID, StageName: stagedName, ExpectedHash: fileContentHash(enc)}
 		if err := recordFileOperation(tx, *pendingFileOperation); err != nil {
 			return syncOperationResult{}, err
 		}
@@ -246,13 +359,41 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 			return syncOperationResult{}, err
 		}
 	case "prefs.save":
-		data, err := json.Marshal(operation.Prefs)
+		current, err := getPrefsTx(tx)
 		if err != nil {
 			return syncOperationResult{}, err
 		}
-		if _, err := tx.Exec("UPDATE prefs SET data = ? WHERE id = 1", string(data)); err != nil {
+		if len(operation.Prefs.SyncPatch) > 0 {
+			if operation.BaseRevision != nil && *operation.BaseRevision != current.Revision {
+				conflict, err := preferencePatchConflicts(current, operation.Prefs)
+				if err != nil {
+					return syncOperationResult{}, err
+				}
+				if conflict {
+					result.Status = "conflict"
+					result.CurrentRevision = current.Revision
+					break
+				}
+			}
+			next, err := applyPreferencePatch(current, operation.Prefs.SyncPatch)
+			if err != nil {
+				return syncOperationResult{}, err
+			}
+			if err := savePrefsTx(tx, next, nil); err != nil {
+				return syncOperationResult{}, err
+			}
+			result.Revision = next.Revision
+			break
+		}
+		if operation.BaseRevision != nil && *operation.BaseRevision != current.Revision {
+			result.Status = "conflict"
+			result.CurrentRevision = current.Revision
+			break
+		}
+		if err := savePrefsTx(tx, operation.Prefs, nil); err != nil {
 			return syncOperationResult{}, err
 		}
+		result.Revision = operation.Prefs.Revision
 	case "noop":
 	}
 
@@ -265,6 +406,9 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		return syncOperationResult{}, err
 	}
 	if _, err := tx.Exec("INSERT INTO sync_operations (device_id, client_sequence, op_id, op_type, result, operation, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)", deviceID, operation.ClientSequence, operation.OpID, operation.Type, string(encoded), encodedOperation, now); err != nil {
+		return syncOperationResult{}, err
+	}
+	if _, err := tx.Exec("UPDATE sync_operation_stats SET operation_count = operation_count + 1, payload_bytes = payload_bytes + ? WHERE id = 1", len(encodedOperation)); err != nil {
 		return syncOperationResult{}, err
 	}
 	if err := compactSyncOperationPayloads(tx); err != nil {
@@ -295,57 +439,100 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 
 func compactSyncOperationAcknowledgements(tx *sql.Tx) error {
 	var count int64
-	if err := tx.QueryRow("SELECT count(*) FROM sync_operations").Scan(&count); err != nil {
+	if err := tx.QueryRow("SELECT operation_count FROM sync_operation_stats WHERE id = 1").Scan(&count); err != nil {
 		return err
 	}
 	if count <= maxSyncOperationAcknowledgements {
 		return nil
 	}
-	_, err := tx.Exec(`DELETE FROM sync_operations WHERE rowid IN (
+	batchSize := min(count-maxSyncOperationAcknowledgements, int64(syncOperationCompactionBatchSize))
+	var removedBytes int64
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(payload_size), 0) FROM (
+		SELECT length(operation) AS payload_size
+		FROM sync_operations
+		ORDER BY applied_at, device_id, client_sequence
+		LIMIT ?
+	)`, batchSize).Scan(&removedBytes); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM sync_operations WHERE rowid IN (
 		SELECT rowid FROM sync_operations
 		ORDER BY applied_at, device_id, client_sequence
 		LIMIT ?
-	)`, count-maxSyncOperationAcknowledgements)
+	)`, batchSize)
+	if err != nil {
+		return err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE sync_operation_stats
+		SET operation_count = MAX(0, operation_count - ?),
+		    payload_bytes = MAX(0, payload_bytes - ?)
+		WHERE id = 1`, removed, removedBytes)
 	return err
 }
 
 func compactSyncOperationPayloads(tx *sql.Tx) error {
 	var total int64
-	if err := tx.QueryRow("SELECT COALESCE(SUM(length(operation)), 0) FROM sync_operations").Scan(&total); err != nil {
+	if err := tx.QueryRow("SELECT payload_bytes FROM sync_operation_stats WHERE id = 1").Scan(&total); err != nil {
 		return err
 	}
 	if total <= maxSyncOperationPayloadBytes {
 		return nil
 	}
 	type storedPayload struct {
-		deviceID string
-		sequence int64
-		size     int64
+		rowID int64
+		size  int64
 	}
-	rows, err := tx.Query("SELECT device_id, client_sequence, length(operation) FROM sync_operations WHERE operation != ? ORDER BY applied_at, device_id, client_sequence", compactedOperationPayload)
-	if err != nil {
-		return err
-	}
-	payloads := make([]storedPayload, 0)
-	for rows.Next() {
-		var payload storedPayload
-		if err := rows.Scan(&payload.deviceID, &payload.sequence, &payload.size); err != nil {
-			rows.Close()
+	for total > maxSyncOperationPayloadBytes {
+		rows, err := tx.Query(`SELECT rowid, length(operation) FROM sync_operations
+			WHERE operation != ?
+			ORDER BY applied_at, device_id, client_sequence
+			LIMIT ?`, compactedOperationPayload, syncOperationCompactionBatchSize)
+		if err != nil {
 			return err
 		}
-		payloads = append(payloads, payload)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, payload := range payloads {
-		if total <= maxSyncOperationPayloadBytes {
+		payloads := make([]storedPayload, 0, syncOperationCompactionBatchSize)
+		for rows.Next() {
+			var payload storedPayload
+			if err := rows.Scan(&payload.rowID, &payload.size); err != nil {
+				rows.Close()
+				return err
+			}
+			payloads = append(payloads, payload)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(payloads) == 0 {
 			break
 		}
-		if _, err := tx.Exec("UPDATE sync_operations SET operation = ? WHERE device_id = ? AND client_sequence = ?", compactedOperationPayload, payload.deviceID, payload.sequence); err != nil {
+		var reduced int64
+		for _, payload := range payloads {
+			result, err := tx.Exec("UPDATE sync_operations SET operation = ? WHERE rowid = ? AND operation != ?", compactedOperationPayload, payload.rowID, compactedOperationPayload)
+			if err != nil {
+				return err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed > 0 {
+				reduced += payload.size - int64(len(compactedOperationPayload))
+			}
+		}
+		if reduced <= 0 {
+			break
+		}
+		total -= reduced
+		if _, err := tx.Exec("UPDATE sync_operation_stats SET payload_bytes = ? WHERE id = 1", total); err != nil {
 			return err
 		}
-		total -= payload.size - int64(len(compactedOperationPayload))
 	}
 	return nil
 }
