@@ -730,6 +730,84 @@ func TestSessionsPersistAcrossStoreRestart(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedActivityRenewsNearExpirySessions(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	rl, err := newRateLimiter(db, false)
+	if err != nil {
+		t.Fatalf("new rate limiter: %v", err)
+	}
+	a := &app{db: db, sessions: newSessionStore(db), rl: rl}
+
+	nearToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create near-expiry session: %v", err)
+	}
+	nearExpiry := time.Now().UTC().Add(sessionRenewalThreshold - time.Hour).Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", nearExpiry, sessionTokenHash(nearToken)); err != nil {
+		t.Fatalf("set near expiry: %v", err)
+	}
+	nearRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	nearRequest.AddCookie(&http.Cookie{Name: "session", Value: nearToken})
+	nearResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(nearResult, nearRequest)
+	if nearResult.Code != http.StatusOK {
+		t.Fatalf("near-expiry authenticated request = %d: %s", nearResult.Code, nearResult.Body.String())
+	}
+	refreshedCookie := nearResult.Result().Cookies()
+	if len(refreshedCookie) != 1 || refreshedCookie[0].MaxAge != int(sessionLifetime.Seconds()) {
+		t.Fatalf("renewal cookie = %#v; want max-age %d", refreshedCookie, int(sessionLifetime.Seconds()))
+	}
+	var renewedExpiry string
+	if err := db.QueryRow("SELECT expires_at FROM sessions WHERE token_hash = ?", sessionTokenHash(nearToken)).Scan(&renewedExpiry); err != nil {
+		t.Fatalf("read renewed expiry: %v", err)
+	}
+	renewedAt, err := time.Parse(time.RFC3339, renewedExpiry)
+	if err != nil || renewedAt.Before(time.Now().UTC().Add(sessionLifetime-2*time.Minute)) {
+		t.Fatalf("renewed expiry = %q; want approximately 180 days from now", renewedExpiry)
+	}
+
+	farToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create far-expiry session: %v", err)
+	}
+	farExpiry := time.Now().UTC().Add(sessionRenewalThreshold + time.Hour).Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", farExpiry, sessionTokenHash(farToken)); err != nil {
+		t.Fatalf("set far expiry: %v", err)
+	}
+	farRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	farRequest.AddCookie(&http.Cookie{Name: "session", Value: farToken})
+	farResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(farResult, farRequest)
+	if farResult.Code != http.StatusOK {
+		t.Fatalf("far-expiry authenticated request = %d: %s", farResult.Code, farResult.Body.String())
+	}
+	if got := farResult.Header().Get("Set-Cookie"); got != "" {
+		t.Fatalf("far-expiry request refreshed cookie %q", got)
+	}
+
+	expiredToken, err := a.sessions.create()
+	if err != nil {
+		t.Fatalf("create expired session: %v", err)
+	}
+	if _, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ?", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), sessionTokenHash(expiredToken)); err != nil {
+		t.Fatalf("set expired session: %v", err)
+	}
+	expiredRequest := httptest.NewRequest(http.MethodGet, "/api/check", nil)
+	expiredRequest.AddCookie(&http.Cookie{Name: "session", Value: expiredToken})
+	expiredResult := httptest.NewRecorder()
+	a.auth(a.handleCheck)(expiredResult, expiredRequest)
+	if expiredResult.Code != http.StatusUnauthorized {
+		t.Fatalf("expired session status = %d: %s", expiredResult.Code, expiredResult.Body.String())
+	}
+}
+
 func TestEventsStreamSendsAnImmediateHeartbeat(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {
