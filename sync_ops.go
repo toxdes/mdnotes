@@ -330,7 +330,8 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		// first server revision exists. Existing notes use ordered note.pin
 		// operations, preventing a stale content save from changing their pin.
 		if currentRevision == 0 && operation.Pinned {
-			if err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&result.PinOrder); err != nil {
+			result.PinOrder, err = nextPinOrderTx(tx)
+			if err != nil {
 				return syncOperationResult{}, err
 			}
 			if _, err := tx.Exec("UPDATE notes SET pinned = 1, pin_order = ? WHERE id = ?", result.PinOrder, operation.NoteID); err != nil {
@@ -369,7 +370,8 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 			break
 		}
 		if operation.Pinned {
-			if err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&result.PinOrder); err != nil {
+			result.PinOrder, err = nextPinOrderTx(tx)
+			if err != nil {
 				return syncOperationResult{}, err
 			}
 		}
@@ -622,6 +624,12 @@ func checkNoteRevisionTx(tx *sql.Tx, id string, expected int64) (int64, error) {
 		return revision, errRevisionConflict
 	}
 	return 0, nil
+}
+
+func nextPinOrderTx(tx *sql.Tx) (int64, error) {
+	var order int64
+	err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&order)
+	return order, err
 }
 
 func getNoteTx(tx *sql.Tx, id string) (*note, error) {
