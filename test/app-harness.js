@@ -15,6 +15,8 @@ globalThis.__mdnotesTestHooks = {
   flushPendingChanges,
   quarantineQueueOperation,
   saveLocalNoteAndQueue,
+  toggleNotePin,
+  getLocalNotes,
   pendingOperations,
   pendingOperationsForNote,
   claimQueueOperation,
