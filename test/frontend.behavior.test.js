@@ -914,13 +914,26 @@ describe('note pinning', () => {
       if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
       throw new Error(`unexpected request: ${path}`);
     }}));
-    await app.hooks.putLocalNote({...remote, pinned: false});
+    await app.hooks.putLocalNote({...remote, title: 'Stale local', content: 'stale local', updated_at: '2025-01-01T00:00:00Z', pinned: false});
     await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
 
     await app.hooks.flushPendingChanges();
     expect(pushCount).toBe(2);
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
-    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({pinned: true, pin_order: 12, revision: 4});
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({title: 'Remote', content: 'remote', pinned: true, pin_order: 12, revision: 4});
+  });
+
+  test('keeps a later local content save while rebasing a stale pin', async () => {
+    const remote = {id: 'note-a', title: 'Remote', tags: '', content: 'remote', revision: 3, pinned: false, pin_order: 0};
+    const app = track(await createApp({fetchImpl: async path => String(path) === '/api/notes/note-a' ? response(200, JSON.stringify(remote)) : response(200, '{}')}));
+    await app.hooks.putLocalNote({...remote, title: 'Local edit', content: 'local edit', revision: 2, pending: true});
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
+    await app.hooks.queueOperation({type: 'note.save', note_id: 'note-a', base_revision: 2, note: {id: 'note-a', title: 'Local edit', tags: '', content: 'local edit'}});
+    const pin = (await app.hooks.pendingOperations()).find(operation => operation.type === 'note.pin');
+
+    await app.hooks.applySyncAcknowledgement(pin, {status: 'conflict', current_revision: 3});
+
+    expect(await app.hooks.getLocalNote('note-a')).toMatchObject({title: 'Local edit', content: 'local edit', pinned: true, revision: 3, pending: true});
   });
 
   test('recovers a compacted pin acknowledgement from the remote note', async () => {

@@ -1752,9 +1752,20 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
         await removePendingOperationIfIdentityMatches(operation.id, operation);
         return;
       }
+      const queued = await pendingOperationsForNote(operation.note_id);
+      const hasLaterSave = queued.some(item => item.client_sequence > operation.client_sequence && item.type === 'note.save');
       await removePendingOperationIfIdentityMatches(operation.id, operation);
       const local = await getLocalNote(operation.note_id);
-      const next = {...remote, ...local, pinned: Boolean(operation.pinned), pin_order: Boolean(operation.pinned) ? (local?.pin_order || 0) : 0, revision: remote.revision, pending: true, base_revision: remote.revision};
+      const preserveLocalContent = hasLaterSave || (currentNoteId === operation.note_id && isDirty);
+      const next = {
+        ...remote,
+        ...(preserveLocalContent ? local : {}),
+        pinned: Boolean(operation.pinned),
+        pin_order: Boolean(operation.pinned) ? (local?.pin_order || 0) : 0,
+        revision: remote.revision,
+        pending: true,
+        base_revision: remote.revision,
+      };
       await putLocalNote(next);
       await queueOperation({type: 'note.pin', note_id: operation.note_id, base_revision: remote.revision, pinned: Boolean(operation.pinned)});
       updateOpenNote(next);
