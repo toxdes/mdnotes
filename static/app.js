@@ -2863,6 +2863,7 @@ applyPanelRatio();
 
 // --- Cursor preview highlight ---
 let previewBlocks = [];
+let previewBlockRanges = [];
 function isPreviewVisible() {
   return !screens.editor.classList.contains('hidden') && panelState !== 'editor';
 }
@@ -2883,6 +2884,24 @@ function scheduleHighlight() {
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
+  previewBlockRanges = [];
+  const source = $('#note-content').value;
+  if (!source || typeof marked === 'undefined' || typeof marked.lexer !== 'function') return;
+  try {
+    const ranges = [];
+    let offset = 0;
+    for (const token of marked.lexer(source, markdownRenderOptions())) {
+      const raw = typeof token.raw === 'string' ? token.raw : '';
+      if (!raw) continue;
+      const start = source.indexOf(raw, offset);
+      if (start < 0) continue;
+      ranges.push({start, end: start + raw.length});
+      offset = start + raw.length;
+    }
+    if (ranges.length === previewBlocks.length) previewBlockRanges = ranges;
+  } catch (_) {
+    previewBlockRanges = [];
+  }
 }
 function highlightBlock() {
   if (!isPreviewVisible()) return;
@@ -2898,9 +2917,15 @@ function highlightBlock() {
   const text = ta.value;
   const pos = ta.selectionStart;
   if (!text.trim() || !previewBlocks.length) return;
-  const before = text.slice(0, pos);
-  const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
-  let idx = Math.max(0, nonEmpty.length - 1);
+  let idx = -1;
+  if (previewBlockRanges.length === previewBlocks.length) {
+    idx = previewBlockRanges.findIndex(range => pos <= range.end);
+    if (idx < 0) idx = previewBlockRanges.length - 1;
+  } else {
+    const before = text.slice(0, pos);
+    const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
+    idx = Math.max(0, nonEmpty.length - 1);
+  }
   if (idx >= previewBlocks.length) idx = previewBlocks.length - 1;
   previewBlocks[idx]?.classList.add('highlight');
 }

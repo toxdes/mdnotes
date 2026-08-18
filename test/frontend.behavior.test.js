@@ -68,6 +68,30 @@ describe('editor display preferences', () => {
 });
 
 describe('markdown preview policy', () => {
+  test('highlights the rendered block containing the caret', async () => {
+    const app = track(await createApp());
+    app.window.marked = {
+      lexer: () => [
+        {raw: '# Heading\n\n'},
+        {raw: '- first\n\n- second\n\n'},
+        {raw: '```text\ninside\n\ncode\n```\n\n'},
+        {raw: 'tail'},
+      ],
+      parse: () => '<h1>Heading</h1><ul><li>first</li><li>second</li></ul><pre><code>inside\n\ncode\n</code></pre><p>tail</p>',
+    };
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: '# Heading\n\n- first\n\n- second\n\n```text\ninside\n\ncode\n```\n\ntail'});
+    app.hooks.updatePreview();
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const codeOffset = textarea.value.indexOf('code');
+    textarea.selectionStart = textarea.selectionEnd = codeOffset;
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks[2].classList.contains('highlight')).toBe(true);
+    expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
   test('escapes raw HTML, rejects unsafe resource URLs, and lazy-loads images', async () => {
     const app = track(await createApp());
     app.window.marked = {
