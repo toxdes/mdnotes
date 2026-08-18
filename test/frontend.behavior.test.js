@@ -823,6 +823,25 @@ describe('logout storage cleanup', () => {
   });
 });
 
+describe('note pinning', () => {
+  test('filters before sorting and queues an offline pin without changing content', async () => {
+    const app = track(await createApp());
+    await app.hooks.putLocalNote({id: 'pinned-work', title: 'Pinned work', tags: 'work', content: 'keep', updated_at: '2026-01-01T00:00:00Z', revision: 2, pinned: true, pin_order: 10});
+    await app.hooks.putLocalNote({id: 'recent-work', title: 'Recent work', tags: 'work', content: 'recent', updated_at: '2026-02-01T00:00:00Z', revision: 2});
+    await app.hooks.putLocalNote({id: 'pinned-home', title: 'Pinned home', tags: 'home', content: 'hidden', updated_at: '2026-03-01T00:00:00Z', revision: 2, pinned: true, pin_order: 20});
+
+    const notes = await app.hooks.getLocalNotes();
+    expect(notes.map(note => note.id)).toEqual(['pinned-home', 'pinned-work', 'recent-work']);
+    expect(notes.filter(note => (note.tags || '').split(',').includes('work')).map(note => note.id)).toEqual(['pinned-work', 'recent-work']);
+
+    await app.hooks.toggleNotePin('recent-work');
+    expect(await app.hooks.getLocalNote('recent-work')).toMatchObject({content: 'recent', pinned: true, pending: true});
+    await expect(app.hooks.pendingOperations()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({type: 'note.pin', note_id: 'recent-work', pinned: true, base_revision: 2}),
+    ]));
+  });
+});
+
 describe('offline database migrations', () => {
   test('upgrades the legacy layout to the explicit schema and queue index', async () => {
     const app = track(await createApp());

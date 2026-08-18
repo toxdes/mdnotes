@@ -933,6 +933,50 @@ func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	}
 }
 
+func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := upsertNote(db, "pin-note", "Pinned", "pin-note.md", "work"); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir()}
+	baseRevision := int64(1)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_pin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "pin_operation", Type: "note.pin", NoteID: "pin-note", BaseRevision: &baseRevision, Pinned: true,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	record := httptest.NewRecorder()
+	a.handleSyncPush(record, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if record.Code != http.StatusOK {
+		t.Fatalf("pin status = %d: %s", record.Code, record.Body.String())
+	}
+	var response syncPushResponse
+	if err := json.Unmarshal(record.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Status != "applied" || response.Acknowledged[0].PinOrder < 1 {
+		t.Fatalf("pin response = %#v", response)
+	}
+	note, err := getNote(db, "pin-note")
+	if err != nil {
+		t.Fatalf("read pinned note: %v", err)
+	}
+	if !note.Pinned || note.PinOrder != response.Acknowledged[0].PinOrder || note.Revision != 2 {
+		t.Fatalf("pinned note = %#v", note)
+	}
+	if note.Title != "Pinned" || note.Tags != "work" {
+		t.Fatalf("pin changed note metadata unexpectedly = %#v", note)
+	}
+}
+
 func TestMigrationsAreRecordedAndIdempotent(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {
