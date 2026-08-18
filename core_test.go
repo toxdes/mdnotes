@@ -979,6 +979,25 @@ func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) 
 	if note.Title != "Pinned" || note.Tags != "work" || note.UpdatedAt != before.UpdatedAt {
 		t.Fatalf("pin changed note metadata unexpectedly = %#v", note)
 	}
+	replayRecord := httptest.NewRecorder()
+	a.handleSyncPush(replayRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	var replay syncPushResponse
+	if replayRecord.Code != http.StatusOK || json.Unmarshal(replayRecord.Body.Bytes(), &replay) != nil || replay.Acknowledged[0].PinOrder != response.Acknowledged[0].PinOrder {
+		t.Fatalf("replayed pin = status %d, body %s", replayRecord.Code, replayRecord.Body.String())
+	}
+	if err := upsertNote(db, "second-pin", "Second", "second-pin.md", ""); err != nil {
+		t.Fatalf("create second note: %v", err)
+	}
+	secondRevision := int64(1)
+	secondBody, _ := json.Marshal(syncPushRequest{DeviceID: "device_other", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "second-pin-operation", Type: "note.pin", NoteID: "second-pin", BaseRevision: &secondRevision, Pinned: true,
+	}}})
+	secondRecord := httptest.NewRecorder()
+	a.handleSyncPush(secondRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(secondBody))))
+	var secondResponse syncPushResponse
+	if secondRecord.Code != http.StatusOK || json.Unmarshal(secondRecord.Body.Bytes(), &secondResponse) != nil || secondResponse.Acknowledged[0].PinOrder <= response.Acknowledged[0].PinOrder {
+		t.Fatalf("second pin ordering = status %d, body %s", secondRecord.Code, secondRecord.Body.String())
+	}
 	unpinRevision := note.Revision
 	unpinBody, err := json.Marshal(syncPushRequest{DeviceID: "device_unpin", Operations: []syncOperationRequest{{
 		ClientSequence: 1, OpID: "unpin_operation", Type: "note.pin", NoteID: "pin-note", BaseRevision: &unpinRevision, Pinned: false,
