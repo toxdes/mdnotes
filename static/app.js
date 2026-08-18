@@ -71,7 +71,7 @@ const unhealthySseFallbackSyncAgeMs = 30 * 1000;
 // the app shell available, while IndexedDB holds the user's working set and a
 // durable queue of mutations to replay after connectivity returns.
 const offlineDBName = 'mdnotes-offline';
-const offlineDBVersion = 3;
+const offlineDBVersion = 4;
 let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
@@ -281,7 +281,20 @@ function removeLocalNote(id) {
 
 async function getLocalNotes() {
   const notes = await getAllLocalNotes();
-  return notes.filter(note => !note.deleted).sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  return notes.filter(note => !note.deleted).sort((a, b) => {
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+    if (a.pinned && b.pinned && Number(a.pin_order || 0) !== Number(b.pin_order || 0)) return Number(b.pin_order || 0) - Number(a.pin_order || 0);
+    return (b.updated_at || '').localeCompare(a.updated_at || '') || String(a.id).localeCompare(String(b.id));
+  });
+}
+
+async function nextLocalPinOrder() {
+  return withOfflineStore(['state'], 'readwrite', async stores => {
+    const current = Number((await requestValue(stores.state.get('pinOrder')))?.value || 0);
+    const next = Math.max(Date.now(), current + 1);
+    await requestValue(stores.state.put({key: 'pinOrder', value: next}));
+    return next;
+  });
 }
 
 function getAllLocalNotes() {
@@ -334,11 +347,22 @@ function mergeQueuedPreferencePayload(existing, operation) {
 }
 
 async function queueOperationInStores(stores, operation) {
-  if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'prefs.save') {
+  if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'note.pin' || operation.type === 'prefs.save') {
     await requestValue(stores.state.delete(rejectedSyncKey(operation.note_id)));
   }
-  if (operation.type === 'note.save' || operation.type === 'prefs.save') {
+  if (operation.type === 'note.save' || operation.type === 'note.pin' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    if (operation.type === 'note.pin') {
+      const initialSave = queued
+        .filter(item => !item.attempted_at && item.type === 'note.save' && Number(item.base_revision || 0) === 0)
+        .sort((left, right) => right.client_sequence - left.client_sequence)[0];
+      if (initialSave?.note) {
+        initialSave.note.pinned = Boolean(operation.pinned);
+        initialSave.note.pin_order = operation.pin_order || 0;
+        await requestValue(stores.queue.put(initialSave));
+        return;
+      }
+    }
     const existing = queued
       // Once a request has been attempted, its op_id/client_sequence and
       // payload are immutable. A later edit must get a new queue identity so
@@ -347,7 +371,10 @@ async function queueOperationInStores(stores, operation) {
       .sort((left, right) => right.client_sequence - left.client_sequence)[0];
     if (existing) {
       if (operation.type === 'prefs.save') mergeQueuedPreferencePayload(existing, operation);
-      else {
+      else if (operation.type === 'note.pin') {
+        existing.base_revision = operation.base_revision;
+        existing.pinned = operation.pinned;
+      } else {
         existing.base_revision = operation.base_revision;
         existing.note = operation.note;
         existing.prefs = operation.prefs;
@@ -446,6 +473,12 @@ function pendingOperationsForNote(noteID) {
   return withOfflineStore(['queue'], 'readonly', stores => requestValue(stores.queue.index('note_id').getAll(noteID)));
 }
 
+function latestLaterOperation(operations, current, type) {
+  return operations
+    .filter(operation => operation.client_sequence > current.client_sequence && operation.type === type)
+    .sort((left, right) => right.client_sequence - left.client_sequence)[0];
+}
+
 async function claimQueueOperation(id) {
   return withOfflineStore(['queue'], 'readwrite', async stores => {
     const operation = await requestValue(stores.queue.get(id));
@@ -472,7 +505,10 @@ function queueOperationPayload(operation) {
       base_content: operation.note.base_content,
       base_title: operation.note.base_title,
       base_tags: operation.note.base_tags,
+      pinned: operation.note.pinned,
+      pin_order: operation.note.pin_order,
     },
+    pinned: operation.pinned,
     prefs: operation.prefs || null,
   });
 }
@@ -527,7 +563,7 @@ async function rebaseQueuedNoteOperations(noteID, acknowledgedID, revision, base
     let hasLater = false;
     operations.forEach(operation => {
       if (operation.id === acknowledgedID || operation.client_sequence < 1 || operation.attempted_at) return;
-      if (operation.type === 'note.save' || operation.type === 'note.delete') {
+      if (operation.type === 'note.save' || operation.type === 'note.delete' || operation.type === 'note.pin') {
         operation.base_revision = revision;
         if (operation.note) {
           operation.note.base_revision = revision;
@@ -1587,7 +1623,7 @@ async function reconcileCompactedOperationLocally(operation, remote) {
     let hasLater = false;
     for (const later of operations) {
       if (later.id === operation.id || later.client_sequence < 1 || later.attempted_at) continue;
-      if (later.type !== 'note.save' && later.type !== 'note.delete') continue;
+      if (later.type !== 'note.save' && later.type !== 'note.delete' && later.type !== 'note.pin') continue;
       if (remote) {
         later.base_revision = remote.revision;
         if (later.note) {
@@ -1615,7 +1651,7 @@ async function reconcileCompactedOperationLocally(operation, remote) {
 }
 
 async function acknowledgeCompactedOperation(operation) {
-  if (operation.type !== 'note.save' && operation.type !== 'note.delete') {
+  if (operation.type !== 'note.save' && operation.type !== 'note.delete' && operation.type !== 'note.pin') {
     const removed = await removePendingOperationIfIdentityMatches(operation.id, operation);
     if (!removed) throw new Error('compacted sync operation changed before acknowledgement');
     return;
@@ -1656,6 +1692,9 @@ function outgoingSyncOperation(operation) {
     outgoing.tags = operation.note.tags;
     outgoing.content = operation.note.content;
     outgoing.base_content = operation.note.base_content || '';
+    outgoing.pinned = Boolean(operation.note.pinned);
+  } else if (operation.type === 'note.pin') {
+    outgoing.pinned = Boolean(operation.pinned);
   } else if (operation.type === 'prefs.save') {
     outgoing.prefs = operation.prefs;
   }
@@ -1712,6 +1751,38 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
       await resolvePreferenceConflict(operation);
       return;
     }
+    if (operation.type === 'note.pin') {
+      const remote = await loadConflictRemoteNote(operation.note_id);
+      if (!remote) {
+        await removeLocalNote(operation.note_id);
+        await removePendingOperationIfIdentityMatches(operation.id, operation);
+        return;
+      }
+      const queued = await pendingOperationsForNote(operation.note_id);
+      const hasLaterSave = Boolean(latestLaterOperation(queued, operation, 'note.save'));
+      const laterPin = latestLaterOperation(queued, operation, 'note.pin');
+      const desiredPinned = laterPin ? Boolean(laterPin.pinned) : Boolean(operation.pinned);
+      await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
+      await removePendingOperationIfIdentityMatches(operation.id, operation);
+      const local = await getLocalNote(operation.note_id);
+      const preserveLocalContent = hasLaterSave || (currentNoteId === operation.note_id && isDirty);
+      const next = {
+        ...remote,
+        ...(preserveLocalContent ? local : {}),
+        pinned: desiredPinned,
+        pin_order: desiredPinned ? (local?.pin_order || 0) : 0,
+        revision: remote.revision,
+        pending: true,
+        base_revision: remote.revision,
+      };
+      await putLocalNote(next);
+      if (!laterPin) {
+        await queueOperation({type: 'note.pin', note_id: operation.note_id, base_revision: remote.revision, pinned: desiredPinned, pin_order: next.pin_order});
+      }
+      updateOpenNote(next);
+      await refreshDashboard();
+      return;
+    }
     const remote = await loadConflictRemoteNote(operation.note_id);
     if (await mergeConflictedNote(operation, remote)) {
       showToast('Merged your non-overlapping changes.', 'success');
@@ -1732,14 +1803,30 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
   }
   if (operation.type === 'note.save') {
     const acknowledgedNote = operation.note;
+    const queued = await pendingOperationsForNote(operation.note_id);
+    const laterPin = latestLaterOperation(queued, operation, 'note.pin');
     const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
     const local = await getLocalNote(operation.note_id);
     if (local) {
-      await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+      const pinOrder = laterPin ? local.pin_order : (acknowledgedNote.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0);
+      await putLocalNote({...local, revision: acknowledgement.revision, pin_order: pinOrder, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
     }
     if (currentNoteId === operation.note_id) {
       currentRevision = acknowledgement.revision || 0;
       currentBaseRevision = hasLater ? acknowledgement.revision : null;
+    }
+  }
+  if (operation.type === 'note.pin') {
+    const local = await getLocalNote(operation.note_id);
+    if (local) {
+      const queued = await pendingOperationsForNote(operation.note_id);
+      const laterPin = latestLaterOperation(queued, operation, 'note.pin');
+      const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, local);
+      const pinned = laterPin ? Boolean(local.pinned) : Boolean(operation.pinned);
+      const pinOrder = laterPin ? local.pin_order : (pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0);
+      const remainsPending = hasLater || Boolean(laterPin);
+      await putLocalNote({...local, revision: acknowledgement.revision, pinned, pin_order: pinOrder, pending: remainsPending, base_revision: remainsPending ? acknowledgement.revision : null});
+      await refreshDashboard();
     }
   }
   await removePendingOperationIfIdentityMatches(operation.id, operation);
@@ -2195,16 +2282,23 @@ function renderDashboard(notes, conflicts) {
     return;
   }
   list.innerHTML = notes.map(n => `
-    <li>
+    <li class="note-item-row">
       <button type="button" class="note-item" data-id="${esc(n.id)}">
-      <div class="note-title">${esc(n.title || 'Untitled')}${conflicts.has(n.id) ? '<span class="note-conflict">Conflict</span>' : ''}</div>
-      <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
-      ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
+        <div class="note-title">${esc(n.title || 'Untitled')}${conflicts.has(n.id) ? '<span class="note-conflict">Conflict</span>' : ''}</div>
+        <div class="note-meta">${esc(formatDate(n.updated_at))}</div>
+        ${n.tags ? '<div class="note-tags">'+n.tags.split(',').map(t=>`<span class="tag">${esc(t.trim())}</span>`).join('')+'</div>' : ''}
       </button>
+      <button type="button" class="note-pin" data-id="${esc(n.id)}" aria-pressed="${Boolean(n.pinned)}" aria-label="${n.pinned ? 'Unpin' : 'Pin'} note" title="${n.pinned ? 'Unpin' : 'Pin'} note"><svg class="icon pin-icon" aria-hidden="true"><use href="#icon-${n.pinned ? 'pinned' : 'pin'}"></use></svg><svg class="icon unpin-icon" aria-hidden="true"><use href="#icon-pinned-off"></use></svg></button>
     </li>
   `).join('');
   list.querySelectorAll('.note-item').forEach(el => {
     el.addEventListener('click', () => openNote(el.dataset.id));
+  });
+  list.querySelectorAll('.note-pin').forEach(el => {
+    el.addEventListener('click', event => {
+      event.stopPropagation();
+      void toggleNotePin(el.dataset.id);
+    });
   });
 }
 
@@ -2504,6 +2598,18 @@ function saveCurrentNote(trySync = true) {
     localSavePromise = null;
   });
   return localSavePromise;
+}
+
+async function toggleNotePin(noteID) {
+  const local = await getLocalNote(noteID);
+  if (!local) return false;
+  const pinned = !Boolean(local.pinned);
+  const baseRevision = local.pending ? (local.base_revision ?? local.revision ?? 0) : (local.revision ?? 0);
+  const next = {...local, pinned, pin_order: pinned ? await nextLocalPinOrder() : 0, pending: true, base_revision: baseRevision};
+  await saveLocalNoteAndQueue(next, {type: 'note.pin', note_id: noteID, base_revision: baseRevision, pinned, pin_order: next.pin_order});
+  await refreshDashboard();
+  scheduleSync();
+  return true;
 }
 
 let saveTimer = null;

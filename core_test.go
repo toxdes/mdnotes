@@ -933,6 +933,124 @@ func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	}
 }
 
+func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	if err := upsertNote(db, "pin-note", "Pinned", "pin-note.md", "work"); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	before, err := getNote(db, "pin-note")
+	if err != nil {
+		t.Fatalf("read original note: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir()}
+	baseRevision := int64(1)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_pin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "pin_operation", Type: "note.pin", NoteID: "pin-note", BaseRevision: &baseRevision, Pinned: true,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	record := httptest.NewRecorder()
+	a.handleSyncPush(record, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if record.Code != http.StatusOK {
+		t.Fatalf("pin status = %d: %s", record.Code, record.Body.String())
+	}
+	var response syncPushResponse
+	if err := json.Unmarshal(record.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Status != "applied" || response.Acknowledged[0].PinOrder < 1 {
+		t.Fatalf("pin response = %#v", response)
+	}
+	note, err := getNote(db, "pin-note")
+	if err != nil {
+		t.Fatalf("read pinned note: %v", err)
+	}
+	if !note.Pinned || note.PinOrder != response.Acknowledged[0].PinOrder || note.Revision != 2 {
+		t.Fatalf("pinned note = %#v", note)
+	}
+	if note.Title != "Pinned" || note.Tags != "work" || note.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("pin changed note metadata unexpectedly = %#v", note)
+	}
+	replayRecord := httptest.NewRecorder()
+	a.handleSyncPush(replayRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	var replay syncPushResponse
+	if replayRecord.Code != http.StatusOK || json.Unmarshal(replayRecord.Body.Bytes(), &replay) != nil || replay.Acknowledged[0].PinOrder != response.Acknowledged[0].PinOrder {
+		t.Fatalf("replayed pin = status %d, body %s", replayRecord.Code, replayRecord.Body.String())
+	}
+	if err := upsertNote(db, "second-pin", "Second", "second-pin.md", ""); err != nil {
+		t.Fatalf("create second note: %v", err)
+	}
+	secondRevision := int64(1)
+	secondBody, _ := json.Marshal(syncPushRequest{DeviceID: "device_other", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "second-pin-operation", Type: "note.pin", NoteID: "second-pin", BaseRevision: &secondRevision, Pinned: true,
+	}}})
+	secondRecord := httptest.NewRecorder()
+	a.handleSyncPush(secondRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(secondBody))))
+	var secondResponse syncPushResponse
+	if secondRecord.Code != http.StatusOK || json.Unmarshal(secondRecord.Body.Bytes(), &secondResponse) != nil || secondResponse.Acknowledged[0].PinOrder <= response.Acknowledged[0].PinOrder {
+		t.Fatalf("second pin ordering = status %d, body %s", secondRecord.Code, secondRecord.Body.String())
+	}
+	unpinRevision := note.Revision
+	unpinBody, err := json.Marshal(syncPushRequest{DeviceID: "device_unpin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "unpin_operation", Type: "note.pin", NoteID: "pin-note", BaseRevision: &unpinRevision, Pinned: false,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal unpin request: %v", err)
+	}
+	unpinRecord := httptest.NewRecorder()
+	a.handleSyncPush(unpinRecord, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(unpinBody))))
+	if unpinRecord.Code != http.StatusOK {
+		t.Fatalf("unpin status = %d: %s", unpinRecord.Code, unpinRecord.Body.String())
+	}
+	note, err = getNote(db, "pin-note")
+	if err != nil || note.Pinned || note.PinOrder != 0 {
+		t.Fatalf("unpinned note = %#v, %v", note, err)
+	}
+}
+
+func TestSyncSaveCreatesPinnedNoteWithCanonicalOrder(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}
+	baseRevision := int64(0)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_new_pin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "save_pinned_note", Type: "note.save", NoteID: "new-pinned-note", BaseRevision: &baseRevision, Title: "Pinned from birth", Content: "body", Pinned: true,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	record := httptest.NewRecorder()
+	a.handleSyncPush(record, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if record.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", record.Code, record.Body.String())
+	}
+	var response syncPushResponse
+	if err := json.Unmarshal(record.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Revision != 1 || response.Acknowledged[0].PinOrder < 1 {
+		t.Fatalf("save response = %#v", response)
+	}
+	note, err := getNote(db, "new-pinned-note")
+	if err != nil || !note.Pinned || note.PinOrder != response.Acknowledged[0].PinOrder {
+		t.Fatalf("created note = %#v, %v", note, err)
+	}
+}
+
 func TestMigrationsAreRecordedAndIdempotent(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {
@@ -1641,8 +1759,11 @@ func TestMetadataSearchTracksNoteUpdatesAndDeletes(t *testing.T) {
 	if err := upsertNote(db, "beta", "Shopping list", "beta.md", "home"); err != nil {
 		t.Fatalf("insert beta: %v", err)
 	}
+	if _, err := db.Exec("UPDATE notes SET pinned = 1, pin_order = 7 WHERE id = ?", "alpha"); err != nil {
+		t.Fatalf("pin alpha: %v", err)
+	}
 	results, err := searchNotes(db, "auro", 50)
-	if err != nil || len(results) != 1 || results[0].ID != "alpha" {
+	if err != nil || len(results) != 1 || results[0].ID != "alpha" || !results[0].Pinned || results[0].PinOrder != 7 {
 		t.Fatalf("title search = %#v, %v", results, err)
 	}
 	results, err = searchNotes(db, "urgent", 50)

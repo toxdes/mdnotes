@@ -40,6 +40,7 @@ type syncOperationRequest struct {
 	Tags           string `json:"tags,omitempty"`
 	Content        string `json:"content,omitempty"`
 	BaseContent    string `json:"base_content,omitempty"`
+	Pinned         bool   `json:"pinned,omitempty"`
 	Prefs          *prefs `json:"prefs,omitempty"`
 }
 
@@ -49,6 +50,7 @@ type syncOperationResult struct {
 	Status          string `json:"status"`
 	Revision        int64  `json:"revision,omitempty"`
 	CurrentRevision int64  `json:"current_revision,omitempty"`
+	PinOrder        int64  `json:"pin_order,omitempty"`
 }
 
 type syncPushResponse struct {
@@ -86,7 +88,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, operation := range request.Operations {
-		if operation.Type != "note.save" && operation.Type != "note.delete" {
+		if operation.Type != "note.save" && operation.Type != "note.delete" && operation.Type != "note.pin" {
 			continue
 		}
 		if blocked, err := a.fileOperationBlocked(operation.NoteID); err != nil {
@@ -134,7 +136,7 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		if result.Status == "applied" {
 			if operation.Type == "prefs.save" {
 				a.publishChange("preferences")
-			} else if operation.Type == "note.save" || operation.Type == "note.delete" {
+			} else if operation.Type == "note.save" || operation.Type == "note.delete" || operation.Type == "note.pin" {
 				a.publishChange("notes")
 			}
 		}
@@ -157,6 +159,10 @@ func validateSyncOperation(operation syncOperationRequest) error {
 	case "note.delete":
 		if !noteIDPattern.MatchString(operation.NoteID) || operation.BaseRevision == nil || *operation.BaseRevision < 1 {
 			return errors.New("invalid note delete operation")
+		}
+	case "note.pin":
+		if !noteIDPattern.MatchString(operation.NoteID) || operation.BaseRevision == nil || *operation.BaseRevision < 0 {
+			return errors.New("invalid note pin operation")
 		}
 	case "prefs.save":
 		if operation.Prefs == nil {
@@ -320,6 +326,18 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		if err := upsertNoteTx(tx, operation.NoteID, operation.Title, operation.NoteID+".md", normalizeTags(operation.Tags), now); err != nil {
 			return syncOperationResult{}, err
 		}
+		// Pin state is folded into creation so a note can be pinned before its
+		// first server revision exists. Existing notes use ordered note.pin
+		// operations, preventing a stale content save from changing their pin.
+		if currentRevision == 0 && operation.Pinned {
+			result.PinOrder, err = nextPinOrderTx(tx)
+			if err != nil {
+				return syncOperationResult{}, err
+			}
+			if _, err := tx.Exec("UPDATE notes SET pinned = 1, pin_order = ? WHERE id = ?", result.PinOrder, operation.NoteID); err != nil {
+				return syncOperationResult{}, err
+			}
+		}
 		if err := tx.QueryRow("SELECT revision FROM notes WHERE id = ?", operation.NoteID).Scan(&result.Revision); err != nil {
 			return syncOperationResult{}, err
 		}
@@ -332,6 +350,41 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 			return syncOperationResult{}, err
 		}
 		cachedContent = &operation.Content
+	case "note.pin":
+		currentRevision, err := checkNoteRevisionTx(tx, operation.NoteID, *operation.BaseRevision)
+		if errors.Is(err, errRevisionConflict) {
+			result.Status = "conflict"
+			result.CurrentRevision = currentRevision
+			break
+		}
+		if err != nil {
+			return syncOperationResult{}, err
+		}
+		var exists int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM notes WHERE id = ?", operation.NoteID).Scan(&exists); err != nil {
+			return syncOperationResult{}, err
+		}
+		if exists == 0 {
+			result.Status = "conflict"
+			result.CurrentRevision = currentRevision
+			break
+		}
+		if operation.Pinned {
+			result.PinOrder, err = nextPinOrderTx(tx)
+			if err != nil {
+				return syncOperationResult{}, err
+			}
+		}
+		if _, err := tx.Exec("UPDATE notes SET pinned = ?, pin_order = ?, revision = revision + 1 WHERE id = ?", operation.Pinned, result.PinOrder, operation.NoteID); err != nil {
+			return syncOperationResult{}, err
+		}
+		if _, err := tx.Exec("INSERT INTO sync_changes (note_id, revision, deleted, changed_at) VALUES (?, ?, 0, ?)", operation.NoteID, currentRevision+1, now); err != nil {
+			return syncOperationResult{}, err
+		}
+		if err := compactSyncChangesTx(tx); err != nil {
+			return syncOperationResult{}, err
+		}
+		result.Revision = currentRevision + 1
 	case "note.delete":
 		currentRevision, err := checkNoteRevisionTx(tx, operation.NoteID, *operation.BaseRevision)
 		if errors.Is(err, errRevisionConflict) {
@@ -573,9 +626,15 @@ func checkNoteRevisionTx(tx *sql.Tx, id string, expected int64) (int64, error) {
 	return 0, nil
 }
 
+func nextPinOrderTx(tx *sql.Tx) (int64, error) {
+	var order int64
+	err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&order)
+	return order, err
+}
+
 func getNoteTx(tx *sql.Tx, id string) (*note, error) {
 	var n note
-	err := tx.QueryRow("SELECT id, title, filename, tags, created_at, updated_at, revision FROM notes WHERE id = ?", id).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.CreatedAt, &n.UpdatedAt, &n.Revision)
+	err := tx.QueryRow("SELECT id, title, filename, tags, pinned, pin_order, created_at, updated_at, revision FROM notes WHERE id = ?", id).Scan(&n.ID, &n.Title, &n.Filename, &n.Tags, &n.Pinned, &n.PinOrder, &n.CreatedAt, &n.UpdatedAt, &n.Revision)
 	if err != nil {
 		return nil, err
 	}
