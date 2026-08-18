@@ -352,6 +352,17 @@ async function queueOperationInStores(stores, operation) {
   }
   if (operation.type === 'note.save' || operation.type === 'note.pin' || operation.type === 'prefs.save') {
     const queued = await requestValue(stores.queue.index('note_id').getAll(operation.note_id));
+    if (operation.type === 'note.pin') {
+      const initialSave = queued
+        .filter(item => !item.attempted_at && item.type === 'note.save' && Number(item.base_revision || 0) === 0)
+        .sort((left, right) => right.client_sequence - left.client_sequence)[0];
+      if (initialSave?.note) {
+        initialSave.note.pinned = Boolean(operation.pinned);
+        initialSave.note.pin_order = operation.pin_order || 0;
+        await requestValue(stores.queue.put(initialSave));
+        return;
+      }
+    }
     const existing = queued
       // Once a request has been attempted, its op_id/client_sequence and
       // payload are immutable. A later edit must get a new queue identity so
@@ -1773,7 +1784,7 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
     const hasLater = await rebaseQueuedNoteOperations(operation.note_id, operation.id, acknowledgement.revision, acknowledgedNote);
     const local = await getLocalNote(operation.note_id);
     if (local) {
-      await putLocalNote({...local, revision: acknowledgement.revision, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
+      await putLocalNote({...local, revision: acknowledgement.revision, pin_order: acknowledgedNote.pinned ? (acknowledgement.pin_order || local.pin_order || 0) : 0, pending: hasLater, base_revision: hasLater ? acknowledgement.revision : null, base_content: hasLater ? acknowledgedNote.content : null, base_title: hasLater ? acknowledgedNote.title : null, base_tags: hasLater ? acknowledgedNote.tags : null});
     }
     if (currentNoteId === operation.note_id) {
       currentRevision = acknowledgement.revision || 0;
@@ -2565,7 +2576,7 @@ async function toggleNotePin(noteID) {
   const pinned = !Boolean(local.pinned);
   const baseRevision = local.pending ? (local.base_revision ?? local.revision ?? 0) : (local.revision ?? 0);
   const next = {...local, pinned, pin_order: pinned ? await nextLocalPinOrder() : 0, pending: true, base_revision: baseRevision};
-  await saveLocalNoteAndQueue(next, {type: 'note.pin', note_id: noteID, base_revision: baseRevision, pinned});
+  await saveLocalNoteAndQueue(next, {type: 'note.pin', note_id: noteID, base_revision: baseRevision, pinned, pin_order: next.pin_order});
   await refreshDashboard();
   scheduleSync();
   return true;

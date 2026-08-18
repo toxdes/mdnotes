@@ -1016,6 +1016,41 @@ func TestSyncPinOperationPreservesContentAndAssignsCanonicalOrder(t *testing.T) 
 	}
 }
 
+func TestSyncSaveCreatesPinnedNoteWithCanonicalOrder(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache()}
+	baseRevision := int64(0)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_new_pin", Operations: []syncOperationRequest{{
+		ClientSequence: 1, OpID: "save_pinned_note", Type: "note.save", NoteID: "new-pinned-note", BaseRevision: &baseRevision, Title: "Pinned from birth", Content: "body", Pinned: true,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	record := httptest.NewRecorder()
+	a.handleSyncPush(record, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if record.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", record.Code, record.Body.String())
+	}
+	var response syncPushResponse
+	if err := json.Unmarshal(record.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Revision != 1 || response.Acknowledged[0].PinOrder < 1 {
+		t.Fatalf("save response = %#v", response)
+	}
+	note, err := getNote(db, "new-pinned-note")
+	if err != nil || !note.Pinned || note.PinOrder != response.Acknowledged[0].PinOrder {
+		t.Fatalf("created note = %#v, %v", note, err)
+	}
+}
+
 func TestMigrationsAreRecordedAndIdempotent(t *testing.T) {
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
 	if err != nil {

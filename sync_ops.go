@@ -161,7 +161,7 @@ func validateSyncOperation(operation syncOperationRequest) error {
 			return errors.New("invalid note delete operation")
 		}
 	case "note.pin":
-		if !noteIDPattern.MatchString(operation.NoteID) || operation.BaseRevision == nil || *operation.BaseRevision < 1 {
+		if !noteIDPattern.MatchString(operation.NoteID) || operation.BaseRevision == nil || *operation.BaseRevision < 0 {
 			return errors.New("invalid note pin operation")
 		}
 	case "prefs.save":
@@ -326,6 +326,17 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		if err := upsertNoteTx(tx, operation.NoteID, operation.Title, operation.NoteID+".md", normalizeTags(operation.Tags), now); err != nil {
 			return syncOperationResult{}, err
 		}
+		// Pin state is folded into creation so a note can be pinned before its
+		// first server revision exists. Existing notes use ordered note.pin
+		// operations, preventing a stale content save from changing their pin.
+		if currentRevision == 0 && operation.Pinned {
+			if err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&result.PinOrder); err != nil {
+				return syncOperationResult{}, err
+			}
+			if _, err := tx.Exec("UPDATE notes SET pinned = 1, pin_order = ? WHERE id = ?", result.PinOrder, operation.NoteID); err != nil {
+				return syncOperationResult{}, err
+			}
+		}
 		if err := tx.QueryRow("SELECT revision FROM notes WHERE id = ?", operation.NoteID).Scan(&result.Revision); err != nil {
 			return syncOperationResult{}, err
 		}
@@ -347,6 +358,15 @@ func (a *app) applySyncOperation(deviceID string, operation syncOperationRequest
 		}
 		if err != nil {
 			return syncOperationResult{}, err
+		}
+		var exists int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM notes WHERE id = ?", operation.NoteID).Scan(&exists); err != nil {
+			return syncOperationResult{}, err
+		}
+		if exists == 0 {
+			result.Status = "conflict"
+			result.CurrentRevision = currentRevision
+			break
 		}
 		if operation.Pinned {
 			if err := tx.QueryRow("SELECT COALESCE(MAX(pin_order), 0) + 1 FROM notes WHERE pinned = 1").Scan(&result.PinOrder); err != nil {

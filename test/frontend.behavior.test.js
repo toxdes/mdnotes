@@ -824,6 +824,20 @@ describe('logout storage cleanup', () => {
 });
 
 describe('note pinning', () => {
+  test('folds a pin into an unsynced note save', async () => {
+    const app = track(await createApp());
+    const note = {id: 'new-note', title: 'New', tags: '', content: 'body', revision: 0, base_revision: 0, pending: true};
+    await app.hooks.putLocalNote(note);
+    await app.hooks.queueOperation({type: 'note.save', note_id: note.id, base_revision: 0, note});
+
+    await app.hooks.toggleNotePin(note.id);
+
+    const operations = await app.hooks.pendingOperations();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({type: 'note.save', base_revision: 0, note: {pinned: true}});
+    expect(await app.hooks.getLocalNote(note.id)).toMatchObject({pinned: true, pending: true});
+  });
+
   test('filters before sorting and queues an offline pin without changing content', async () => {
     const app = track(await createApp());
     await app.hooks.putLocalNote({id: 'pinned-work', title: 'Pinned work', tags: 'work', content: 'keep', updated_at: '2026-01-01T00:00:00Z', revision: 2, pinned: true, pin_order: 10});
