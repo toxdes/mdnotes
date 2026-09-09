@@ -174,6 +174,22 @@ describe('sync scheduling while hidden', () => {
   });
 });
 
+describe('server change invalidation', () => {
+  test('ignores a note event already covered by the local sync cursor', async () => {
+    const app = track(await createApp());
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    await app.hooks.applyRemoteChangePage([], new Map(), 42);
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'notes', sequence: 42})).resolves.toBe(false);
+    expect(app.hooks.getSyncScheduleState()).toEqual({scheduled: false, options: {}});
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'notes', sequence: 43})).resolves.toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 90));
+    expect(app.hooks.getSyncScheduleState().scheduled).toBe(true);
+    app.hooks.cancelScheduledSync();
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));

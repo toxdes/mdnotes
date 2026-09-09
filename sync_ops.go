@@ -110,6 +110,15 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := syncPushResponse{Acknowledged: make([]syncOperationResult, 0, len(request.Operations)), ExpectedSequence: lastSequence + 1}
+	var notesChanged, preferencesChanged bool
+	defer func() {
+		if preferencesChanged {
+			a.publishChange("preferences")
+		}
+		if notesChanged {
+			a.publishChange("notes")
+		}
+	}()
 	for _, operation := range request.Operations {
 		if operation.ClientSequence <= lastSequence {
 			stored, err := storedSyncOperation(a.db, request.DeviceID, operation.ClientSequence, operation.OpID)
@@ -135,9 +144,9 @@ func (a *app) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		}
 		if result.Status == "applied" {
 			if operation.Type == "prefs.save" {
-				a.publishChange("preferences")
+				preferencesChanged = true
 			} else if operation.Type == "note.save" || operation.Type == "note.delete" || operation.Type == "note.pin" {
-				a.publishChange("notes")
+				notesChanged = true
 			}
 		}
 		response.Acknowledged = append(response.Acknowledged, result)

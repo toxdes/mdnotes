@@ -633,6 +633,7 @@ try {
     syncCoordinationChannel.addEventListener('message', event => {
       if (!event.data || event.data.sender === syncTabID) return;
       if (event.data.type === 'sync-request') scheduleSync({}, 0);
+      if (event.data.type === 'sync-complete') void refreshLocalStateFromStorage();
       if (event.data.type === 'logout') void closeOfflineDatabaseConnection();
     });
   }
@@ -643,6 +644,12 @@ try {
 function notifySyncRequested() {
   try {
     syncCoordinationChannel?.postMessage({type: 'sync-request', sender: syncTabID});
+  } catch (_) {}
+}
+
+function notifySyncCompleted() {
+  try {
+    syncCoordinationChannel?.postMessage({type: 'sync-complete', sender: syncTabID});
   } catch (_) {}
 }
 
@@ -2063,6 +2070,7 @@ async function performSync(options = {}) {
   if (syncInFlight) return false;
   syncInFlight = true;
   const wasOffline = syncFailed;
+  let syncSucceeded = false;
   try {
     // Save the visible editor locally before pulling. This never waits on the
     // network, but ensures a remote notification cannot overwrite the common
@@ -2079,6 +2087,8 @@ async function performSync(options = {}) {
     syncRetryDelayMs = 0;
     setSyncStatus('online');
     if (!serverEvents) connectServerEvents();
+    syncSucceeded = true;
+    notifySyncCompleted();
     if (!preserveSnackbar) hideOfflineNotice();
     if (wasOffline && !preserveSnackbar) showToast('Back online. Changes synced.');
     return true;
@@ -2120,6 +2130,7 @@ async function performSync(options = {}) {
     return false;
   } finally {
     syncInFlight = false;
+    if (syncSucceeded) void flushPendingServerChange();
   }
 }
 
@@ -2134,6 +2145,7 @@ let serverHeartbeatAt = 0;
 let serverEventsWatchdog = null;
 let serverChangeTimer = null;
 let serverChangePending = false;
+let serverChangePendingSequence = 0;
 
 function isServerEventsHealthy() {
   return Boolean(serverEvents && serverHeartbeatAt > 0 && Date.now() - serverHeartbeatAt <= sseStaleAfterMs);
@@ -2158,13 +2170,65 @@ async function handleServerHeartbeat() {
 
 function scheduleServerChangeSync() {
   serverChangePending = true;
-  if (serverChangeTimer) return;
+  if (serverChangeTimer || syncInFlight) return;
   serverChangeTimer = setTimeout(async () => {
     serverChangeTimer = null;
+    if (syncInFlight) return;
     serverChangePending = false;
     scheduleSync();
     if (serverChangePending) scheduleServerChangeSync();
   }, 75);
+}
+
+async function handleServerChangeEvent(change = {}) {
+  const type = change?.type || 'notes';
+  if (type === 'preferences') {
+    const revision = Number(change.revision || 0);
+    if (revision > 0 && revision <= Number(prefs.revision || 0)) return false;
+    void loadPrefs();
+  }
+  if (type !== 'notes') {
+    scheduleServerChangeSync();
+    return true;
+  }
+
+  const sequence = Number(change.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    scheduleServerChangeSync();
+    return true;
+  }
+  serverChangePendingSequence = Math.max(serverChangePendingSequence, sequence);
+  let cursor = 0;
+  try {
+    cursor = Number(await getOfflineState('syncSequence') || 0);
+  } catch (_) {
+    scheduleServerChangeSync();
+    return true;
+  }
+  if (sequence <= cursor) {
+    if (serverChangePendingSequence <= cursor) serverChangePendingSequence = 0;
+    return false;
+  }
+  if (!syncInFlight) scheduleServerChangeSync();
+  return true;
+}
+
+async function flushPendingServerChange() {
+  const pending = serverChangePendingSequence;
+  if (!pending || syncInFlight) return;
+  let cursor = 0;
+  try {
+    cursor = Number(await getOfflineState('syncSequence') || 0);
+  } catch (_) {
+    scheduleServerChangeSync();
+    return;
+  }
+  if (serverChangePendingSequence <= cursor) {
+    serverChangePendingSequence = 0;
+    return;
+  }
+  if (serverChangePendingSequence === pending) serverChangePendingSequence = 0;
+  scheduleServerChangeSync();
 }
 
 function connectServerEvents() {
@@ -2178,9 +2242,10 @@ function connectServerEvents() {
   events.addEventListener('change', event => {
     serverHeartbeatAt = Date.now();
     try {
-      if (JSON.parse(event.data).type === 'preferences') void loadPrefs();
-    } catch (_) {}
-    scheduleServerChangeSync();
+      void handleServerChangeEvent(JSON.parse(event.data)).catch(() => scheduleServerChangeSync());
+    } catch (_) {
+      scheduleServerChangeSync();
+    }
   });
   events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
   events.onopen = () => { void handleServerHeartbeat(); };
@@ -2213,6 +2278,7 @@ function disconnectServerEvents() {
   if (serverChangeTimer) clearTimeout(serverChangeTimer);
   serverChangeTimer = null;
   serverChangePending = false;
+  serverChangePendingSequence = 0;
 }
 
 // --- Auth ---
@@ -2319,6 +2385,14 @@ async function refreshDashboard() {
   if (generation !== dashboardRenderGeneration) return;
   dashboardNotes = notes;
   renderDashboard(notes, conflicts);
+}
+
+async function refreshLocalStateFromStorage() {
+  if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+  if (!screens.editor.classList.contains('hidden') && currentNoteId && !isDirty) {
+    const note = await getLocalNote(currentNoteId);
+    if (note) updateOpenNote(note);
+  }
 }
 
 async function syncDashboardInBackground() {

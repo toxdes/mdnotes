@@ -847,6 +847,16 @@ func TestEventsStreamSendsAnImmediateHeartbeat(t *testing.T) {
 	}
 }
 
+func TestSSEChangeIncludesDurableSequence(t *testing.T) {
+	w := httptest.NewRecorder()
+	if err := writeSSEChange(w, changeEvent{Type: "notes", Sequence: 42}); err != nil {
+		t.Fatalf("write SSE change: %v", err)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"type":"notes"`) || !strings.Contains(body, `"sequence":42`) {
+		t.Fatalf("SSE change body = %q", body)
+	}
+}
+
 func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	notesDir := t.TempDir()
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
@@ -930,6 +940,47 @@ func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	response = decode(result)
 	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Status != "conflict" || response.Acknowledged[0].CurrentRevision != 1 || response.ExpectedSequence != 3 {
 		t.Fatalf("conflict response = %#v", response)
+	}
+}
+
+func TestSyncPushPublishesOneCoalescedNoteEventPerBatch(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	events := newEventBroker()
+	subscriber := events.subscribe()
+	defer events.unsubscribe(subscriber)
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache(), events: events}
+	zero := int64(0)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_batch", Operations: []syncOperationRequest{
+		{ClientSequence: 1, OpID: "batch_one", Type: "note.save", NoteID: "batch-one", BaseRevision: &zero, Title: "One", Content: "one"},
+		{ClientSequence: 2, OpID: "batch_two", Type: "note.save", NoteID: "batch-two", BaseRevision: &zero, Title: "Two", Content: "two"},
+	}})
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	result := httptest.NewRecorder()
+	a.handleSyncPush(result, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if result.Code != http.StatusOK {
+		t.Fatalf("batch status = %d: %s", result.Code, result.Body.String())
+	}
+	select {
+	case event := <-subscriber:
+		if event.Type != "notes" || event.Sequence != 2 {
+			t.Fatalf("batch event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for batch event")
+	}
+	select {
+	case event := <-subscriber:
+		t.Fatalf("unexpected second batch event = %#v", event)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 
@@ -1559,9 +1610,9 @@ func TestDirectPreferencePatchUsesRevisionAndPublishesChange(t *testing.T) {
 		t.Fatalf("direct preference status = %d: %s", result.Code, result.Body.String())
 	}
 	select {
-	case kind := <-subscriber:
-		if kind != "preferences" {
-			t.Fatalf("preference event kind = %q", kind)
+	case event := <-subscriber:
+		if event.Type != "preferences" || event.Revision != 3 {
+			t.Fatalf("preference event = %#v", event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for preference event")

@@ -38,6 +38,7 @@ globalThis.__mdnotesTestHooks = {
   api,
   cancelActiveSyncRequests,
   scheduleSync,
+  handleServerChangeEvent,
   putLocalNote,
   init,
   restoreRoute,
