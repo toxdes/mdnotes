@@ -1709,6 +1709,7 @@ function encodedByteLength(value) {
 function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
   return withOfflineStore(['queue'], 'readwrite', stores => new Promise((resolve, reject) => {
     const batch = [];
+    const revisionNoteIDs = new Set();
     const request = stores.queue.index('client_sequence').openCursor();
     let finished = false;
     const finish = () => {
@@ -1724,6 +1725,11 @@ function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
         return;
       }
       const operation = cursor.value;
+      const isRevisionOperation = ['note.save', 'note.delete', 'note.pin'].includes(operation.type) && operation.note_id;
+      if (isRevisionOperation && revisionNoteIDs.has(operation.note_id)) {
+        finish();
+        return;
+      }
       const candidate = [...batch.map(item => outgoingSyncOperation(item)), outgoingSyncOperation(operation)];
       const requestBytes = encodedByteLength({device_id: deviceID, operations: candidate});
       if (batch.length && requestBytes > maxBytes) {
@@ -1735,6 +1741,7 @@ function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
         cursor.update(operation);
       }
       batch.push(operation);
+      if (isRevisionOperation) revisionNoteIDs.add(operation.note_id);
       if (batch.length >= maxOperations) finish();
       else cursor.continue();
     };

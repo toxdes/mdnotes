@@ -299,6 +299,87 @@ describe('F-02 immutable queue operations', () => {
     expect((await app.hooks.pendingOperations()).map(operation => operation.note.content)).toEqual(['second']);
   });
 
+  test('does not self-conflict when a newer note save is queued during an earlier push', async () => {
+    let revision = 1;
+    let remote = {id: 'note-a', title: 'Note', tags: '', content: 'base', revision};
+    const pushes = [];
+    const app = track(await createApp({
+      fetchImpl: async (path, options = {}) => {
+        if (String(path) === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          pushes.push(request.operations);
+          const acknowledged = request.operations.map(operation => {
+            if (operation.base_revision !== revision) {
+              return {
+                client_sequence: operation.client_sequence,
+                op_id: operation.op_id,
+                status: 'conflict',
+                current_revision: revision,
+              };
+            }
+            revision++;
+            remote = {...remote, title: operation.title, tags: operation.tags, content: operation.content, revision};
+            return {
+              client_sequence: operation.client_sequence,
+              op_id: operation.op_id,
+              status: 'applied',
+              revision,
+            };
+          });
+          return response(200, JSON.stringify({
+            acknowledged,
+            expected_sequence: request.operations.at(-1).client_sequence + 1,
+          }));
+        }
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+
+    await app.hooks.putLocalNote({
+      ...remote,
+      pending: true,
+      base_revision: revision,
+      base_content: remote.content,
+      base_title: remote.title,
+      base_tags: remote.tags,
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: revision,
+      note: {...remote, content: 'first edit', base_revision: revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags},
+    });
+    const first = (await app.hooks.pendingOperations())[0];
+    await app.hooks.claimQueueOperation(first.id);
+
+    await app.hooks.putLocalNote({
+      ...remote,
+      content: 'newest edit',
+      pending: true,
+      base_revision: revision,
+      base_content: remote.content,
+      base_title: remote.title,
+      base_tags: remote.tags,
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: revision,
+      note: {...remote, content: 'newest edit', base_revision: revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags},
+    });
+
+    await expect(app.hooks.flushPendingChanges()).resolves.toBe(true);
+
+    expect(pushes).toHaveLength(2);
+    expect(pushes[0]).toHaveLength(1);
+    expect(pushes[1]).toHaveLength(1);
+    expect(pushes[1][0].base_revision).toBe(2);
+    expect(remote.content).toBe('newest edit');
+    expect(app.window.document.querySelector('#toast-region').textContent).not.toContain('conflict');
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+  });
+
   test('allows only one tab to hold the fallback sync lease', async () => {
     const firstTab = track(await createApp());
     const secondTab = track(await createApp());
