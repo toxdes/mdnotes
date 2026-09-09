@@ -1,4 +1,7 @@
 import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {
   createApp,
   deleteOfflineDatabase,
@@ -21,6 +24,8 @@ function track(app) {
   apps.push(app);
   return app;
 }
+
+const styleSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'static', 'style.css'), 'utf8');
 
 describe('font availability', () => {
   test('requires both the stylesheet and a loaded font face', async () => {
@@ -69,16 +74,7 @@ describe('editor display preferences', () => {
 
 describe('markdown preview policy', () => {
   test('highlights the rendered block containing the caret', async () => {
-    const app = track(await createApp());
-    app.window.marked = {
-      lexer: () => [
-        {raw: '# Heading\n\n'},
-        {raw: '- first\n\n- second\n\n'},
-        {raw: '```text\ninside\n\ncode\n```\n\n'},
-        {raw: 'tail'},
-      ],
-      parse: () => '<h1>Heading</h1><ul><li>first</li><li>second</li></ul><pre><code>inside\n\ncode\n</code></pre><p>tail</p>',
-    };
+    const app = track(await createApp({realMarked: true}));
     app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: '# Heading\n\n- first\n\n- second\n\n```text\ninside\n\ncode\n```\n\ntail'});
     app.hooks.updatePreview();
 
@@ -90,6 +86,79 @@ describe('markdown preview policy', () => {
     const blocks = [...app.window.document.querySelector('#preview').children];
     expect(blocks[2].classList.contains('highlight')).toBe(true);
     expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('maps a caret inside a loose list to the list block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '- first\n\n- second\n\nparagraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const secondItemOffset = content.indexOf('second');
+    textarea.selectionStart = textarea.selectionEnd = secondItemOffset;
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks[0].tagName).toBe('UL');
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+    expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('maps a caret inside fenced code across blank lines to the code block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '```text\ninside\n\ncode\n```\n\ntail';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const codeOffset = content.indexOf('code');
+    textarea.selectionStart = textarea.selectionEnd = codeOffset;
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks[0].tagName).toBe('PRE');
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+    expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('does not use preview ranges from an older source while rendering is pending', async () => {
+    const app = track(await createApp({realMarked: true}));
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: 'first paragraph\n\nsecond paragraph'});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.value = 'short\n\nsecond';
+    textarea.selectionStart = textarea.selectionEnd = textarea.value.indexOf('second');
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks.every(block => !block.classList.contains('highlight'))).toBe(true);
+
+    app.hooks.updatePreview();
+    app.hooks.highlightBlock();
+    const refreshedBlocks = [...app.window.document.querySelector('#preview').children];
+    expect(refreshedBlocks[1].classList.contains('highlight')).toBe(true);
+  });
+
+  test('maps headings, blockquotes, thematic breaks, and tables to their blocks', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '> quoted\n\n## heading\n\n---\n\n| a | b |\n| - | - |\n| 1 | 2 |';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const preview = app.window.document.querySelector('#preview');
+    const blocks = [...preview.children];
+    expect(blocks.map(block => block.tagName)).toEqual(['BLOCKQUOTE', 'H2', 'HR', 'TABLE']);
+    for (const [index, marker] of ['quoted', 'heading', '---', '| 1'].entries()) {
+      textarea.selectionStart = textarea.selectionEnd = content.indexOf(marker);
+      app.hooks.highlightBlock();
+      expect(blocks[index].classList.contains('highlight')).toBe(true);
+    }
+  });
+
+  test('highlighting does not change preview block geometry', () => {
+    expect(styleSource).toMatch(/\.preview \.highlight\{[^}]*background:/);
+    expect(styleSource).not.toMatch(/\.preview \.highlight\{[^}]*\bmargin:/);
+    expect(styleSource).not.toMatch(/\.preview \.highlight\{[^}]*\bpadding:/);
+    expect(styleSource).toContain('.preview p{margin:0 0 1em}');
   });
 
   test('escapes raw HTML, rejects unsafe resource URLs, and lazy-loads images', async () => {

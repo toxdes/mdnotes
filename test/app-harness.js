@@ -7,6 +7,7 @@ import {indexedDB, IDBKeyRange} from 'fake-indexeddb';
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const appSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'app.js'), 'utf8');
 const themesSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'themes.js'), 'utf8');
+const markedSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'marked.min.js'), 'utf8');
 
 const testHookSource = `
 globalThis.__mdnotesTestHooks = {
@@ -104,7 +105,7 @@ export async function deleteOfflineDatabase() {
   });
 }
 
-export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null} = {}) {
+export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null, realMarked = false} = {}) {
   const dom = new JSDOM(fs.readFileSync(path.join(testDirectory, '..', 'static', 'index.html'), 'utf8'), {
     url: 'http://localhost:8080/',
     pretendToBeVisual: true,
@@ -116,7 +117,11 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
   window.fetch = fetchImpl;
   if (serviceWorker) Object.defineProperty(window.navigator, 'serviceWorker', {value: serviceWorker, configurable: true});
   window.eval(themesSource);
-  window.marked = {parse: () => ''};
+  if (realMarked) {
+    window.eval(markedSource);
+  } else {
+    window.marked = {parse: () => ''};
+  }
   window.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   window.requestAnimationFrame = callback => window.setTimeout(callback, 0);
   window.cancelAnimationFrame = id => window.clearTimeout(id);

@@ -3104,6 +3104,7 @@ applyPanelRatio();
 // --- Cursor preview highlight ---
 let previewBlocks = [];
 let previewBlockRanges = [];
+let previewRangeSource = null;
 function isPreviewVisible() {
   return !screens.editor.classList.contains('hidden') && panelState !== 'editor';
 }
@@ -3121,24 +3122,60 @@ function scheduleHighlight() {
     highlightBlock();
   });
 }
+function previewTokenTag(token) {
+  switch (token.type) {
+    case 'blockquote': return 'BLOCKQUOTE';
+    case 'code': return 'PRE';
+    case 'heading': {
+      const match = (token.raw || '').match(/^\s*(#+)/);
+      return match ? `H${match[1].length}` : null;
+    }
+    case 'hr': return 'HR';
+    case 'list': return token.ordered ? 'OL' : 'UL';
+    case 'paragraph': return 'P';
+    case 'table': return 'TABLE';
+    default: return null;
+  }
+}
+
+function clearPreviewHighlight() {
+  const current = $('#preview').querySelector('.highlight');
+  if (current) current.classList.remove('highlight');
+}
+
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
   previewBlockRanges = [];
+  previewRangeSource = null;
   const source = $('#note-content').value;
   if (!source || typeof marked === 'undefined' || typeof marked.lexer !== 'function') return;
   try {
     const ranges = [];
     let offset = 0;
+    let blockIndex = 0;
     for (const token of marked.lexer(source, markdownRenderOptions())) {
       const raw = typeof token.raw === 'string' ? token.raw : '';
       if (!raw) continue;
       const start = source.indexOf(raw, offset);
-      if (start < 0) continue;
-      ranges.push({start, end: start + raw.length});
+      if (start !== offset) {
+        previewBlockRanges = [];
+        return;
+      }
       offset = start + raw.length;
+      const tagName = previewTokenTag(token);
+      if (!tagName) continue;
+      const block = previewBlocks[blockIndex++];
+      if (!block || block.tagName !== tagName) {
+        previewBlockRanges = [];
+        return;
+      }
+      const contentEnd = start + raw.replace(/[\s\r\n]+$/, '').length;
+      ranges.push({start, end: Math.max(start, contentEnd)});
     }
-    if (ranges.length === previewBlocks.length) previewBlockRanges = ranges;
+    if (offset !== source.length || blockIndex !== previewBlocks.length) return;
+    previewBlockRanges = ranges;
+    previewRangeSource = source;
   } catch (_) {
     previewBlockRanges = [];
   }
@@ -3146,27 +3183,15 @@ function cachePreviewBlocks() {
 function highlightBlock() {
   if (!isPreviewVisible()) return;
   if (prefs.hideCursorHighlight) {
-    const cur = $('#preview').querySelector('.highlight');
-    if (cur) cur.classList.remove('highlight');
+    clearPreviewHighlight();
     return;
   }
   const ta = $('#note-content');
-  const pv = $('#preview');
-  const cur = pv.querySelector('.highlight');
-  if (cur) cur.classList.remove('highlight');
+  clearPreviewHighlight();
   const text = ta.value;
   const pos = ta.selectionStart;
-  if (!text.trim() || !previewBlocks.length) return;
-  let idx = -1;
-  if (previewBlockRanges.length === previewBlocks.length) {
-    idx = previewBlockRanges.findIndex(range => pos <= range.end);
-    if (idx < 0) idx = previewBlockRanges.length - 1;
-  } else {
-    const before = text.slice(0, pos);
-    const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
-    idx = Math.max(0, nonEmpty.length - 1);
-  }
-  if (idx >= previewBlocks.length) idx = previewBlocks.length - 1;
+  if (!text.trim() || !previewBlocks.length || renderedPreviewSource !== text || previewRangeSource !== text) return;
+  const idx = previewBlockRanges.findIndex(range => range.start <= pos && pos < range.end);
   previewBlocks[idx]?.classList.add('highlight');
 }
 
@@ -3206,6 +3231,9 @@ $('#delete-btn').addEventListener('click', async () => {
 $('#note-content').addEventListener('input', () => {
   markDirty();
   scheduleSave();
+  previewRangeSource = null;
+  previewBlockRanges = [];
+  scheduleHighlight();
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 500);
 });
