@@ -39,6 +39,7 @@ let currentBaseRevision = null;
 let syncInFlight = false;
 let syncScheduleTimer = null;
 let syncScheduleOptions = {};
+let syncPendingWhileInFlight = false;
 let syncRetryDelayMs = 0;
 let activeSyncControllers = new Set();
 let syncCancellationRequested = false;
@@ -60,6 +61,8 @@ let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
 let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
 let registeredServiceWorkerRevision = null;
 let updateToast = null;
+let syncStatusRevealTimer = null;
+let dashboardHydrationState = 'ready';
 
 const httpRequestTimeoutMs = 15000;
 const syncRetryDelaysMs = [1000, 5000, 15000, 60000, 300000];
@@ -800,17 +803,33 @@ function cancelActiveSyncRequests() {
 
 function beginSyncNetworkRequest() {
   syncNetworkRequestsInFlight++;
-  setSyncStatus('syncing');
+  if (!syncInFlight) setSyncStatus('syncing');
 }
 
 function endSyncNetworkRequest() {
   syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
-  if (syncNetworkRequestsInFlight === 0) setIdleSyncStatus();
+  if (syncNetworkRequestsInFlight === 0 && !syncInFlight) setIdleSyncStatus();
 }
 
 function setIdleSyncStatus() {
-  if (syncNetworkRequestsInFlight > 0) return;
+  if (syncNetworkRequestsInFlight > 0 || syncInFlight) return;
   setSyncStatus(syncFailed ? 'offline' : 'online');
+}
+
+function beginSyncStatusPresentation() {
+  if (syncStatusRevealTimer || $('#sync-status')?.dataset.state === 'syncing') return;
+  syncStatusRevealTimer = setTimeout(() => {
+    syncStatusRevealTimer = null;
+    if (syncInFlight) setSyncStatus('syncing');
+  }, 150);
+}
+
+function finishSyncStatusPresentation(state) {
+  if (syncStatusRevealTimer) {
+    clearTimeout(syncStatusRevealTimer);
+    syncStatusRevealTimer = null;
+  }
+  setSyncStatus(state);
 }
 
 class APIError extends Error {
@@ -2027,6 +2046,10 @@ async function withSyncLeadership(work) {
 
 function scheduleSync(options = {}, delayMs = 75) {
   mergeSyncScheduleOptions(options);
+  if (syncInFlight) {
+    syncPendingWhileInFlight = true;
+    return;
+  }
   if (document.visibilityState === 'hidden') return;
   if (syncScheduleTimer) return;
   const delay = Math.max(delayMs, syncRetryDelayMs);
@@ -2038,13 +2061,13 @@ function scheduleSync(options = {}, delayMs = 75) {
     const requested = syncScheduleOptions;
     syncScheduleOptions = {};
     if (syncInFlight) {
-      scheduleSync(requested, 100);
+      syncScheduleOptions = {...syncScheduleOptions, ...requested};
+      syncPendingWhileInFlight = true;
       return;
     }
     const synced = await syncNow(requested);
     if (synced) {
       syncRetryDelayMs = 0;
-      if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
       return;
     }
     if (syncFailed) {
@@ -2055,6 +2078,23 @@ function scheduleSync(options = {}, delayMs = 75) {
   }, delay);
 }
 
+function takePendingSyncIntent() {
+  const options = {...syncScheduleOptions};
+  syncPendingWhileInFlight = false;
+  syncScheduleOptions = {};
+  return options;
+}
+
+async function syncWorkRemains(options = {}) {
+  if (options.reconcile) return true;
+  if ((await pendingOperations()).length) return true;
+  const cursor = Number(await getOfflineState('syncSequence') || 0);
+  if (serverChangePendingSequence && serverChangePendingSequence <= cursor) {
+    serverChangePendingSequence = 0;
+  }
+  return serverChangePendingSequence > cursor;
+}
+
 async function performSync(options = {}) {
   const preserveSnackbar = Boolean(options.preserveSnackbar);
   let reconcile = Boolean(options.reconcile);
@@ -2062,38 +2102,51 @@ async function performSync(options = {}) {
     clearTimeout(syncScheduleTimer);
     syncScheduleTimer = null;
     reconcile = Boolean(reconcile || syncScheduleOptions.reconcile);
-    syncScheduleOptions = {};
   }
   // Network requests and the authenticated SSE heartbeat are authoritative.
   // navigator.onLine is only an unreliable browser hint, particularly in an
   // installed mobile PWA, so it must never prevent a requested sync.
   if (syncInFlight) return false;
   syncInFlight = true;
+  syncPendingWhileInFlight = false;
+  syncScheduleOptions = {};
+  beginSyncStatusPresentation();
   const wasOffline = syncFailed;
-  let syncSucceeded = false;
   try {
-    // Save the visible editor locally before pulling. This never waits on the
-    // network, but ensures a remote notification cannot overwrite the common
-    // base needed to merge the user's newest keystrokes.
-    if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
-    await pullRemoteChanges();
-    if (reconcile) await reconcileLocalNotes();
-    const pushed = await flushPendingChanges();
-    if (pushed) await pullRemoteChanges();
+    for (;;) {
+      // Save the visible editor locally before pulling. This never waits on the
+      // network, but ensures a remote notification cannot overwrite the common
+      // base needed to merge the user's newest keystrokes.
+      if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
+      await pullRemoteChanges();
+      if (reconcile) await reconcileLocalNotes();
+      const pushed = await flushPendingChanges();
+      if (pushed) await pullRemoteChanges();
+
+      const pendingOptions = takePendingSyncIntent();
+      if (!await syncWorkRemains(pendingOptions)) break;
+      reconcile = Boolean(pendingOptions.reconcile);
+    }
+
     localStorage.setItem('mdnotes-offline-ready', '1');
     clearSyncDiagnostic();
     syncFailed = false;
     lastSuccessfulSyncAt = Date.now();
     syncRetryDelayMs = 0;
-    setSyncStatus('online');
+    dashboardHydrationState = 'ready';
+    if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    finishSyncStatusPresentation('online');
     if (!serverEvents) connectServerEvents();
-    syncSucceeded = true;
     notifySyncCompleted();
     if (!preserveSnackbar) hideOfflineNotice();
     if (wasOffline && !preserveSnackbar) showToast('Back online. Changes synced.');
     return true;
   } catch (error) {
     console.warn('sync failed', error);
+    if (dashboardHydrationState === 'loading') {
+      dashboardHydrationState = 'offline-empty';
+      if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    }
     if (isAbortError(error) && syncCancellationRequested) {
       syncCancellationRequested = false;
       return false;
@@ -2104,7 +2157,7 @@ async function performSync(options = {}) {
       // losing network access. In particular, do not mask it with an offline
       // screen just because this browser has an offline cache.
       syncFailed = false;
-      setSyncStatus('online');
+      finishSyncStatusPresentation('online');
       hideOfflineNotice();
       requireAuthentication();
       $('#login-error').textContent = 'Your session expired. Sign in again.';
@@ -2116,7 +2169,7 @@ async function performSync(options = {}) {
     const responseStatus = error?.responseStatus || lastSyncResponseStatus;
     if (responseStatus >= 400 && responseStatus < 500) {
       syncFailed = false;
-      setSyncStatus('online');
+      finishSyncStatusPresentation('online');
       hideOfflineNotice();
       const message = `Sync needs attention: ${error.message}`;
       if (lastSyncProblem !== message) {
@@ -2127,15 +2180,23 @@ async function performSync(options = {}) {
     }
     lastSyncProblem = '';
     markServerOffline();
+    finishSyncStatusPresentation('offline');
     return false;
   } finally {
     syncInFlight = false;
-    if (syncSucceeded) void flushPendingServerChange();
+    if (syncStatusRevealTimer) {
+      clearTimeout(syncStatusRevealTimer);
+      syncStatusRevealTimer = null;
+    }
   }
 }
 
 async function syncNow(options = {}) {
-  if (syncInFlight) return false;
+  if (syncInFlight) {
+    mergeSyncScheduleOptions(options);
+    syncPendingWhileInFlight = true;
+    return false;
+  }
   return withSyncLeadership(() => performSync(options));
 }
 
@@ -2154,6 +2215,10 @@ function isServerEventsHealthy() {
 function markServerOffline() {
   const shouldToast = !syncFailed;
   syncFailed = true;
+  if (dashboardHydrationState === 'loading') {
+    dashboardHydrationState = 'offline-empty';
+    void refreshDashboard().catch(error => console.warn('could not render offline empty state', error));
+  }
   setSyncStatus('offline');
   showOfflineNotice();
   if (shouldToast) showToast('Working offline. Your changes are saved on this device.', 'warning');
@@ -2211,24 +2276,6 @@ async function handleServerChangeEvent(change = {}) {
   }
   if (!syncInFlight) scheduleServerChangeSync();
   return true;
-}
-
-async function flushPendingServerChange() {
-  const pending = serverChangePendingSequence;
-  if (!pending || syncInFlight) return;
-  let cursor = 0;
-  try {
-    cursor = Number(await getOfflineState('syncSequence') || 0);
-  } catch (_) {
-    scheduleServerChangeSync();
-    return;
-  }
-  if (serverChangePendingSequence <= cursor) {
-    serverChangePendingSequence = 0;
-    return;
-  }
-  if (serverChangePendingSequence === pending) serverChangePendingSequence = 0;
-  scheduleServerChangeSync();
 }
 
 function connectServerEvents() {
@@ -2351,7 +2398,12 @@ function renderDashboard(notes, conflicts) {
   if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
-    list.innerHTML = '<li class="note-empty">No notes yet</li>';
+    const message = dashboardHydrationState === 'loading'
+      ? 'Loading notes…'
+      : dashboardHydrationState === 'offline-empty'
+        ? 'No notes are available on this device yet.'
+        : 'No notes yet';
+    list.innerHTML = `<li class="note-empty">${message}</li>`;
     return;
   }
   list.innerHTML = notes.map(n => `
@@ -2542,6 +2594,7 @@ async function restoreCachedStartup() {
     await openNote(noteID, {route: 'none'});
     return;
   }
+  dashboardHydrationState = (await getLocalNotes()).length ? 'ready' : 'loading';
   await loadDashboard({sync: false});
   const conflicts = await unresolvedConflictIDs();
   for (const conflictID of conflicts) {

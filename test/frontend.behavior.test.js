@@ -190,6 +190,163 @@ describe('server change invalidation', () => {
   });
 });
 
+describe('sync coordinator', () => {
+  test('does not run a redundant follow-up for requests made during an idle sync', async () => {
+    let markSyncStarted;
+    let releaseSync;
+    const syncStarted = new Promise(resolve => { markSyncStarted = resolve; });
+    const syncGate = new Promise(resolve => { releaseSync = resolve; });
+    let syncRequests = 0;
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path).startsWith('/api/sync?')) {
+          syncRequests++;
+          if (syncRequests === 1) {
+            markSyncStarted();
+            await syncGate;
+          }
+          return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    const sync = app.hooks.syncNow();
+    await syncStarted;
+    app.hooks.scheduleSync();
+    app.hooks.scheduleSync();
+    releaseSync();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 180));
+
+    expect(syncRequests).toBe(1);
+  });
+
+  test('keeps one logical syncing state across pull, push, and final pull', async () => {
+    let markPushStarted;
+    let releasePush;
+    const pushStarted = new Promise(resolve => { markPushStarted = resolve; });
+    const pushGate = new Promise(resolve => { releasePush = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        const value = String(path);
+        if (value.startsWith('/api/sync?')) return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        if (value === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          markPushStarted();
+          await pushGate;
+          return response(200, {
+            acknowledged: request.operations.map(operation => ({
+              client_sequence: operation.client_sequence,
+              op_id: operation.op_id,
+              status: 'applied',
+              revision: 1,
+            })),
+            expected_sequence: request.operations.at(-1).client_sequence + 1,
+          });
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Note', tags: '', content: 'body', revision: 0, pending: true, base_revision: 0});
+    await app.hooks.queueOperation({type: 'note.save', note_id: 'note-a', base_revision: 0, note: {id: 'note-a', title: 'Note', tags: '', content: 'body', revision: 0}});
+
+    const states = [];
+    const status = app.window.document.querySelector('#sync-status');
+    const observer = new app.window.MutationObserver(() => states.push(status.dataset.state));
+    observer.observe(status, {attributes: true, subtree: true, childList: true});
+    const sync = app.hooks.syncNow();
+    await pushStarted;
+    await new Promise(resolve => setTimeout(resolve, 180));
+    releasePush();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    observer.disconnect();
+
+    expect(states.filter((state, index) => index === 0 || state !== states[index - 1])).toEqual(['syncing', 'online']);
+  });
+
+  test('flushes a local edit made during sync without starting an empty extra cycle', async () => {
+    let markFirstPushStarted;
+    let releaseFirstPush;
+    const firstPushStarted = new Promise(resolve => { markFirstPushStarted = resolve; });
+    const firstPushGate = new Promise(resolve => { releaseFirstPush = resolve; });
+    let app;
+    let pullRequests = 0;
+    let pushRequests = 0;
+    const fetchImpl = async (path, options) => {
+      const value = String(path);
+      if (value.startsWith('/api/sync?')) {
+        pullRequests++;
+        return response(200, {changes: [], nextSequence: 0, hasMore: false});
+      }
+      if (value === '/api/sync/push') {
+        pushRequests++;
+        const request = JSON.parse(options.body);
+        if (pushRequests === 1) {
+          markFirstPushStarted();
+          await firstPushGate;
+        }
+        return response(200, {
+          acknowledged: request.operations.map(operation => ({
+            client_sequence: operation.client_sequence,
+            op_id: operation.op_id,
+            status: 'applied',
+            revision: 1,
+          })),
+          expected_sequence: request.operations.at(-1).client_sequence + 1,
+        });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    };
+    app = track(await createApp({fetchImpl}));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    const first = {id: 'note-a', title: 'Note', tags: '', content: 'first', revision: 0};
+    await app.hooks.putLocalNote({...first, pending: true, base_revision: 0});
+    await app.hooks.queueOperation({type: 'note.save', note_id: first.id, base_revision: 0, note: first});
+
+    const sync = app.hooks.syncNow();
+    await firstPushStarted;
+    const second = {...first, content: 'second', pending: true, base_revision: 0};
+    await app.hooks.putLocalNote(second);
+    await app.hooks.queueOperation({type: 'note.save', note_id: second.id, base_revision: 0, note: second});
+    app.hooks.scheduleSync();
+    releaseFirstPush();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 180));
+
+    expect(pushRequests).toBe(2);
+    expect(pullRequests).toBe(2);
+  });
+
+  test('shows a loading state instead of a final empty state during initial hydration', async () => {
+    let markCheckStarted;
+    let releaseCheck;
+    const checkStarted = new Promise(resolve => { markCheckStarted = resolve; });
+    const checkGate = new Promise(resolve => { releaseCheck = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/check') {
+          markCheckStarted();
+          await checkGate;
+          return response(503, 'offline');
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+
+    const startup = app.hooks.init();
+    await checkStarted;
+    expect(app.window.document.querySelector('#note-list').textContent).toContain('Loading notes');
+    releaseCheck();
+    await startup;
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+});
+
 describe('F-01 editor save coordination', () => {
   test('drains an edit made while the previous local save is in flight', async () => {
     const app = track(await createApp({deferredSave: true}));
