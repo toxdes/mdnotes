@@ -445,6 +445,27 @@ describe('server change invalidation', () => {
     expect(app.hooks.getSyncScheduleState().scheduled).toBe(true);
     app.hooks.cancelScheduledSync();
   });
+
+  test('pulls again when a newer note event arrives during sync completion', async () => {
+    let pullRequests = 0;
+    const app = track(await createApp({
+      deferredSyncCompletion: true,
+      fetchImpl: async path => {
+        if (!String(path).startsWith('/api/sync?')) throw new Error(`unexpected request: ${path}`);
+        pullRequests++;
+        return response(200, {changes: [], nextSequence: pullRequests > 1 ? 1 : 0, hasMore: false});
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    const sync = app.hooks.syncNow();
+    await app.syncCompletionStarted;
+    await app.hooks.handleServerChangeEvent({type: 'notes', sequence: 1});
+    app.releaseSyncCompletion();
+    await sync;
+
+    await vi.waitFor(() => expect(pullRequests).toBe(2));
+  });
 });
 
 describe('sync coordinator', () => {

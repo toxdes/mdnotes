@@ -2286,6 +2286,10 @@ async function performSync(options = {}) {
       clearTimeout(syncStatusRevealTimer);
       syncStatusRevealTimer = null;
     }
+    // Work can arrive after the loop's final check but before the cycle has
+    // finished refreshing the UI. Carry that intent into a new cycle instead
+    // of leaving it dormant until the periodic fallback runs.
+    if (syncPendingWhileInFlight) scheduleSync(takePendingSyncIntent(), 0);
   }
 }
 
@@ -2372,7 +2376,8 @@ async function handleServerChangeEvent(change = {}) {
     if (serverChangePendingSequence <= cursor) serverChangePendingSequence = 0;
     return false;
   }
-  if (!syncInFlight) scheduleServerChangeSync();
+  if (syncInFlight) scheduleSync();
+  else scheduleServerChangeSync();
   return true;
 }
 
