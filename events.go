@@ -15,42 +15,83 @@ import (
 // always catch up on its next normal sync.
 type eventBroker struct {
 	mu          sync.Mutex
-	subscribers map[chan string]struct{}
+	subscribers map[chan changeEvent]struct{}
+}
+
+type changeEvent struct {
+	Type     string `json:"type"`
+	Sequence int64  `json:"sequence,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
 }
 
 func newEventBroker() *eventBroker {
-	return &eventBroker{subscribers: make(map[chan string]struct{})}
+	return &eventBroker{subscribers: make(map[chan changeEvent]struct{})}
 }
 
-func (b *eventBroker) subscribe() chan string {
-	ch := make(chan string, 1)
+func (b *eventBroker) subscribe() chan changeEvent {
+	ch := make(chan changeEvent, 4)
 	b.mu.Lock()
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
 	return ch
 }
 
-func (b *eventBroker) unsubscribe(ch chan string) {
+func (b *eventBroker) unsubscribe(ch chan changeEvent) {
 	b.mu.Lock()
 	delete(b.subscribers, ch)
 	b.mu.Unlock()
 }
 
-func (b *eventBroker) publish(kind string) {
+func (b *eventBroker) publish(event changeEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for ch := range b.subscribers {
-		select {
-		case ch <- kind:
-		default:
+		pending := make([]changeEvent, 0, 4)
+		for {
+			select {
+			case existing := <-ch:
+				pending = append(pending, existing)
+			default:
+				goto drained
+			}
+		}
+	drained:
+		replaced := false
+		for index := range pending {
+			if pending[index].Type == event.Type {
+				pending[index] = event
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			pending = append(pending, event)
+		}
+		for _, next := range pending {
+			select {
+			case ch <- next:
+			default:
+				break
+			}
 		}
 	}
 }
 
 func (a *app) publishChange(kind string) {
-	if a.events != nil {
-		a.events.publish(kind)
+	if a.events == nil {
+		return
 	}
+	event := changeEvent{Type: kind}
+	if a.db != nil {
+		if kind == "notes" {
+			_ = a.db.QueryRow("SELECT COALESCE(MAX(sequence), 0) FROM sync_changes").Scan(&event.Sequence)
+		} else if kind == "preferences" {
+			if current, err := getPrefs(a.db); err == nil {
+				event.Revision = current.Revision
+			}
+		}
+	}
+	a.events.publish(event)
 }
 
 const (
@@ -64,8 +105,8 @@ func writeSSEHeartbeat(w io.Writer) error {
 	return err
 }
 
-func writeSSEChange(w io.Writer, kind string) error {
-	data, err := json.Marshal(map[string]string{"type": kind})
+func writeSSEChange(w io.Writer, event changeEvent) error {
+	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
@@ -109,7 +150,7 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	var changes chan string
+	var changes chan changeEvent
 	if a.events != nil {
 		changes = a.events.subscribe()
 		defer a.events.unsubscribe(changes)
@@ -139,11 +180,11 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
-		case kind := <-changes:
+		case event := <-changes:
 			if err := setSSEWriteDeadline(w); err != nil {
 				return
 			}
-			if err := writeSSEChange(w, kind); err != nil {
+			if err := writeSSEChange(w, event); err != nil {
 				return
 			}
 			flusher.Flush()

@@ -47,6 +47,50 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 	}
 }
 
+func TestParseArtificialRTTDelay(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{name: "absent", raw: "", want: 0},
+		{name: "zero", raw: "0", want: 0},
+		{name: "milliseconds", raw: "25", want: 25 * time.Millisecond},
+		{name: "whitespace", raw: " 40 ", want: 40 * time.Millisecond},
+		{name: "invalid", raw: "slow", want: 0},
+		{name: "negative", raw: "-1", want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := parseArtificialRTTDelay(test.raw)
+			if got != test.want {
+				t.Fatalf("parseArtificialRTTDelay(%q) = %s, want %s", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestArtificialRTTDelayMiddlewareDelaysRequestsButNotSSE(t *testing.T) {
+	const delay = 15 * time.Millisecond
+	handler := artificialRTTDelayMiddleware(delay, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	start := time.Now()
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/api/check", nil))
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("API request completed in %s, want at least %s", elapsed, delay)
+	}
+
+	start = time.Now()
+	result = httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/api/events", nil))
+	if elapsed := time.Since(start); elapsed >= delay {
+		t.Fatalf("SSE request completed in %s, want less than %s", elapsed, delay)
+	}
+}
+
 func TestAPIValidationErrorsUseStableJSONCodes(t *testing.T) {
 	a := &app{}
 	request := httptest.NewRequest(http.MethodGet, "/api/search?q="+strings.Repeat("x", 257), nil)
@@ -847,6 +891,16 @@ func TestEventsStreamSendsAnImmediateHeartbeat(t *testing.T) {
 	}
 }
 
+func TestSSEChangeIncludesDurableSequence(t *testing.T) {
+	w := httptest.NewRecorder()
+	if err := writeSSEChange(w, changeEvent{Type: "notes", Sequence: 42}); err != nil {
+		t.Fatalf("write SSE change: %v", err)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"type":"notes"`) || !strings.Contains(body, `"sequence":42`) {
+		t.Fatalf("SSE change body = %q", body)
+	}
+}
+
 func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	notesDir := t.TempDir()
 	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
@@ -930,6 +984,47 @@ func TestSyncPushOrdersAndDeduplicatesOperations(t *testing.T) {
 	response = decode(result)
 	if len(response.Acknowledged) != 1 || response.Acknowledged[0].Status != "conflict" || response.Acknowledged[0].CurrentRevision != 1 || response.ExpectedSequence != 3 {
 		t.Fatalf("conflict response = %#v", response)
+	}
+}
+
+func TestSyncPushPublishesOneCoalescedNoteEventPerBatch(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "notes.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	events := newEventBroker()
+	subscriber := events.subscribe()
+	defer events.unsubscribe(subscriber)
+	a := &app{db: db, notesDir: t.TempDir(), noteCache: newNoteCache(), events: events}
+	zero := int64(0)
+	body, err := json.Marshal(syncPushRequest{DeviceID: "device_batch", Operations: []syncOperationRequest{
+		{ClientSequence: 1, OpID: "batch_one", Type: "note.save", NoteID: "batch-one", BaseRevision: &zero, Title: "One", Content: "one"},
+		{ClientSequence: 2, OpID: "batch_two", Type: "note.save", NoteID: "batch-two", BaseRevision: &zero, Title: "Two", Content: "two"},
+	}})
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	result := httptest.NewRecorder()
+	a.handleSyncPush(result, httptest.NewRequest(http.MethodPost, "/api/sync/push", strings.NewReader(string(body))))
+	if result.Code != http.StatusOK {
+		t.Fatalf("batch status = %d: %s", result.Code, result.Body.String())
+	}
+	select {
+	case event := <-subscriber:
+		if event.Type != "notes" || event.Sequence != 2 {
+			t.Fatalf("batch event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for batch event")
+	}
+	select {
+	case event := <-subscriber:
+		t.Fatalf("unexpected second batch event = %#v", event)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 
@@ -1471,11 +1566,11 @@ func TestPreferenceSyncMergesDisjointChangesAndConflictsSameField(t *testing.T) 
 	}
 	raw := func(value string) json.RawMessage { return json.RawMessage(strconv.Quote(value)) }
 
-	first := push("device_a", 1, "pref_a", map[string]json.RawMessage{"theme": raw("default-dark"), "statusDisplay": raw("compact"), "hideSaveButton": json.RawMessage("true")}, map[string]json.RawMessage{"theme": raw("default-light"), "statusDisplay": raw("normal"), "hideSaveButton": json.RawMessage("false")}, 1)
+	first := push("device_a", 1, "pref_a", map[string]json.RawMessage{"theme": raw("default-dark"), "statusDisplay": raw("compact"), "hideSaveButton": json.RawMessage("true"), "fontFamilyGoogle": json.RawMessage("true")}, map[string]json.RawMessage{"theme": raw("default-light"), "statusDisplay": raw("normal"), "hideSaveButton": json.RawMessage("false"), "fontFamilyGoogle": json.RawMessage("false")}, 1)
 	if first.Acknowledged[0].Status != "applied" || first.Acknowledged[0].Revision != 2 {
 		t.Fatalf("first preference result = %#v", first.Acknowledged)
 	}
-	second := push("device_b", 1, "pref_b", map[string]json.RawMessage{"accentColor": raw("#123456")}, map[string]json.RawMessage{"accentColor": raw("")}, 1)
+	second := push("device_b", 1, "pref_b", map[string]json.RawMessage{"accentColor": raw("#123456"), "editorFontFamilyGoogle": json.RawMessage("true")}, map[string]json.RawMessage{"accentColor": raw(""), "editorFontFamilyGoogle": json.RawMessage("false")}, 1)
 	if second.Acknowledged[0].Status != "applied" || second.Acknowledged[0].Revision != 3 {
 		t.Fatalf("disjoint preference result = %#v", second.Acknowledged)
 	}
@@ -1483,7 +1578,7 @@ func TestPreferenceSyncMergesDisjointChangesAndConflictsSameField(t *testing.T) 
 	if err != nil {
 		t.Fatalf("load merged preferences: %v", err)
 	}
-	if p.Theme != "default-dark" || p.AccentColor != "#123456" || p.StatusDisplay != "compact" || !p.HideSaveButton || p.Revision != 3 {
+	if p.Theme != "default-dark" || p.AccentColor != "#123456" || p.StatusDisplay != "compact" || !p.HideSaveButton || !p.FontFamilyGoogle || !p.EditorFontFamilyGoogle || p.Revision != 3 {
 		t.Fatalf("merged preferences = %#v", p)
 	}
 	conflict := push("device_c", 1, "pref_c", map[string]json.RawMessage{"theme": raw("default-light")}, map[string]json.RawMessage{"theme": raw("default-light")}, 1)
@@ -1559,9 +1654,9 @@ func TestDirectPreferencePatchUsesRevisionAndPublishesChange(t *testing.T) {
 		t.Fatalf("direct preference status = %d: %s", result.Code, result.Body.String())
 	}
 	select {
-	case kind := <-subscriber:
-		if kind != "preferences" {
-			t.Fatalf("preference event kind = %q", kind)
+	case event := <-subscriber:
+		if event.Type != "preferences" || event.Revision != 3 {
+			t.Fatalf("preference event = %#v", event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for preference event")

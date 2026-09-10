@@ -1,4 +1,7 @@
 import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {
   createApp,
   deleteOfflineDatabase,
@@ -22,28 +25,159 @@ function track(app) {
   return app;
 }
 
-describe('font availability', () => {
-  test('requires both the stylesheet and a loaded font face', async () => {
+const styleSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'static', 'style.css'), 'utf8');
+
+describe('font preferences', () => {
+  test('uses text inputs and leaves Google Fonts fetching disabled by default', async () => {
     const app = track(await createApp());
+
+    expect(app.window.document.querySelector('#pref-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-editor-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-preview-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-editor-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-preview-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-font-google').closest('.font-input-wrap')).not.toBeNull();
+    expect(app.window.document.querySelector('#pref-editor-font-google').closest('.font-input-wrap')).not.toBeNull();
+    expect(app.window.document.querySelector('#pref-preview-font-google').closest('.font-input-wrap')).not.toBeNull();
+  });
+
+  test('keeps arbitrary local font names and applies slot-specific system fallbacks', async () => {
+    const app = track(await createApp());
+
+    await app.hooks.savePref('fontFamily', 'Aptos');
+    await app.hooks.savePref('editorFontFamily', 'Fira Code');
+    await app.hooks.savePref('previewFontFamily', 'Source Serif 4');
+    await app.hooks.applyFonts();
+
+    const root = app.window.document.documentElement;
+    expect(root.style.getPropertyValue('--font')).toContain('"Aptos"');
+    expect(root.style.getPropertyValue('--font')).toContain('ui-sans-serif');
+    expect(root.style.getPropertyValue('--editor-font')).toContain('"Fira Code"');
+    expect(root.style.getPropertyValue('--editor-font')).toContain('ui-monospace');
+    expect(root.style.getPropertyValue('--preview-font')).toContain('"Source Serif 4"');
+    expect(root.style.getPropertyValue('--preview-font')).toContain('ui-sans-serif');
+    await app.hooks.savePref('previewFontFamily', 'system-serif');
+    await app.hooks.applyFonts();
+    expect(root.style.getPropertyValue('--preview-font')).toContain('ui-serif');
+    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
+  });
+
+  test('keeps an invalid font name visible and does not save it', async () => {
+    const app = track(await createApp());
+    const input = app.window.document.querySelector('#pref-font');
+    const error = app.window.document.querySelector('#pref-font-error');
+
+    input.value = 'Bad"Font';
+    input.dispatchEvent(new app.window.Event('change'));
+
+    await vi.waitFor(() => expect(error.hidden).toBe(false));
+    expect(input.value).toBe('Bad"Font');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(error.textContent).toContain('valid font name');
+    expect((await app.hooks.pendingOperations()).filter(operation => operation.type === 'prefs.save')).toHaveLength(0);
+    expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs') || '{}').fontFamily).not.toBe('Bad"Font');
+
+    await app.hooks.applyFonts();
+    expect(input.value).toBe('Bad"Font');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(error.hidden).toBe(false);
+  });
+
+  test('does not probe Google Fonts for local-only custom preferences', async () => {
+    const app = track(await createApp());
+    await app.hooks.savePref('fontFamily', 'Aptos');
     const head = app.window.document.head;
     const append = head.append.bind(head);
-    const fontLoads = [];
-    app.window.document.fonts.load = async descriptor => {
-      fontLoads.push(descriptor);
-      return [{}];
-    };
+    let probeCount = 0;
     head.append = (...nodes) => {
       append(...nodes);
-      nodes.filter(node => node.rel === 'stylesheet').forEach(node => {
-        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      nodes.filter(node => node.rel === 'stylesheet' && !node.dataset.mdnotesFont).forEach(node => {
+        probeCount++;
+        setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
       });
     };
 
-    await expect(app.hooks.checkFontAvailability()).resolves.toBe('available');
+    await app.hooks.loadPrefs();
 
-    expect(fontLoads).toContain('1rem "Inter"');
-    expect(app.window.document.querySelector('#font-availability').textContent).toBe('Google Fonts available');
-    expect(app.window.document.querySelector('#pref-font option[value="Inter"]').disabled).toBe(false);
+    expect(probeCount).toBe(0);
+    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
+  });
+
+  test('shows a font error when opt-in Google loading fails', async () => {
+    const app = track(await createApp());
+    app.window.console.warn = () => {};
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    head.append = (...nodes) => {
+      append(...nodes);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
+      });
+    };
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.savePref('fontFamily', 'Definitely Not A Google Font');
+    await app.hooks.applyFonts();
+
+    const error = app.window.document.querySelector('#pref-font-error');
+    expect(error.hidden).toBe(false);
+    expect(error.textContent).toContain('Font not available');
+    expect(app.window.document.documentElement.style.getPropertyValue('--font')).toContain('ui-sans-serif');
+  });
+
+  test('requests a Google family without assuming unsupported weights or styles', async () => {
+    const app = track(await createApp());
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    let stylesheet;
+    head.append = (...nodes) => {
+      append(...nodes);
+      stylesheet ||= nodes.find(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      });
+    };
+    app.window.document.fonts.load = async () => [{}];
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.savePref('fontFamily', 'Crimson Pro');
+    await app.hooks.applyFonts();
+
+    expect(stylesheet.href).toContain('family=Crimson+Pro&display=swap');
+    expect(stylesheet.href).not.toContain('ital,wght');
+  });
+
+  test('keeps Google fetching independent for each font slot', async () => {
+    const app = track(await createApp());
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    head.append = (...nodes) => {
+      append(...nodes);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      });
+    };
+    app.window.document.fonts.load = async () => [{}];
+
+    await app.hooks.savePref('editorFontFamily', 'Fira Code');
+    const editorFetch = app.window.document.querySelector('#pref-editor-font-google');
+    editorFetch.checked = true;
+    editorFetch.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.pendingOperations();
+    await app.hooks.applyFonts();
+
+    const requested = [...app.window.document.querySelectorAll('[data-mdnotes-font]')];
+    expect(requested).toHaveLength(1);
+    expect(requested[0].href).toContain('family=Fira+Code&display=swap');
+    expect(app.window.document.querySelector('#pref-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-preview-font-google').checked).toBe(false);
   });
 });
 
@@ -68,17 +202,65 @@ describe('editor display preferences', () => {
 });
 
 describe('markdown preview policy', () => {
-  test('highlights the rendered block containing the caret', async () => {
-    const app = track(await createApp());
+  test('preserves the starting number of ordered lists', async () => {
+    const app = track(await createApp({realMarked: true}));
+    app.hooks.showNoteInEditor({
+      id: 'note-a',
+      title: 'Note',
+      content: '6. [ ] six\n7. [ ] seven\n8. [ ] eight',
+    });
+    app.hooks.updatePreview();
+
+    const ordered = app.window.document.querySelector('#preview ol');
+    expect(ordered).not.toBeNull();
+    expect(ordered.getAttribute('start')).toBe('6');
+  });
+
+  test('preserves nested and signed ordered-list starts but strips malformed attributes', async () => {
+    const app = track(await createApp({realMarked: true}));
     app.window.marked = {
-      lexer: () => [
-        {raw: '# Heading\n\n'},
-        {raw: '- first\n\n- second\n\n'},
-        {raw: '```text\ninside\n\ncode\n```\n\n'},
-        {raw: 'tail'},
-      ],
-      parse: () => '<h1>Heading</h1><ul><li>first</li><li>second</li></ul><pre><code>inside\n\ncode\n</code></pre><p>tail</p>',
+      parse: () => '<ol start="6"><li>outer<ol start="-2"><li>nested</li></ol></li></ol><ol start="not-a-number"><li>bad</li></ol><p start="9">not a list</p>',
     };
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: 'ordered'});
+    app.hooks.updatePreview();
+
+    const lists = [...app.window.document.querySelectorAll('#preview ol')];
+    expect(lists.map(list => list.getAttribute('start'))).toEqual(['6', '-2', null]);
+    expect(app.window.document.querySelector('#preview p').getAttribute('start')).toBeNull();
+  });
+
+  test('leaves three editor lines of bottom breathing room', async () => {
+    expect(styleSource).toContain('#note-content{padding-bottom:4.95em;scroll-padding-bottom:4.95em}');
+  });
+
+  test('softly aligns the preview anchor with the editor caret', async () => {
+    const app = track(await createApp());
+
+    expect(app.hooks.calculatePreviewScrollAdjustment({
+      previewTop: 0,
+      previewHeight: 200,
+      previewScrollTop: 0,
+      previewScrollHeight: 600,
+      anchorTop: 300,
+      caretTop: 100,
+      margin: 30,
+      deadband: 20,
+    })).toBe(200);
+
+    expect(app.hooks.calculatePreviewScrollAdjustment({
+      previewTop: 0,
+      previewHeight: 200,
+      previewScrollTop: 100,
+      previewScrollHeight: 600,
+      anchorTop: 112,
+      caretTop: 100,
+      margin: 30,
+      deadband: 20,
+    })).toBe(0);
+  });
+
+  test('highlights the rendered block containing the caret', async () => {
+    const app = track(await createApp({realMarked: true}));
     app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: '# Heading\n\n- first\n\n- second\n\n```text\ninside\n\ncode\n```\n\ntail'});
     app.hooks.updatePreview();
 
@@ -90,6 +272,130 @@ describe('markdown preview policy', () => {
     const blocks = [...app.window.document.querySelector('#preview').children];
     expect(blocks[2].classList.contains('highlight')).toBe(true);
     expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('maps a caret inside a loose list to the list block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '- first\n\n- second\n\nparagraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const secondItemOffset = content.indexOf('second');
+    textarea.selectionStart = textarea.selectionEnd = secondItemOffset;
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks[0].tagName).toBe('UL');
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+    expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('maps caret positions at block ends and in separator whitespace', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '# First\n\nfirst paragraph\n\n# Second\n\nsecond paragraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+    app.hooks.updatePreview();
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    const positions = [
+      {position: content.indexOf('# First') + '# First'.length, block: 0},
+      {position: content.indexOf('\n\nfirst') + 1, block: 0},
+      {position: content.indexOf('\n\n# Second') + 1, block: 1},
+      {position: content.length, block: blocks.length - 1},
+    ];
+
+    for (const {position, block} of positions) {
+      textarea.selectionStart = textarea.selectionEnd = position;
+      app.hooks.highlightBlock();
+      expect(blocks.filter(element => element.classList.contains('highlight'))).toHaveLength(1);
+      expect(blocks[block].classList.contains('highlight')).toBe(true);
+    }
+  });
+
+  test('maps a caret inside fenced code across blank lines to the code block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '```text\ninside\n\ncode\n```\n\ntail';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const codeOffset = content.indexOf('code');
+    textarea.selectionStart = textarea.selectionEnd = codeOffset;
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks[0].tagName).toBe('PRE');
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+    expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('does not use preview ranges from an older source while rendering is pending', async () => {
+    const app = track(await createApp({realMarked: true}));
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: 'first paragraph\n\nsecond paragraph'});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.value = 'short\n\nsecond';
+    textarea.selectionStart = textarea.selectionEnd = textarea.value.indexOf('second');
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks.every(block => !block.classList.contains('highlight'))).toBe(true);
+
+    app.hooks.updatePreview();
+    app.hooks.highlightBlock();
+    const refreshedBlocks = [...app.window.document.querySelector('#preview').children];
+    expect(refreshedBlocks[1].classList.contains('highlight')).toBe(true);
+  });
+
+  test('maps headings, blockquotes, thematic breaks, and tables to their blocks', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '> quoted\n\n## heading\n\n---\n\n| a | b |\n| - | - |\n| 1 | 2 |';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const preview = app.window.document.querySelector('#preview');
+    const blocks = [...preview.children];
+    expect(blocks.map(block => block.tagName)).toEqual(['BLOCKQUOTE', 'H2', 'HR', 'TABLE']);
+    for (const [index, marker] of ['quoted', 'heading', '---', '| 1'].entries()) {
+      textarea.selectionStart = textarea.selectionEnd = content.indexOf(marker);
+      app.hooks.highlightBlock();
+      expect(blocks[index].classList.contains('highlight')).toBe(true);
+    }
+  });
+
+  test('maps a Setext heading to its rendered heading block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = 'Setext heading\n==============\n\nparagraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.selectionStart = textarea.selectionEnd = content.indexOf('Setext');
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks.map(block => block.tagName)).toEqual(['H1', 'P']);
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+  });
+
+  test('maps rendered blocks after an omitted link-reference definition', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '[docs]: https://example.com\n\nParagraph with [docs].';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.selectionStart = textarea.selectionEnd = content.indexOf('Paragraph');
+    app.hooks.highlightBlock();
+
+    const paragraph = app.window.document.querySelector('#preview > p');
+    expect(paragraph).not.toBeNull();
+    expect(paragraph.classList.contains('highlight')).toBe(true);
+  });
+
+  test('highlighting does not change preview block geometry', () => {
+    expect(styleSource).toMatch(/\.preview \.highlight\{[^}]*background:/);
+    expect(styleSource).not.toMatch(/\.preview \.highlight\{[^}]*\bmargin:/);
+    expect(styleSource).not.toMatch(/\.preview \.highlight\{[^}]*\bpadding:/);
+    expect(styleSource).toContain('.preview p{margin:0 0 1em}');
   });
 
   test('escapes raw HTML, rejects unsafe resource URLs, and lazy-loads images', async () => {
@@ -171,6 +477,239 @@ describe('sync scheduling while hidden', () => {
     await new Promise(resolve => setTimeout(resolve, 150));
 
     expect(requests.some(url => String(url).includes('/api/sync'))).toBe(true);
+  });
+});
+
+describe('server change invalidation', () => {
+  test('refreshes preferences without scheduling an unrelated note sync', async () => {
+    const requests = [];
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        requests.push(String(path));
+        if (String(path) === '/api/prefs') return response(200, {revision: 2, theme: 'default-light'});
+        if (String(path).startsWith('/api/sync?')) return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'preferences', revision: 2})).resolves.toBe(true);
+    await vi.waitFor(() => expect(requests.filter(path => path === '/api/prefs')).toHaveLength(1));
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    expect(requests.some(path => path.startsWith('/api/sync?'))).toBe(false);
+    expect(app.hooks.getSyncScheduleState()).toEqual({scheduled: false, options: {}});
+  });
+
+  test('ignores a note event already covered by the local sync cursor', async () => {
+    const app = track(await createApp());
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    await app.hooks.applyRemoteChangePage([], new Map(), 42);
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'notes', sequence: 42})).resolves.toBe(false);
+    expect(app.hooks.getSyncScheduleState()).toEqual({scheduled: false, options: {}});
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'notes', sequence: 43})).resolves.toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 90));
+    expect(app.hooks.getSyncScheduleState().scheduled).toBe(true);
+    app.hooks.cancelScheduledSync();
+  });
+
+  test('pulls again when a newer note event arrives during sync completion', async () => {
+    let pullRequests = 0;
+    const app = track(await createApp({
+      deferredSyncCompletion: true,
+      fetchImpl: async path => {
+        if (!String(path).startsWith('/api/sync?')) throw new Error(`unexpected request: ${path}`);
+        pullRequests++;
+        return response(200, {changes: [], nextSequence: pullRequests > 1 ? 1 : 0, hasMore: false});
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    const sync = app.hooks.syncNow();
+    await app.syncCompletionStarted;
+    await app.hooks.handleServerChangeEvent({type: 'notes', sequence: 1});
+    app.releaseSyncCompletion();
+    await sync;
+
+    await vi.waitFor(() => expect(pullRequests).toBe(2));
+  });
+});
+
+describe('sync coordinator', () => {
+  test('reports a durable queued edit as saved but waiting to sync', async () => {
+    const app = track(await createApp());
+    app.hooks.setEditorState({
+      id: 'note-a', dirty: true, title: 'Note', content: 'local edit',
+      savedSnapshot: {title: '', tags: '', content: ''},
+    });
+
+    await app.hooks.saveCurrentNote(false);
+    await vi.waitFor(() => {
+      const status = app.window.document.querySelector('#editor-status');
+      expect(status).toMatchObject({
+        dataset: expect.objectContaining({state: 'local'}),
+        title: 'Saved on this device; waiting to sync',
+      });
+      expect(status.querySelector('.sync-indicator-label').textContent).toBe('Saved');
+      expect(status.getAttribute('aria-label')).toBe('Saved on this device; waiting to sync');
+    });
+  });
+
+  test('does not run a redundant follow-up for requests made during an idle sync', async () => {
+    let markSyncStarted;
+    let releaseSync;
+    const syncStarted = new Promise(resolve => { markSyncStarted = resolve; });
+    const syncGate = new Promise(resolve => { releaseSync = resolve; });
+    let syncRequests = 0;
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path).startsWith('/api/sync?')) {
+          syncRequests++;
+          if (syncRequests === 1) {
+            markSyncStarted();
+            await syncGate;
+          }
+          return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    const sync = app.hooks.syncNow();
+    await syncStarted;
+    app.hooks.scheduleSync();
+    app.hooks.scheduleSync();
+    releaseSync();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 180));
+
+    expect(syncRequests).toBe(1);
+  });
+
+  test('keeps one logical syncing state across pull, push, and final pull', async () => {
+    let markPushStarted;
+    let releasePush;
+    const pushStarted = new Promise(resolve => { markPushStarted = resolve; });
+    const pushGate = new Promise(resolve => { releasePush = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async (path, options) => {
+        const value = String(path);
+        if (value.startsWith('/api/sync?')) return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        if (value === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          markPushStarted();
+          await pushGate;
+          return response(200, {
+            acknowledged: request.operations.map(operation => ({
+              client_sequence: operation.client_sequence,
+              op_id: operation.op_id,
+              status: 'applied',
+              revision: 1,
+            })),
+            expected_sequence: request.operations.at(-1).client_sequence + 1,
+          });
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    await app.hooks.putLocalNote({id: 'note-a', title: 'Note', tags: '', content: 'body', revision: 0, pending: true, base_revision: 0});
+    await app.hooks.queueOperation({type: 'note.save', note_id: 'note-a', base_revision: 0, note: {id: 'note-a', title: 'Note', tags: '', content: 'body', revision: 0}});
+
+    const states = [];
+    const status = app.window.document.querySelector('#sync-status');
+    const observer = new app.window.MutationObserver(() => states.push(status.dataset.state));
+    observer.observe(status, {attributes: true, subtree: true, childList: true});
+    const sync = app.hooks.syncNow();
+    await pushStarted;
+    await new Promise(resolve => setTimeout(resolve, 180));
+    releasePush();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    observer.disconnect();
+
+    expect(states.filter((state, index) => index === 0 || state !== states[index - 1])).toEqual(['syncing', 'online']);
+  });
+
+  test('flushes a local edit made during sync without starting an empty extra cycle', async () => {
+    let markFirstPushStarted;
+    let releaseFirstPush;
+    const firstPushStarted = new Promise(resolve => { markFirstPushStarted = resolve; });
+    const firstPushGate = new Promise(resolve => { releaseFirstPush = resolve; });
+    let app;
+    let pullRequests = 0;
+    let pushRequests = 0;
+    const fetchImpl = async (path, options) => {
+      const value = String(path);
+      if (value.startsWith('/api/sync?')) {
+        pullRequests++;
+        return response(200, {changes: [], nextSequence: 0, hasMore: false});
+      }
+      if (value === '/api/sync/push') {
+        pushRequests++;
+        const request = JSON.parse(options.body);
+        if (pushRequests === 1) {
+          markFirstPushStarted();
+          await firstPushGate;
+        }
+        return response(200, {
+          acknowledged: request.operations.map(operation => ({
+            client_sequence: operation.client_sequence,
+            op_id: operation.op_id,
+            status: 'applied',
+            revision: 1,
+          })),
+          expected_sequence: request.operations.at(-1).client_sequence + 1,
+        });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    };
+    app = track(await createApp({fetchImpl}));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+    const first = {id: 'note-a', title: 'Note', tags: '', content: 'first', revision: 0};
+    await app.hooks.putLocalNote({...first, pending: true, base_revision: 0});
+    await app.hooks.queueOperation({type: 'note.save', note_id: first.id, base_revision: 0, note: first});
+
+    const sync = app.hooks.syncNow();
+    await firstPushStarted;
+    const second = {...first, content: 'second', pending: true, base_revision: 0};
+    await app.hooks.putLocalNote(second);
+    await app.hooks.queueOperation({type: 'note.save', note_id: second.id, base_revision: 0, note: second});
+    app.hooks.scheduleSync();
+    releaseFirstPush();
+    await sync;
+    await new Promise(resolve => setTimeout(resolve, 180));
+
+    expect(pushRequests).toBe(2);
+    expect(pullRequests).toBe(2);
+  });
+
+  test('shows a loading state instead of a final empty state during initial hydration', async () => {
+    let markCheckStarted;
+    let releaseCheck;
+    const checkStarted = new Promise(resolve => { markCheckStarted = resolve; });
+    const checkGate = new Promise(resolve => { releaseCheck = resolve; });
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/check') {
+          markCheckStarted();
+          await checkGate;
+          return response(503, 'offline');
+        }
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    app.window.console.error = () => {};
+
+    const startup = app.hooks.init();
+    await checkStarted;
+    expect(app.window.document.querySelector('#note-list').textContent).toContain('Loading notes');
+    releaseCheck();
+    await startup;
+    await new Promise(resolve => setTimeout(resolve, 0));
   });
 });
 
@@ -297,6 +836,185 @@ describe('F-02 immutable queue operations', () => {
 
     expect(await app.hooks.removePendingOperationIfIdentityMatches(attempted.id, attempted)).toBe(true);
     expect((await app.hooks.pendingOperations()).map(operation => operation.note.content)).toEqual(['second']);
+  });
+
+  test('does not self-conflict when a newer note save is queued during an earlier push', async () => {
+    let revision = 1;
+    let remote = {id: 'note-a', title: 'Note', tags: '', content: 'base', revision};
+    const pushes = [];
+    const app = track(await createApp({
+      fetchImpl: async (path, options = {}) => {
+        if (String(path) === '/api/sync/push') {
+          const request = JSON.parse(options.body);
+          pushes.push(request.operations);
+          const acknowledged = request.operations.map(operation => {
+            if (operation.base_revision !== revision) {
+              return {
+                client_sequence: operation.client_sequence,
+                op_id: operation.op_id,
+                status: 'conflict',
+                current_revision: revision,
+              };
+            }
+            revision++;
+            remote = {...remote, title: operation.title, tags: operation.tags, content: operation.content, revision};
+            return {
+              client_sequence: operation.client_sequence,
+              op_id: operation.op_id,
+              status: 'applied',
+              revision,
+            };
+          });
+          return response(200, JSON.stringify({
+            acknowledged,
+            expected_sequence: request.operations.at(-1).client_sequence + 1,
+          }));
+        }
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+
+    await app.hooks.putLocalNote({
+      ...remote,
+      pending: true,
+      base_revision: revision,
+      base_content: remote.content,
+      base_title: remote.title,
+      base_tags: remote.tags,
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: revision,
+      note: {...remote, content: 'first edit', base_revision: revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags},
+    });
+    const first = (await app.hooks.pendingOperations())[0];
+    await app.hooks.claimQueueOperation(first.id);
+
+    await app.hooks.putLocalNote({
+      ...remote,
+      content: 'newest edit',
+      pending: true,
+      base_revision: revision,
+      base_content: remote.content,
+      base_title: remote.title,
+      base_tags: remote.tags,
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save',
+      note_id: 'note-a',
+      base_revision: revision,
+      note: {...remote, content: 'newest edit', base_revision: revision, base_content: remote.content, base_title: remote.title, base_tags: remote.tags},
+    });
+
+    await expect(app.hooks.flushPendingChanges()).resolves.toBe(true);
+
+    expect(pushes).toHaveLength(2);
+    expect(pushes[0]).toHaveLength(1);
+    expect(pushes[1]).toHaveLength(1);
+    expect(pushes[1][0].base_revision).toBe(2);
+    expect(remote.content).toBe('newest edit');
+    expect(app.window.document.querySelector('#toast-region').textContent).not.toContain('conflict');
+    expect(await app.hooks.pendingOperations()).toHaveLength(0);
+  });
+
+  test('does not overwrite a remote edit when a stale pin precedes a local save', async () => {
+    let revision = 3;
+    let remote = {
+      id: 'note-a', title: 'Note', tags: '',
+      content: 'one\ntwo\nthree\nremote change',
+      revision, pinned: false, pin_order: 0,
+    };
+    const app = track(await createApp({
+      realMerge: true,
+      fetchImpl: async (path, options = {}) => {
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        if (String(path) !== '/api/sync/push') throw new Error(`unexpected request: ${path}`);
+        const request = JSON.parse(options.body);
+        const acknowledged = request.operations.map(operation => {
+          if (operation.type !== 'noop' && operation.base_revision !== revision) {
+            return {op_id: operation.op_id, status: 'conflict', current_revision: revision};
+          }
+          if (operation.type === 'noop') return {op_id: operation.op_id, status: 'applied'};
+          revision++;
+          if (operation.type === 'note.save') {
+            remote = {...remote, title: operation.title, tags: operation.tags, content: operation.content, revision};
+          } else if (operation.type === 'note.pin') {
+            remote = {...remote, pinned: operation.pinned, pin_order: operation.pinned ? 9 : 0, revision};
+          }
+          return {op_id: operation.op_id, status: 'applied', revision, pin_order: remote.pin_order};
+        });
+        return response(200, JSON.stringify({
+          acknowledged,
+          expected_sequence: request.operations.at(-1).client_sequence + 1,
+        }));
+      },
+    }));
+    const base = 'one\ntwo\nthree\nfour';
+    const localContent = 'one\nlocal change\nthree\nfour';
+    await app.hooks.putLocalNote({
+      ...remote, content: localContent, revision: 2, pinned: true, pin_order: 5,
+      pending: true, base_revision: 2, base_content: base, base_title: 'Note', base_tags: '',
+    });
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
+    await app.hooks.queueOperation({
+      type: 'note.save', note_id: 'note-a', base_revision: 2,
+      note: {id: 'note-a', title: 'Note', tags: '', content: localContent, revision: 2, pinned: true, base_revision: 2, base_content: base, base_title: 'Note', base_tags: ''},
+    });
+
+    await app.hooks.flushPendingChanges();
+
+    expect(remote.content).toBe('one\nlocal change\nthree\nremote change');
+  });
+
+  test('preserves a later pin when an earlier save conflicts', async () => {
+    let revision = 2;
+    let remote = {
+      id: 'note-a', title: 'Note', tags: '',
+      content: 'one\ntwo\nthree\nremote change',
+      revision, pinned: false, pin_order: 0,
+    };
+    const app = track(await createApp({
+      realMerge: true,
+      fetchImpl: async (path, options = {}) => {
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        if (String(path) !== '/api/sync/push') throw new Error(`unexpected request: ${path}`);
+        const request = JSON.parse(options.body);
+        const acknowledged = request.operations.map(operation => {
+          if (operation.type !== 'noop' && operation.base_revision !== revision) {
+            return {op_id: operation.op_id, status: 'conflict', current_revision: revision};
+          }
+          if (operation.type === 'noop') return {op_id: operation.op_id, status: 'applied'};
+          revision++;
+          if (operation.type === 'note.save') {
+            remote = {...remote, title: operation.title, tags: operation.tags, content: operation.content, pinned: operation.pinned, revision, pin_order: operation.pinned ? 12 : 0};
+          } else if (operation.type === 'note.pin') {
+            remote = {...remote, pinned: operation.pinned, revision, pin_order: operation.pinned ? 12 : 0};
+          }
+          return {op_id: operation.op_id, status: 'applied', revision, pin_order: remote.pin_order};
+        });
+        return response(200, JSON.stringify({acknowledged, expected_sequence: request.operations.at(-1).client_sequence + 1}));
+      },
+    }));
+    const base = 'one\ntwo\nthree\nfour';
+    const localContent = 'one\nlocal change\nthree\nfour';
+    await app.hooks.putLocalNote({
+      ...remote, content: localContent, revision: 1, pinned: true, pin_order: 5,
+      pending: true, base_revision: 1, base_content: base, base_title: 'Note', base_tags: '',
+    });
+    await app.hooks.queueOperation({
+      type: 'note.save', note_id: 'note-a', base_revision: 1,
+      note: {id: 'note-a', title: 'Note', tags: '', content: localContent, revision: 1, pinned: false, base_revision: 1, base_content: base, base_title: 'Note', base_tags: ''},
+    });
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 1, pinned: true, pin_order: 5});
+
+    await app.hooks.flushPendingChanges();
+
+    expect(remote).toMatchObject({
+      content: 'one\nlocal change\nthree\nremote change',
+      pinned: true,
+    });
   });
 
   test('allows only one tab to hold the fallback sync lease', async () => {
@@ -721,6 +1439,41 @@ describe('sync request lifecycle', () => {
 });
 
 describe('preference sync coordination', () => {
+  test('syncs Google font fetch switches as preference patches', async () => {
+    const app = track(await createApp());
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    app.hooks.cancelScheduledSync();
+
+    const pending = await app.hooks.pendingOperations();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].prefs._sync_patch).toEqual({fontFamilyGoogle: true});
+  });
+
+  test('restores Google font fetch switches from remote preferences', async () => {
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/prefs') return response(200, JSON.stringify({
+          revision: 2,
+          autoSave: true,
+          fontFamily: 'Inter',
+          fontFamilyGoogle: true,
+          editorFontFamily: 'system-monospace',
+          editorFontFamilyGoogle: false,
+          previewFontFamily: 'system-sans',
+          previewFontFamilyGoogle: false,
+        }));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    await app.hooks.loadPrefs();
+    expect(fetchFonts.checked).toBe(true);
+  });
+
   test('coalesces preference changes into field-level patches', async () => {
     const app = track(await createApp());
 

@@ -19,16 +19,12 @@ let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let editorSessionGeneration = 0;
-const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
-const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
+const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', fontFamilyGoogle:false, editorFontFamily:'system-monospace', editorFontFamilyGoogle:false, previewFontFamily:'system-sans', previewFontFamilyGoogle:false};
 const FONT_CACHE_NAME = 'mdnotes-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
 const SYSTEM_SERIF_STACK = 'ui-serif,Georgia,Cambria,"Times New Roman",Times,serif';
 const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace';
-const SYSTEM_FONT_OPTIONS = [{value:'system-sans',label:'System (Sans)'}, {value:'system-serif',label:'System (Serif)'}, {value:'system-monospace',label:'System (Monospace)'}];
 let prefs = {...DEFAULT_PREFS};
-let fontAvailability = 'checking';
-let fontAvailabilityPromise = null;
 let fontLoadGeneration = 0;
 let fontApplyQueue = Promise.resolve();
 let renderedPreviewSource = null;
@@ -39,6 +35,7 @@ let currentBaseRevision = null;
 let syncInFlight = false;
 let syncScheduleTimer = null;
 let syncScheduleOptions = {};
+let syncPendingWhileInFlight = false;
 let syncRetryDelayMs = 0;
 let activeSyncControllers = new Set();
 let syncCancellationRequested = false;
@@ -60,6 +57,12 @@ let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
 let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
 let registeredServiceWorkerRevision = null;
 let updateToast = null;
+let syncStatusRevealTimer = null;
+let syncStatusGeneration = 0;
+let dashboardHydrationState = 'ready';
+let restoringHistoryRoute = false;
+let backNavigationInFlight = false;
+const pendingHistoryRestoreResolvers = [];
 
 const httpRequestTimeoutMs = 15000;
 const syncRetryDelaysMs = [1000, 5000, 15000, 60000, 300000];
@@ -76,9 +79,12 @@ let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const noteRouteIDPattern = /^[A-Za-z0-9_-]{1,64}$/;
+const appRouteState = 'mdnotes';
+const preferencesPath = '/preferences';
 
 function noteIDFromLocation() {
   try {
+    if (window.location.pathname === preferencesPath) return null;
     const id = decodeURIComponent(window.location.pathname.slice(1));
     return noteRouteIDPattern.test(id) ? id : null;
   } catch (_) {
@@ -86,15 +92,84 @@ function noteIDFromLocation() {
   }
 }
 
+function dashboardRouteState() {
+  return {app: appRouteState, screen: 'dashboard'};
+}
+
+function noteRouteState(noteID) {
+  return {app: appRouteState, screen: 'note', noteID};
+}
+
+function preferencesRouteState(returnRoute) {
+  return {app: appRouteState, screen: 'preferences', returnRoute};
+}
+
+function isAppNoteRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'note' && noteRouteIDPattern.test(state.noteID || '');
+}
+
+function isAppDashboardRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'dashboard';
+}
+
+function isAppPreferencesRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'preferences';
+}
+
+function currentAppRouteState() {
+  if (isAppNoteRoute()) return noteRouteState(history.state.noteID);
+  if (isAppDashboardRoute()) return dashboardRouteState();
+  const noteID = noteIDFromLocation();
+  return noteID ? noteRouteState(noteID) : dashboardRouteState();
+}
+
+function initializeHistoryRoute() {
+  if (window.location.pathname === preferencesPath) {
+    if (isAppPreferencesRoute()) return;
+    const path = window.location.pathname;
+    history.replaceState(dashboardRouteState(), '', '/');
+    history.pushState(preferencesRouteState(dashboardRouteState()), '', path);
+    return;
+  }
+  const noteID = noteIDFromLocation();
+  if (noteID) {
+    if (isAppNoteRoute() && history.state.noteID === noteID) return;
+    const path = window.location.pathname;
+    history.replaceState(dashboardRouteState(), '', '/');
+    history.pushState(noteRouteState(noteID), '', path);
+    return;
+  }
+  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) {
+    history.replaceState(dashboardRouteState(), '', '/');
+  }
+}
+
 function setNoteRoute(noteID, {replace = false} = {}) {
   const path = `/${encodeURIComponent(noteID)}`;
-  if (window.location.pathname === path && !window.location.search && !window.location.hash) return;
-  history[replace ? 'replaceState' : 'pushState']({noteID}, '', path);
+  const state = noteRouteState(noteID);
+  if (window.location.pathname === path && !window.location.search && !window.location.hash) {
+    if (!isAppNoteRoute() || history.state.noteID !== noteID) history.replaceState(state, '', path);
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', path);
 }
 
 function setDashboardRoute({replace = false} = {}) {
-  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) return;
-  history[replace ? 'replaceState' : 'pushState']({}, '', '/');
+  const state = dashboardRouteState();
+  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) {
+    if (!isAppDashboardRoute()) history.replaceState(state, '', '/');
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', '/');
+}
+
+function setPreferencesRoute({replace = false, returnRoute = currentAppRouteState()} = {}) {
+  const state = preferencesRouteState(returnRoute);
+  if (window.location.pathname === preferencesPath && !window.location.search && !window.location.hash) {
+    if (!isAppPreferencesRoute()) history.replaceState(state, '', preferencesPath);
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', preferencesPath);
 }
 
 function openOfflineDB() {
@@ -633,6 +708,7 @@ try {
     syncCoordinationChannel.addEventListener('message', event => {
       if (!event.data || event.data.sender === syncTabID) return;
       if (event.data.type === 'sync-request') scheduleSync({}, 0);
+      if (event.data.type === 'sync-complete') void refreshLocalStateFromStorage();
       if (event.data.type === 'logout') void closeOfflineDatabaseConnection();
     });
   }
@@ -646,14 +722,22 @@ function notifySyncRequested() {
   } catch (_) {}
 }
 
+function notifySyncCompleted() {
+  try {
+    syncCoordinationChannel?.postMessage({type: 'sync-complete', sender: syncTabID});
+  } catch (_) {}
+}
+
 const syncStates = {
   online: {label: 'Saved', title: 'Saved and up to date'},
+  local: {label: 'Saved', title: 'Saved on this device; waiting to sync'},
   syncing: {label: 'Syncing', title: 'Synchronizing changes'},
   offline: {label: 'Offline', title: 'Offline — changes are saved on this device'},
 };
 let syncFailed = false;
 
 function setSyncStatus(state) {
+  syncStatusGeneration++;
   const config = syncStates[state] || syncStates.offline;
   ['#sync-status', '#editor-status'].forEach(selector => {
     const element = $(selector);
@@ -793,17 +877,41 @@ function cancelActiveSyncRequests() {
 
 function beginSyncNetworkRequest() {
   syncNetworkRequestsInFlight++;
-  setSyncStatus('syncing');
+  if (!syncInFlight) setSyncStatus('syncing');
 }
 
-function endSyncNetworkRequest() {
+async function endSyncNetworkRequest() {
   syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
-  if (syncNetworkRequestsInFlight === 0) setIdleSyncStatus();
+  if (syncNetworkRequestsInFlight === 0 && !syncInFlight) await setIdleSyncStatus();
 }
 
-function setIdleSyncStatus() {
-  if (syncNetworkRequestsInFlight > 0) return;
-  setSyncStatus(syncFailed ? 'offline' : 'online');
+async function setIdleSyncStatus() {
+  if (syncNetworkRequestsInFlight > 0 || syncInFlight) return;
+  const generation = ++syncStatusGeneration;
+  try {
+    const operations = await pendingOperations();
+    if (generation !== syncStatusGeneration || syncNetworkRequestsInFlight > 0 || syncInFlight) return;
+    if (typeof document === 'undefined') return;
+    setSyncStatus(syncFailed ? 'offline' : operations.length ? 'local' : 'online');
+  } catch (error) {
+    console.warn('could not determine pending sync status', error);
+  }
+}
+
+function beginSyncStatusPresentation() {
+  if (syncStatusRevealTimer || $('#sync-status')?.dataset.state === 'syncing') return;
+  syncStatusRevealTimer = setTimeout(() => {
+    syncStatusRevealTimer = null;
+    if (syncInFlight) setSyncStatus('syncing');
+  }, 150);
+}
+
+function finishSyncStatusPresentation(state) {
+  if (syncStatusRevealTimer) {
+    clearTimeout(syncStatusRevealTimer);
+    syncStatusRevealTimer = null;
+  }
+  setSyncStatus(state);
 }
 
 class APIError extends Error {
@@ -871,7 +979,7 @@ async function api(path, opts) {
     console.error(error);
     throw error;
   } finally {
-    if (syncRequest) endSyncNetworkRequest();
+    if (syncRequest) await endSyncNetworkRequest();
   }
 }
 
@@ -896,7 +1004,7 @@ async function syncFetch(path, options) {
     setSyncDiagnostic(`${method} ${path} failed: ${typed.message}`);
     throw typed;
   } finally {
-    endSyncNetworkRequest();
+    await endSyncNetworkRequest();
   }
 }
 
@@ -1163,11 +1271,17 @@ async function mergeConflictedNote(operation, remote) {
   };
   const merged = window.MDNotesMerge.mergeNoteVersions(base, local, remote);
   if (!merged) return false;
+  const queued = await pendingOperationsForNote(operation.note_id);
+  const laterPin = latestLaterOperation(queued, operation, 'note.pin');
 
   const now = new Date().toISOString();
   const mergedLocal = {
     ...remote,
     ...merged,
+    ...(laterPin ? {
+      pinned: Boolean(laterPin.pinned),
+      pin_order: laterPin.pinned ? (local.pin_order || 0) : 0,
+    } : {}),
     updated_at: now,
     pending: true,
     base_revision: remote.revision,
@@ -1291,6 +1405,14 @@ function closeConflictResolver() {
   closeModal($('#conflict-modal'));
 }
 
+function closePreferences() {
+  if (isAppPreferencesRoute()) {
+    history.back();
+    return;
+  }
+  closeModal($('#prefs-modal'));
+}
+
 function openModal(modal) {
   if (!modal.__keyboardBound) {
     modal.addEventListener('keydown', handleModalKeydown);
@@ -1316,6 +1438,7 @@ function handleModalKeydown(event) {
   if (event.key === 'Escape') {
     event.preventDefault();
     if (modal.id === 'conflict-modal') closeConflictResolver();
+    else if (modal.id === 'prefs-modal') closePreferences();
     else closeModal(modal);
     return;
   }
@@ -1444,17 +1567,25 @@ async function createConflictResolution(operation, remote) {
     return false;
   }
 
+  const queued = await pendingOperationsForNote(operation.note_id);
+  const laterPin = latestLaterOperation(queued, operation, 'note.pin');
+  const resolvedRemote = laterPin ? {
+    ...remote,
+    pinned: Boolean(laterPin.pinned),
+    pin_order: laterPin.pinned ? (local.pin_order || 0) : 0,
+  } : remote;
+
   const conflict = {
     note_id: operation.note_id,
     created_at: new Date().toISOString(),
     base: conflictBase(local, operation),
     local: {title: local.title || '', tags: local.tags || '', content: local.content || ''},
-    remote: {...remote, title: remote.title || '', tags: remote.tags || '', content: remote.content || '', revision: remote.revision || 0, filename: remote.filename || ''},
+    remote: {...resolvedRemote, title: remote.title || '', tags: remote.tags || '', content: remote.content || '', revision: remote.revision || 0, filename: remote.filename || ''},
   };
   // Persist the user's version before acknowledging the conflict locally. If
   // the browser closes now, reopening the note resumes this resolver.
   await setUnresolvedConflict(conflict);
-  await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+  await putLocalNote({...resolvedRemote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
   await removePendingOperationIfIdentityMatches(operation.id, operation);
   // Bring the authoritative version into the normal editor before opening the
@@ -1709,6 +1840,7 @@ function encodedByteLength(value) {
 function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
   return withOfflineStore(['queue'], 'readwrite', stores => new Promise((resolve, reject) => {
     const batch = [];
+    const revisionNoteIDs = new Set();
     const request = stores.queue.index('client_sequence').openCursor();
     let finished = false;
     const finish = () => {
@@ -1724,6 +1856,11 @@ function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
         return;
       }
       const operation = cursor.value;
+      const isRevisionOperation = ['note.save', 'note.delete', 'note.pin'].includes(operation.type) && operation.note_id;
+      if (isRevisionOperation && revisionNoteIDs.has(operation.note_id)) {
+        finish();
+        return;
+      }
       const candidate = [...batch.map(item => outgoingSyncOperation(item)), outgoingSyncOperation(operation)];
       const requestBytes = encodedByteLength({device_id: deviceID, operations: candidate});
       if (batch.length && requestBytes > maxBytes) {
@@ -1735,6 +1872,7 @@ function claimPendingOperationBatch(deviceID, maxOperations, maxBytes) {
         cursor.update(operation);
       }
       batch.push(operation);
+      if (isRevisionOperation) revisionNoteIDs.add(operation.note_id);
       if (batch.length >= maxOperations) finish();
       else cursor.continue();
     };
@@ -1762,7 +1900,11 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
       const hasLaterSave = Boolean(latestLaterOperation(queued, operation, 'note.save'));
       const laterPin = latestLaterOperation(queued, operation, 'note.pin');
       const desiredPinned = laterPin ? Boolean(laterPin.pinned) : Boolean(operation.pinned);
-      await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
+      // A later save was authored against the pin's older base. Let that save
+      // conflict normally so its content is three-way merged with the remote
+      // edit; rebasing it here would make the stale snapshot look current and
+      // allow it to overwrite the remote change.
+      if (!hasLaterSave) await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
       await removePendingOperationIfIdentityMatches(operation.id, operation);
       const local = await getLocalNote(operation.note_id);
       const preserveLocalContent = hasLaterSave || (currentNoteId === operation.note_id && isDirty);
@@ -2013,6 +2155,10 @@ async function withSyncLeadership(work) {
 
 function scheduleSync(options = {}, delayMs = 75) {
   mergeSyncScheduleOptions(options);
+  if (syncInFlight) {
+    syncPendingWhileInFlight = true;
+    return;
+  }
   if (document.visibilityState === 'hidden') return;
   if (syncScheduleTimer) return;
   const delay = Math.max(delayMs, syncRetryDelayMs);
@@ -2024,13 +2170,13 @@ function scheduleSync(options = {}, delayMs = 75) {
     const requested = syncScheduleOptions;
     syncScheduleOptions = {};
     if (syncInFlight) {
-      scheduleSync(requested, 100);
+      syncScheduleOptions = {...syncScheduleOptions, ...requested};
+      syncPendingWhileInFlight = true;
       return;
     }
     const synced = await syncNow(requested);
     if (synced) {
       syncRetryDelayMs = 0;
-      if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
       return;
     }
     if (syncFailed) {
@@ -2041,6 +2187,23 @@ function scheduleSync(options = {}, delayMs = 75) {
   }, delay);
 }
 
+function takePendingSyncIntent() {
+  const options = {...syncScheduleOptions};
+  syncPendingWhileInFlight = false;
+  syncScheduleOptions = {};
+  return options;
+}
+
+async function syncWorkRemains(options = {}) {
+  if (options.reconcile) return true;
+  if ((await pendingOperations()).length) return true;
+  const cursor = Number(await getOfflineState('syncSequence') || 0);
+  if (serverChangePendingSequence && serverChangePendingSequence <= cursor) {
+    serverChangePendingSequence = 0;
+  }
+  return serverChangePendingSequence > cursor;
+}
+
 async function performSync(options = {}) {
   const preserveSnackbar = Boolean(options.preserveSnackbar);
   let reconcile = Boolean(options.reconcile);
@@ -2048,35 +2211,51 @@ async function performSync(options = {}) {
     clearTimeout(syncScheduleTimer);
     syncScheduleTimer = null;
     reconcile = Boolean(reconcile || syncScheduleOptions.reconcile);
-    syncScheduleOptions = {};
   }
   // Network requests and the authenticated SSE heartbeat are authoritative.
   // navigator.onLine is only an unreliable browser hint, particularly in an
   // installed mobile PWA, so it must never prevent a requested sync.
   if (syncInFlight) return false;
   syncInFlight = true;
+  syncPendingWhileInFlight = false;
+  syncScheduleOptions = {};
+  beginSyncStatusPresentation();
   const wasOffline = syncFailed;
   try {
-    // Save the visible editor locally before pulling. This never waits on the
-    // network, but ensures a remote notification cannot overwrite the common
-    // base needed to merge the user's newest keystrokes.
-    if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
-    await pullRemoteChanges();
-    if (reconcile) await reconcileLocalNotes();
-    const pushed = await flushPendingChanges();
-    if (pushed) await pullRemoteChanges();
+    for (;;) {
+      // Save the visible editor locally before pulling. This never waits on the
+      // network, but ensures a remote notification cannot overwrite the common
+      // base needed to merge the user's newest keystrokes.
+      if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
+      await pullRemoteChanges();
+      if (reconcile) await reconcileLocalNotes();
+      const pushed = await flushPendingChanges();
+      if (pushed) await pullRemoteChanges();
+
+      const pendingOptions = takePendingSyncIntent();
+      if (!await syncWorkRemains(pendingOptions)) break;
+      reconcile = Boolean(pendingOptions.reconcile);
+    }
+
     localStorage.setItem('mdnotes-offline-ready', '1');
     clearSyncDiagnostic();
     syncFailed = false;
     lastSuccessfulSyncAt = Date.now();
     syncRetryDelayMs = 0;
-    setSyncStatus('online');
+    dashboardHydrationState = 'ready';
+    if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    finishSyncStatusPresentation('online');
     if (!serverEvents) connectServerEvents();
+    notifySyncCompleted();
     if (!preserveSnackbar) hideOfflineNotice();
     if (wasOffline && !preserveSnackbar) showToast('Back online. Changes synced.');
     return true;
   } catch (error) {
     console.warn('sync failed', error);
+    if (dashboardHydrationState === 'loading') {
+      dashboardHydrationState = 'offline-empty';
+      if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+    }
     if (isAbortError(error) && syncCancellationRequested) {
       syncCancellationRequested = false;
       return false;
@@ -2087,7 +2266,7 @@ async function performSync(options = {}) {
       // losing network access. In particular, do not mask it with an offline
       // screen just because this browser has an offline cache.
       syncFailed = false;
-      setSyncStatus('online');
+      finishSyncStatusPresentation('online');
       hideOfflineNotice();
       requireAuthentication();
       $('#login-error').textContent = 'Your session expired. Sign in again.';
@@ -2099,7 +2278,7 @@ async function performSync(options = {}) {
     const responseStatus = error?.responseStatus || lastSyncResponseStatus;
     if (responseStatus >= 400 && responseStatus < 500) {
       syncFailed = false;
-      setSyncStatus('online');
+      finishSyncStatusPresentation('online');
       hideOfflineNotice();
       const message = `Sync needs attention: ${error.message}`;
       if (lastSyncProblem !== message) {
@@ -2110,14 +2289,27 @@ async function performSync(options = {}) {
     }
     lastSyncProblem = '';
     markServerOffline();
+    finishSyncStatusPresentation('offline');
     return false;
   } finally {
     syncInFlight = false;
+    if (syncStatusRevealTimer) {
+      clearTimeout(syncStatusRevealTimer);
+      syncStatusRevealTimer = null;
+    }
+    // Work can arrive after the loop's final check but before the cycle has
+    // finished refreshing the UI. Carry that intent into a new cycle instead
+    // of leaving it dormant until the periodic fallback runs.
+    if (syncPendingWhileInFlight) scheduleSync(takePendingSyncIntent(), 0);
   }
 }
 
 async function syncNow(options = {}) {
-  if (syncInFlight) return false;
+  if (syncInFlight) {
+    mergeSyncScheduleOptions(options);
+    syncPendingWhileInFlight = true;
+    return false;
+  }
   return withSyncLeadership(() => performSync(options));
 }
 
@@ -2127,6 +2319,7 @@ let serverHeartbeatAt = 0;
 let serverEventsWatchdog = null;
 let serverChangeTimer = null;
 let serverChangePending = false;
+let serverChangePendingSequence = 0;
 
 function isServerEventsHealthy() {
   return Boolean(serverEvents && serverHeartbeatAt > 0 && Date.now() - serverHeartbeatAt <= sseStaleAfterMs);
@@ -2135,6 +2328,10 @@ function isServerEventsHealthy() {
 function markServerOffline() {
   const shouldToast = !syncFailed;
   syncFailed = true;
+  if (dashboardHydrationState === 'loading') {
+    dashboardHydrationState = 'offline-empty';
+    void refreshDashboard().catch(error => console.warn('could not render offline empty state', error));
+  }
   setSyncStatus('offline');
   showOfflineNotice();
   if (shouldToast) showToast('Working offline. Your changes are saved on this device.', 'warning');
@@ -2143,7 +2340,7 @@ function markServerOffline() {
 async function handleServerHeartbeat() {
   serverHeartbeatAt = Date.now();
   if (!syncFailed) {
-    if (!syncInFlight) setSyncStatus('online');
+    if (!syncInFlight) setIdleSyncStatus();
     return;
   }
   scheduleSync({reconcile: true});
@@ -2151,13 +2348,49 @@ async function handleServerHeartbeat() {
 
 function scheduleServerChangeSync() {
   serverChangePending = true;
-  if (serverChangeTimer) return;
+  if (serverChangeTimer || syncInFlight) return;
   serverChangeTimer = setTimeout(async () => {
     serverChangeTimer = null;
+    if (syncInFlight) return;
     serverChangePending = false;
     scheduleSync();
     if (serverChangePending) scheduleServerChangeSync();
   }, 75);
+}
+
+async function handleServerChangeEvent(change = {}) {
+  const type = change?.type || 'notes';
+  if (type === 'preferences') {
+    const revision = Number(change.revision || 0);
+    if (revision > 0 && revision <= Number(prefs.revision || 0)) return false;
+    void loadPrefs();
+    return true;
+  }
+  if (type !== 'notes') {
+    scheduleServerChangeSync();
+    return true;
+  }
+
+  const sequence = Number(change.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    scheduleServerChangeSync();
+    return true;
+  }
+  serverChangePendingSequence = Math.max(serverChangePendingSequence, sequence);
+  let cursor = 0;
+  try {
+    cursor = Number(await getOfflineState('syncSequence') || 0);
+  } catch (_) {
+    scheduleServerChangeSync();
+    return true;
+  }
+  if (sequence <= cursor) {
+    if (serverChangePendingSequence <= cursor) serverChangePendingSequence = 0;
+    return false;
+  }
+  if (syncInFlight) scheduleSync();
+  else scheduleServerChangeSync();
+  return true;
 }
 
 function connectServerEvents() {
@@ -2171,9 +2404,10 @@ function connectServerEvents() {
   events.addEventListener('change', event => {
     serverHeartbeatAt = Date.now();
     try {
-      if (JSON.parse(event.data).type === 'preferences') void loadPrefs();
-    } catch (_) {}
-    scheduleServerChangeSync();
+      void handleServerChangeEvent(JSON.parse(event.data)).catch(() => scheduleServerChangeSync());
+    } catch (_) {
+      scheduleServerChangeSync();
+    }
   });
   events.addEventListener('heartbeat', () => { void handleServerHeartbeat(); });
   events.onopen = () => { void handleServerHeartbeat(); };
@@ -2206,6 +2440,7 @@ function disconnectServerEvents() {
   if (serverChangeTimer) clearTimeout(serverChangeTimer);
   serverChangeTimer = null;
   serverChangePending = false;
+  serverChangePendingSequence = 0;
 }
 
 // --- Auth ---
@@ -2278,7 +2513,12 @@ function renderDashboard(notes, conflicts) {
   if (currentTag) notes = notes.filter(note => noteHasTag(note, currentTag));
   const list = $('#note-list');
   if (notes.length === 0) {
-    list.innerHTML = '<li class="note-empty">No notes yet</li>';
+    const message = dashboardHydrationState === 'loading'
+      ? 'Loading notes…'
+      : dashboardHydrationState === 'offline-empty'
+        ? 'No notes are available on this device yet.'
+        : 'No notes yet';
+    list.innerHTML = `<li class="note-empty">${message}</li>`;
     return;
   }
   list.innerHTML = notes.map(n => `
@@ -2312,6 +2552,15 @@ async function refreshDashboard() {
   if (generation !== dashboardRenderGeneration) return;
   dashboardNotes = notes;
   renderDashboard(notes, conflicts);
+}
+
+async function refreshLocalStateFromStorage() {
+  if (!screens.dashboard.classList.contains('hidden')) await refreshDashboard();
+  if (!screens.editor.classList.contains('hidden') && currentNoteId && !isDirty) {
+    const note = await getLocalNote(currentNoteId);
+    if (note) updateOpenNote(note);
+  }
+  setIdleSyncStatus();
 }
 
 async function syncDashboardInBackground() {
@@ -2365,16 +2614,30 @@ function startNewNote(title = '') {
 $('#new-note-btn').addEventListener('click', () => startNewNote());
 
 $('#back-btn').addEventListener('click', async () => {
-  if (saveTimer) clearTimeout(saveTimer);
-  if (localSaveTimer) clearTimeout(localSaveTimer);
-  if (previewTimer) clearTimeout(previewTimer);
-  // Navigation waits only for the durable local save. Network replay then runs
-  // after the cached dashboard is visible, rather than making Back feel slow.
-  await saveCurrentNote(false);
-  clearCurrentNote();
-  await loadDashboard({sync: false});
-  if ((await pendingOperations()).length) scheduleSync();
-  setDashboardRoute();
+  if (backNavigationInFlight) return;
+  backNavigationInFlight = true;
+  try {
+    if (saveTimer) clearTimeout(saveTimer);
+    if (localSaveTimer) clearTimeout(localSaveTimer);
+    if (previewTimer) clearTimeout(previewTimer);
+    // Navigation waits only for the durable local save. Network replay then runs
+    // after the cached dashboard is visible, rather than making Back feel slow.
+    await saveCurrentNote(false);
+    clearCurrentNote();
+    if ((await pendingOperations()).length) scheduleSync();
+    if (isAppNoteRoute()) {
+      // The note entry already has the dashboard entry beneath it. Consume the
+      // note entry so browser Back and the in-app button have the same result.
+      const restored = new Promise(resolve => pendingHistoryRestoreResolvers.push(resolve));
+      history.back();
+      await restored;
+      return;
+    }
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  } finally {
+    backNavigationInFlight = false;
+  }
 });
 
 function showNoteInEditor(data) {
@@ -2406,6 +2669,7 @@ async function openNote(id, {route = 'push'} = {}) {
   if (!data) return;
   showNoteInEditor(data);
   if (route === 'push') setNoteRoute(id);
+  else if (route === 'replace') setNoteRoute(id, {replace: true});
   await showConflictResolverFor(id);
   // The note is already usable from IndexedDB. Sync is driven by the central
   // scheduler, server events, and pending local work rather than navigation.
@@ -2421,7 +2685,7 @@ async function followWikiLink(title) {
   if (isDirty) await saveCurrentNote(false);
   const existing = (await getLocalNotes()).find(note => normalizeWikiTitle(note.title || '') === normalizeWikiTitle(title));
   if (existing) {
-    await openNote(existing.id);
+    await openNote(existing.id, {route: 'replace'});
     return;
   }
   startNewNote(title);
@@ -2431,6 +2695,32 @@ async function followWikiLink(title) {
 }
 
 async function restoreRoute({fetchRemote = false} = {}) {
+  if (!isAppPreferencesRoute() && !$('#prefs-modal').classList.contains('hidden')) closeModal($('#prefs-modal'));
+  if (isAppPreferencesRoute()) {
+    const returnRoute = history.state?.returnRoute;
+    const noteID = returnRoute?.screen === 'note' ? returnRoute.noteID : null;
+    if (noteID && await getLocalNote(noteID)) {
+      await openNote(noteID, {route: 'none'});
+      openPreferences({route: 'none'});
+      return;
+    }
+    if (noteID && fetchRemote && !await hasPendingOperation(noteID) && !await getUnresolvedConflict(noteID)) {
+      try {
+        const remote = await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true, throwOnError: true});
+        await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+        await openNote(noteID, {route: 'none'});
+        openPreferences({route: 'none'});
+        return;
+      } catch (error) {
+        if (error?.responseStatus !== 404) return;
+      }
+    }
+    if (noteID) setDashboardRoute({replace: true});
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    if (!noteID) openPreferences({route: 'none'});
+    return;
+  }
   const noteID = noteIDFromLocation();
   if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
   if (noteID && await getLocalNote(noteID)) {
@@ -2461,6 +2751,7 @@ async function restoreCachedStartup() {
     await openNote(noteID, {route: 'none'});
     return;
   }
+  dashboardHydrationState = (await getLocalNotes()).length ? 'ready' : 'loading';
   await loadDashboard({sync: false});
   const conflicts = await unresolvedConflictIDs();
   for (const conflictID of conflicts) {
@@ -2543,7 +2834,7 @@ async function persistEditorSnapshot(snapshot, trySync) {
       currentBaseRevision = null;
       savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
       isDirty = false;
-      if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+      if (!restoringHistoryRoute && noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
       setIdleSyncStatus();
     }
     return true;
@@ -2563,7 +2854,7 @@ async function persistEditorSnapshot(snapshot, trySync) {
     currentBaseRevision = baseRevision;
     savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
     isDirty = false;
-    if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+    if (!restoringHistoryRoute && noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
     setIdleSyncStatus();
   }
   if (trySync) await syncNow();
@@ -2970,6 +3261,7 @@ applyPanelRatio();
 // --- Cursor preview highlight ---
 let previewBlocks = [];
 let previewBlockRanges = [];
+let previewRangeSource = null;
 function isPreviewVisible() {
   return !screens.editor.classList.contains('hidden') && panelState !== 'editor';
 }
@@ -2987,24 +3279,156 @@ function scheduleHighlight() {
     highlightBlock();
   });
 }
+function previewTokenTag(token) {
+  switch (token.type) {
+    case 'blockquote': return 'BLOCKQUOTE';
+    case 'code': return 'PRE';
+    case 'heading': {
+      const match = (token.raw || '').match(/^\s*(#+)/);
+      if (match) return `H${match[1].length}`;
+      return Number.isInteger(token.depth) && token.depth >= 1 && token.depth <= 6 ? `H${token.depth}` : null;
+    }
+    case 'hr': return 'HR';
+    case 'list': return token.ordered ? 'OL' : 'UL';
+    case 'paragraph': return 'P';
+    case 'table': return 'TABLE';
+    default: return null;
+  }
+}
+
+function previewGapDoesNotRender(source) {
+  if (!source) return true;
+  return marked.lexer(source, markdownRenderOptions()).every(token => token.type === 'space');
+}
+
+function clearPreviewHighlight() {
+  const current = $('#preview').querySelector('.highlight');
+  if (current) current.classList.remove('highlight');
+}
+
+function calculatePreviewScrollAdjustment({previewTop, previewHeight, previewScrollTop, previewScrollHeight, anchorTop, caretTop, margin, deadband}) {
+  const safeTop = previewTop + margin;
+  const safeBottom = previewTop + Math.max(margin, previewHeight - margin);
+  const targetCaretTop = Math.min(safeBottom, Math.max(safeTop, caretTop));
+  const delta = anchorTop - targetCaretTop;
+  if (Math.abs(delta) <= deadband) return 0;
+  const maxScroll = Math.max(0, previewScrollHeight - previewHeight);
+  return Math.max(-previewScrollTop, Math.min(maxScroll - previewScrollTop, delta));
+}
+
+function measureEditorCaret() {
+  const ta = $('#note-content');
+  const taRect = ta.getBoundingClientRect();
+  if (!taRect.width || !taRect.height) return null;
+  const computed = getComputedStyle(ta);
+  const mirror = document.createElement('div');
+  mirror.style.position = 'absolute';
+  mirror.style.visibility = 'hidden';
+  mirror.style.pointerEvents = 'none';
+  mirror.style.left = `${taRect.left + window.scrollX}px`;
+  mirror.style.top = `${taRect.top + window.scrollY}px`;
+  mirror.style.width = `${taRect.width}px`;
+  mirror.style.boxSizing = computed.boxSizing;
+  mirror.style.border = computed.border;
+  mirror.style.padding = computed.padding;
+  mirror.style.font = computed.font;
+  mirror.style.letterSpacing = computed.letterSpacing;
+  mirror.style.lineHeight = computed.lineHeight;
+  mirror.style.tabSize = computed.tabSize;
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.overflowWrap = 'break-word';
+  mirror.style.wordBreak = 'break-word';
+  mirror.style.height = 'auto';
+  mirror.textContent = ta.value.slice(0, ta.selectionStart);
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  mirror.append(marker);
+  document.body.append(mirror);
+  const mirrorRect = mirror.getBoundingClientRect();
+  const markerRect = marker.getBoundingClientRect();
+  const lineHeight = parseFloat(computed.lineHeight) || parseFloat(computed.fontSize) * 1.5 || 24;
+  mirror.remove();
+  return {
+    top: taRect.top + markerRect.top - mirrorRect.top - ta.scrollTop,
+    height: markerRect.height || lineHeight,
+    lineHeight,
+  };
+}
+
+function previewBlockIndexAtPosition(position) {
+  let previous = -1;
+  let next = -1;
+  for (let index = 0; index < previewBlockRanges.length; index++) {
+    const range = previewBlockRanges[index];
+    if (range.start <= position && position < range.end) return index;
+    if (range.end <= position) previous = index;
+    if (next < 0 && position < range.start) next = index;
+  }
+  if (previous < 0) return next;
+  if (next < 0) return previous;
+  const distanceToPrevious = position - previewBlockRanges[previous].end;
+  const distanceToNext = previewBlockRanges[next].start - position;
+  return distanceToPrevious <= distanceToNext ? previous : next;
+}
+
+function alignPreviewWithCaret(block, range) {
+  const preview = $('#preview');
+  const caret = measureEditorCaret();
+  if (!caret || !preview.clientHeight || !preview.scrollHeight) return;
+  const previewRect = preview.getBoundingClientRect();
+  const blockRect = block.getBoundingClientRect();
+  const sourceLength = Math.max(1, range.end - range.start);
+  const sourceProgress = Math.min(1, Math.max(0, ($('#note-content').selectionStart - range.start) / sourceLength));
+  const anchorTop = blockRect.top + blockRect.height * sourceProgress;
+  const caretTop = caret.top + caret.height / 2;
+  const margin = Math.max(caret.lineHeight * 2, Math.min(96, preview.clientHeight * .18));
+  const deadband = caret.lineHeight * 2;
+  const adjustment = calculatePreviewScrollAdjustment({
+    previewTop: previewRect.top,
+    previewHeight: preview.clientHeight,
+    previewScrollTop: preview.scrollTop,
+    previewScrollHeight: preview.scrollHeight,
+    anchorTop,
+    caretTop,
+    margin,
+    deadband,
+  });
+  if (adjustment) preview.scrollTop += adjustment;
+}
+
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
   previewBlockRanges = [];
+  previewRangeSource = null;
   const source = $('#note-content').value;
   if (!source || typeof marked === 'undefined' || typeof marked.lexer !== 'function') return;
   try {
     const ranges = [];
     let offset = 0;
+    let blockIndex = 0;
     for (const token of marked.lexer(source, markdownRenderOptions())) {
       const raw = typeof token.raw === 'string' ? token.raw : '';
       if (!raw) continue;
       const start = source.indexOf(raw, offset);
-      if (start < 0) continue;
-      ranges.push({start, end: start + raw.length});
+      if (start < offset || !previewGapDoesNotRender(source.slice(offset, start))) {
+        previewBlockRanges = [];
+        return;
+      }
       offset = start + raw.length;
+      const tagName = previewTokenTag(token);
+      if (!tagName) continue;
+      const block = previewBlocks[blockIndex++];
+      if (!block || block.tagName !== tagName) {
+        previewBlockRanges = [];
+        return;
+      }
+      const contentEnd = start + raw.replace(/[\s\r\n]+$/, '').length;
+      ranges.push({start, end: Math.max(start, contentEnd)});
     }
-    if (ranges.length === previewBlocks.length) previewBlockRanges = ranges;
+    if (!previewGapDoesNotRender(source.slice(offset)) || blockIndex !== previewBlocks.length) return;
+    previewBlockRanges = ranges;
+    previewRangeSource = source;
   } catch (_) {
     previewBlockRanges = [];
   }
@@ -3012,28 +3436,19 @@ function cachePreviewBlocks() {
 function highlightBlock() {
   if (!isPreviewVisible()) return;
   if (prefs.hideCursorHighlight) {
-    const cur = $('#preview').querySelector('.highlight');
-    if (cur) cur.classList.remove('highlight');
+    clearPreviewHighlight();
     return;
   }
   const ta = $('#note-content');
-  const pv = $('#preview');
-  const cur = pv.querySelector('.highlight');
-  if (cur) cur.classList.remove('highlight');
+  clearPreviewHighlight();
   const text = ta.value;
   const pos = ta.selectionStart;
-  if (!text.trim() || !previewBlocks.length) return;
-  let idx = -1;
-  if (previewBlockRanges.length === previewBlocks.length) {
-    idx = previewBlockRanges.findIndex(range => pos <= range.end);
-    if (idx < 0) idx = previewBlockRanges.length - 1;
-  } else {
-    const before = text.slice(0, pos);
-    const nonEmpty = before.split(/\n\n+/).filter(b => b.trim());
-    idx = Math.max(0, nonEmpty.length - 1);
-  }
-  if (idx >= previewBlocks.length) idx = previewBlocks.length - 1;
-  previewBlocks[idx]?.classList.add('highlight');
+  if (!text.trim() || !previewBlocks.length || renderedPreviewSource !== text || previewRangeSource !== text) return;
+  const idx = previewBlockIndexAtPosition(pos);
+  const block = previewBlocks[idx];
+  if (!block) return;
+  block.classList.add('highlight');
+  alignPreviewWithCaret(block, previewBlockRanges[idx]);
 }
 
 // --- Delete ---
@@ -3072,6 +3487,9 @@ $('#delete-btn').addEventListener('click', async () => {
 $('#note-content').addEventListener('input', () => {
   markDirty();
   scheduleSave();
+  previewRangeSource = null;
+  previewBlockRanges = [];
+  scheduleHighlight();
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 500);
 });
@@ -3118,7 +3536,7 @@ const previewAllowedElements = new Set([
   'HR', 'IMG', 'INPUT', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'SUB', 'SUP', 'TABLE',
   'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL',
 ]);
-const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'title', 'type']);
+const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'start', 'title', 'type']);
 
 function safePreviewURL(value, allowMailto = false) {
   if (!value || /[\u0000-\u001f]/.test(value)) return false;
@@ -3145,6 +3563,12 @@ function sanitizePreview(container) {
       const name = attributeName.toLowerCase();
       if (!previewAllowedAttributes.has(name) || name.startsWith('on')) element.removeAttribute(attributeName);
     });
+    if (element.tagName === 'OL') {
+      const start = element.getAttribute('start');
+      if (start !== null && !/^[+-]?\d+$/.test(start)) element.removeAttribute('start');
+    } else {
+      element.removeAttribute('start');
+    }
     if (element.tagName === 'A') {
       const href = element.getAttribute('href');
       if (href && !safePreviewURL(href, true)) element.removeAttribute('href');
@@ -3223,6 +3647,17 @@ function validAccentColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '';
 }
 
+function validFontValue(value) {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim();
+  return Boolean(normalized) && normalized.length <= 120 && !/[\u0000-\u001f\u007f"\\;,]/.test(normalized);
+}
+
+function normalizeFontValue(value, key) {
+  if (value === 'system') return key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
+  return validFontValue(value) ? value.trim() : DEFAULT_PREFS[key];
+}
+
 function legacyThemeID() {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark') return 'default-dark';
@@ -3238,8 +3673,7 @@ function normalizePrefs(value = {}, fallback = {}) {
   if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
   if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
   ['fontFamily', 'editorFontFamily', 'previewFontFamily'].forEach(key => {
-    if (merged[key] === 'system') merged[key] = key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
-    if (!['system-sans', 'system-serif', 'system-monospace', ...FONT_OPTIONS].includes(merged[key])) merged[key] = DEFAULT_PREFS[key];
+    merged[key] = normalizeFontValue(merged[key], key);
   });
   return merged;
 }
@@ -3259,7 +3693,7 @@ function applyTheme(themeID = prefs.theme) {
 
 function fontCSSURL(fontFamily) {
   const family = encodeURIComponent(fontFamily).replace(/%20/g, '+');
-  return `https://fonts.googleapis.com/css2?family=${family}:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600;1,700&display=swap`;
+  return `https://fonts.googleapis.com/css2?family=${family}&display=swap`;
 }
 
 function isSystemFont(fontFamily) {
@@ -3277,22 +3711,47 @@ async function clearFontCache() {
 }
 
 const FONT_SLOTS = [
-  {preference:'fontFamily', variable:'--font'},
-  {preference:'editorFontFamily', variable:'--editor-font'},
-  {preference:'previewFontFamily', variable:'--preview-font'},
+  {preference:'fontFamily', fetchPreference:'fontFamilyGoogle', variable:'--font', input:'#pref-font', fetch:'#pref-font-google', error:'#pref-font-error', fallback:SYSTEM_FONT_STACK},
+  {preference:'editorFontFamily', fetchPreference:'editorFontFamilyGoogle', variable:'--editor-font', input:'#pref-editor-font', fetch:'#pref-editor-font-google', error:'#pref-editor-font-error', fallback:SYSTEM_MONO_STACK},
+  {preference:'previewFontFamily', fetchPreference:'previewFontFamilyGoogle', variable:'--preview-font', input:'#pref-preview-font', fetch:'#pref-preview-font-google', error:'#pref-preview-font-error', fallback:SYSTEM_FONT_STACK},
 ];
+
+function fontCSSValue(fontFamily, fallback) {
+  if (isSystemFont(fontFamily)) return systemFontStack(fontFamily);
+  return `"${fontFamily}",${fallback}`;
+}
+
+function setFontError(slot, message = '') {
+  const error = $(slot.error);
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = !message;
+  const input = $(slot.input);
+  if (input) {
+    if (message) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  }
+}
+
+function shouldFetchGoogleFont(slot) {
+  return prefs[slot.fetchPreference] === true;
+}
 
 function removeLoadedFonts() {
   document.querySelectorAll('[data-mdnotes-font]').forEach(link => link.remove());
-  FONT_SLOTS.forEach(slot => document.documentElement.style.setProperty(slot.variable, systemFontStack(prefs[slot.preference])));
+  FONT_SLOTS.forEach(slot => {
+    document.documentElement.style.setProperty(slot.variable, fontCSSValue(prefs[slot.preference], slot.fallback));
+    if (validFontValue($(slot.input)?.value)) setFontError(slot);
+  });
 }
 
 async function applyFontsNow(clearCache = false) {
   const generation = ++fontLoadGeneration;
   if (clearCache) await clearFontCache();
   removeLoadedFonts();
-  const families = [...new Set(FONT_SLOTS.map(slot => prefs[slot.preference]).filter(font => font && !isSystemFont(font)))];
+  const families = [...new Set(FONT_SLOTS.filter(shouldFetchGoogleFont).map(slot => prefs[slot.preference]).filter(font => font && !isSystemFont(font)))];
   const loaded = new Map();
+  const failed = new Set();
   await Promise.all(families.map(async fontFamily => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
@@ -3310,13 +3769,15 @@ async function applyFontsNow(clearCache = false) {
       loaded.set(fontFamily, true);
     } catch (error) {
       link.remove();
+      failed.add(fontFamily);
       console.warn(`font unavailable: ${fontFamily}`, error);
     }
   }));
   if (generation !== fontLoadGeneration) return;
   FONT_SLOTS.forEach(slot => {
     const fontFamily = prefs[slot.preference];
-    if (!isSystemFont(fontFamily) && loaded.has(fontFamily)) document.documentElement.style.setProperty(slot.variable, `"${fontFamily}",${SYSTEM_FONT_STACK}`);
+    document.documentElement.style.setProperty(slot.variable, fontCSSValue(fontFamily, slot.fallback));
+    if (shouldFetchGoogleFont(slot) && !isSystemFont(fontFamily) && failed.has(fontFamily) && !loaded.has(fontFamily)) setFontError(slot, 'Font not available from Google Fonts.');
   });
 }
 
@@ -3332,21 +3793,18 @@ function renderThemeOptions() {
 }
 
 function renderFontOptions() {
-  const localOptions = SYSTEM_FONT_OPTIONS.map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
-  const downloadableOptions = FONT_OPTIONS.map(font => `<option value="${esc(font)}"${fontAvailability === 'available' ? '' : ' disabled'}>${esc(font)}</option>`).join('');
-  ['#pref-font', '#pref-editor-font', '#pref-preview-font'].forEach(selector => {
-    const target = $(selector);
-    target.disabled = false;
-    target.innerHTML = localOptions + downloadableOptions;
+  FONT_SLOTS.forEach(slot => {
+    const input = $(slot.input);
+    if (input) input.value = prefs[slot.preference];
+    const fetchToggle = $(slot.fetch);
+    if (fetchToggle) fetchToggle.checked = Boolean(prefs[slot.fetchPreference]);
   });
-  $('#pref-font').value = prefs.fontFamily;
-  $('#pref-editor-font').value = prefs.editorFontFamily;
-  $('#pref-preview-font').value = prefs.previewFontFamily;
 }
 
 function applyPrefs() {
   applyTheme(prefs.theme);
   void applyFonts();
+  renderFontOptions();
   applyEditorPrefs();
 }
 
@@ -3364,7 +3822,7 @@ try {
   applyPrefs();
 }
 
-$('#prefs-btn').addEventListener('click', () => {
+function openPreferences({route = 'push'} = {}) {
   $('#pref-autosave').checked = prefs.autoSave;
   $('#pref-hidepreview').checked = prefs.hidePreview;
   $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
@@ -3375,20 +3833,17 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-status').value = prefs.statusDisplay;
   $('#pref-theme').value = prefs.theme;
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
-  $('#pref-font').value = prefs.fontFamily;
-  $('#pref-editor-font').value = prefs.editorFontFamily;
-  $('#pref-preview-font').value = prefs.previewFontFamily;
+  renderFontOptions();
+  if (route === 'push') setPreferencesRoute();
   openModal($('#prefs-modal'));
-  void checkFontAvailability(fontAvailability === 'unavailable');
-});
+}
 
-$('#prefs-close').addEventListener('click', () => {
-  closeModal($('#prefs-modal'));
-});
+$('#prefs-btn').addEventListener('click', openPreferences);
+$('#editor-prefs-btn').addEventListener('click', openPreferences);
 
-$('#prefs-modal .modal-backdrop').addEventListener('click', () => {
-  closeModal($('#prefs-modal'));
-});
+$('#prefs-close').addEventListener('click', closePreferences);
+
+$('#prefs-modal .modal-backdrop').addEventListener('click', closePreferences);
 
 async function savePref(key, value) {
   const previous = {...prefs};
@@ -3405,7 +3860,7 @@ async function savePref(key, value) {
     },
   });
   if (key === 'theme' || key === 'accentColor') applyTheme(prefs.theme);
-  if (['fontFamily', 'editorFontFamily', 'previewFontFamily'].includes(key)) void applyFonts(true);
+  if (['fontFamily', 'fontFamilyGoogle', 'editorFontFamily', 'editorFontFamilyGoogle', 'previewFontFamily', 'previewFontFamilyGoogle'].includes(key)) void applyFonts(true);
   applyEditorPrefs();
   scheduleSync();
 }
@@ -3433,9 +3888,24 @@ $('#pref-hidecursor').addEventListener('change', function () {
 });
 $('#pref-theme').addEventListener('change', function () { void savePref('theme', this.value); });
 $('#pref-accent').addEventListener('change', function () { void savePref('accentColor', this.value); });
-$('#pref-font').addEventListener('change', function () { void savePref('fontFamily', this.value); });
-$('#pref-editor-font').addEventListener('change', function () { void savePref('editorFontFamily', this.value); });
-$('#pref-preview-font').addEventListener('change', function () { void savePref('previewFontFamily', this.value); });
+FONT_SLOTS.forEach(slot => {
+  const input = $(slot.input);
+  input.addEventListener('input', function () {
+    if (!$(slot.error)?.hidden) setFontError(slot, validFontValue(this.value) ? '' : 'Enter a valid font name without quotes, backslashes, semicolons, or commas.');
+  });
+  input.addEventListener('change', function () {
+    if (!validFontValue(this.value)) {
+      setFontError(slot, 'Enter a valid font name without quotes, backslashes, semicolons, or commas.');
+      return;
+    }
+    this.value = this.value.trim();
+    setFontError(slot);
+    void savePref(slot.preference, this.value);
+  });
+  $(slot.fetch).addEventListener('change', function () {
+    void savePref(slot.fetchPreference, this.checked);
+  });
+});
 $('#pref-status').addEventListener('change', function () { void savePref('statusDisplay', this.value); });
 
 $$('.prefs-nav').forEach(button => button.addEventListener('click', () => {
@@ -3464,44 +3934,6 @@ $$('.prefs-nav').forEach(button => button.addEventListener('keydown', event => {
   tabs[next].click();
 }));
 
-async function checkFontAvailability(force = false) {
-  if (!force && (fontAvailability === 'available' || fontAvailability === 'unavailable')) return fontAvailability;
-  if (fontAvailabilityPromise) return fontAvailabilityPromise;
-  fontAvailability = 'checking';
-  $('#font-availability').textContent = 'Checking Google Fonts...';
-  renderFontOptions();
-
-  fontAvailabilityPromise = (async () => {
-    const probe = document.createElement('link');
-    probe.rel = 'stylesheet';
-    probe.href = fontCSSURL('Inter');
-    const stylesheetLoaded = await new Promise(resolve => {
-      const timeout = setTimeout(() => resolve(false), 5000);
-      probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
-      probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
-      document.head.append(probe);
-    });
-    probe.remove();
-    let faceLoaded = false;
-    if (stylesheetLoaded) {
-      try {
-        const loadedFaces = await document.fonts.load('1rem "Inter"');
-        faceLoaded = Boolean(loadedFaces && loadedFaces.length);
-      } catch (_) {}
-    }
-    fontAvailability = stylesheetLoaded && faceLoaded ? 'available' : 'unavailable';
-    $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
-    renderFontOptions();
-    if (fontAvailability === 'available') void applyFonts();
-    return fontAvailability;
-  })().finally(() => { fontAvailabilityPromise = null; });
-  return fontAvailabilityPromise;
-}
-
-function hasSelectedWebFont() {
-  return FONT_SLOTS.some(slot => prefs[slot.preference] && !isSystemFont(prefs[slot.preference]));
-}
-
 async function loadPrefs() {
   let p = null;
   try {
@@ -3515,7 +3947,6 @@ async function loadPrefs() {
     prefs = normalizePrefs(p, cached);
     localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
     applyPrefs();
-    if (hasSelectedWebFont()) void checkFontAvailability();
     return;
   }
   try {
@@ -3523,13 +3954,13 @@ async function loadPrefs() {
     if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
   applyPrefs();
-  if (hasSelectedWebFont()) void checkFontAvailability();
 }
 
 // --- Init ---
 async function init() {
   let localStartupReady = false;
   try {
+    initializeHistoryRoute();
     await restoreCachedStartup();
     localStartupReady = true;
     $('#app').classList.remove('booting');
@@ -3584,14 +4015,16 @@ function registerServiceWorker(revision = appRevisionAtLoad) {
   });
 }
 
-window.addEventListener('popstate', () => { void restoreRoute(); });
+window.addEventListener('popstate', () => {
+  restoringHistoryRoute = true;
+  void restoreRoute().finally(() => {
+    restoringHistoryRoute = false;
+    pendingHistoryRestoreResolvers.shift()?.();
+  });
+});
 
 window.addEventListener('online', async () => {
   connectServerEvents();
-  if (hasSelectedWebFont()) {
-    fontAvailability = 'checking';
-    void checkFontAvailability();
-  }
   scheduleSync({reconcile: true});
 });
 

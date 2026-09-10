@@ -7,6 +7,8 @@ import {indexedDB, IDBKeyRange} from 'fake-indexeddb';
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const appSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'app.js'), 'utf8');
 const themesSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'themes.js'), 'utf8');
+const markedSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'marked.min.js'), 'utf8');
+const mergeSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'merge.js'), 'utf8');
 
 const testHookSource = `
 globalThis.__mdnotesTestHooks = {
@@ -28,7 +30,8 @@ globalThis.__mdnotesTestHooks = {
   applyRemoteSnapshot,
   removeLocalNoteAndSupersede,
   savePref,
-  checkFontAvailability,
+  applyFonts,
+  loadPrefs,
   applyRemoteDeletion,
   applyRemoteChangePage,
   getLocalNote,
@@ -38,6 +41,8 @@ globalThis.__mdnotesTestHooks = {
   api,
   cancelActiveSyncRequests,
   scheduleSync,
+  syncNow,
+  handleServerChangeEvent,
   putLocalNote,
   init,
   restoreRoute,
@@ -64,6 +69,7 @@ globalThis.__mdnotesTestHooks = {
   showNoteInEditor,
   updatePreview,
   highlightBlock,
+  calculatePreviewScrollAdjustment,
   closeDatabase: async () => {
     const db = offlineDBPromise && await offlineDBPromise;
     db?.close();
@@ -82,6 +88,8 @@ globalThis.__mdnotesTestHooks = {
 
 const deferredSaveCall = "await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});";
 const deferredSaveReplacement = "await globalThis.__testSaveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});";
+const syncCompletionCall = "    localStorage.setItem('mdnotes-offline-ready', '1');";
+const syncCompletionReplacement = "    await globalThis.__testBeforeSyncCompletion();\n    localStorage.setItem('mdnotes-offline-ready', '1');";
 
 function response(status, body = '') {
   return {
@@ -102,7 +110,7 @@ export async function deleteOfflineDatabase() {
   });
 }
 
-export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null} = {}) {
+export async function createApp({deferredSave = false, deferredSyncCompletion = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null, realMarked = false, realMerge = false} = {}) {
   const dom = new JSDOM(fs.readFileSync(path.join(testDirectory, '..', 'static', 'index.html'), 'utf8'), {
     url: 'http://localhost:8080/',
     pretendToBeVisual: true,
@@ -114,7 +122,12 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
   window.fetch = fetchImpl;
   if (serviceWorker) Object.defineProperty(window.navigator, 'serviceWorker', {value: serviceWorker, configurable: true});
   window.eval(themesSource);
-  window.marked = {parse: () => ''};
+  if (realMerge) window.eval(mergeSource);
+  if (realMarked) {
+    window.eval(markedSource);
+  } else {
+    window.marked = {parse: () => ''};
+  }
   window.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   window.requestAnimationFrame = callback => window.setTimeout(callback, 0);
   window.cancelAnimationFrame = id => window.clearTimeout(id);
@@ -136,10 +149,28 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
     };
   }
 
+  let resolveSyncCompletionStarted;
+  let releaseSyncCompletion;
+  const syncCompletionStarted = new Promise(resolve => { resolveSyncCompletionStarted = resolve; });
+  const syncCompletionGate = new Promise(resolve => { releaseSyncCompletion = resolve; });
+  let syncCompletionCalls = 0;
+  if (deferredSyncCompletion) {
+    window.__testBeforeSyncCompletion = async () => {
+      syncCompletionCalls++;
+      if (syncCompletionCalls !== 1) return;
+      resolveSyncCompletionStarted();
+      await syncCompletionGate;
+    };
+  }
+
   let source = appSource;
   if (deferredSave) {
     if (!source.includes(deferredSaveCall)) throw new Error('save call was not found for test instrumentation');
     source = source.replace(deferredSaveCall, deferredSaveReplacement);
+  }
+  if (deferredSyncCompletion) {
+    if (!source.includes(syncCompletionCall)) throw new Error('sync completion marker was not found for test instrumentation');
+    source = source.replace(syncCompletionCall, syncCompletionReplacement);
   }
   if (!source.includes('\ninit();\n')) throw new Error('app init marker was not found');
   source = source.replace('\ninit();\n', `\n${testHookSource}\n`);
@@ -151,6 +182,8 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
     saveCalls,
     firstSaveStarted,
     releaseFirstSave,
+    syncCompletionStarted,
+    releaseSyncCompletion,
     close: async () => {
       await window.__mdnotesTestHooks.closeDatabase();
       window.close();

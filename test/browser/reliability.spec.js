@@ -75,3 +75,37 @@ test('keeps warm dashboard display within the local startup budget', async ({pag
   const budget = Number(process.env.WARM_DASHBOARD_BUDGET_MS || 1500);
   expect(p95, `warm dashboard samples: ${samples.join(', ')}`).toBeLessThan(budget);
 });
+
+test('keeps the typing caret and active preview block away from the viewport edge', async ({page}) => {
+  await signIn(page);
+  await page.locator('#new-note-btn').click();
+  await expect(page.locator('#editor')).toBeVisible();
+
+  const content = Array.from({length: 80}, (_, index) => `## Section ${index}\n\nA paragraph with enough text to create a useful rendered preview block.`).join('\n\n');
+  const editor = page.locator('#note-content');
+  await editor.fill(content);
+  await editor.focus();
+  await editor.press('End');
+  await page.waitForTimeout(700);
+
+  const metrics = await page.evaluate(() => {
+    const textarea = document.querySelector('#note-content');
+    const preview = document.querySelector('#preview');
+    const active = preview.querySelector('.highlight');
+    const previewRect = preview.getBoundingClientRect();
+    const activeRect = active?.getBoundingClientRect();
+    return {
+      editorHasScrollRoom: textarea.scrollHeight > textarea.clientHeight,
+      editorScrollTop: textarea.scrollTop,
+      previewHasScrollRoom: preview.scrollHeight > preview.clientHeight,
+      previewScrollTop: preview.scrollTop,
+      activeVisible: Boolean(activeRect && activeRect.bottom > previewRect.top && activeRect.top < previewRect.bottom),
+    };
+  });
+
+  expect(metrics.editorHasScrollRoom).toBe(true);
+  expect(metrics.editorScrollTop).toBeGreaterThan(0);
+  expect(metrics.previewHasScrollRoom).toBe(true);
+  expect(metrics.previewScrollTop, JSON.stringify(metrics)).toBeGreaterThan(0);
+  expect(metrics.activeVisible).toBe(true);
+});
