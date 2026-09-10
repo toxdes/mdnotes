@@ -181,6 +181,33 @@ describe('editor display preferences', () => {
 });
 
 describe('markdown preview policy', () => {
+  test('preserves the starting number of ordered lists', async () => {
+    const app = track(await createApp({realMarked: true}));
+    app.hooks.showNoteInEditor({
+      id: 'note-a',
+      title: 'Note',
+      content: '6. [ ] six\n7. [ ] seven\n8. [ ] eight',
+    });
+    app.hooks.updatePreview();
+
+    const ordered = app.window.document.querySelector('#preview ol');
+    expect(ordered).not.toBeNull();
+    expect(ordered.getAttribute('start')).toBe('6');
+  });
+
+  test('preserves nested and signed ordered-list starts but strips malformed attributes', async () => {
+    const app = track(await createApp({realMarked: true}));
+    app.window.marked = {
+      parse: () => '<ol start="6"><li>outer<ol start="-2"><li>nested</li></ol></li></ol><ol start="not-a-number"><li>bad</li></ol><p start="9">not a list</p>',
+    };
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: 'ordered'});
+    app.hooks.updatePreview();
+
+    const lists = [...app.window.document.querySelectorAll('#preview ol')];
+    expect(lists.map(list => list.getAttribute('start'))).toEqual(['6', '-2', null]);
+    expect(app.window.document.querySelector('#preview p').getAttribute('start')).toBeNull();
+  });
+
   test('leaves three editor lines of bottom breathing room', async () => {
     expect(styleSource).toContain('#note-content{padding-bottom:4.95em;scroll-padding-bottom:4.95em}');
   });

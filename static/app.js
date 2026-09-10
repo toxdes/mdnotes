@@ -3426,7 +3426,7 @@ const previewAllowedElements = new Set([
   'HR', 'IMG', 'INPUT', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'SUB', 'SUP', 'TABLE',
   'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL',
 ]);
-const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'title', 'type']);
+const previewAllowedAttributes = new Set(['align', 'alt', 'checked', 'class', 'colspan', 'disabled', 'href', 'rowspan', 'src', 'start', 'title', 'type']);
 
 function safePreviewURL(value, allowMailto = false) {
   if (!value || /[\u0000-\u001f]/.test(value)) return false;
@@ -3453,6 +3453,12 @@ function sanitizePreview(container) {
       const name = attributeName.toLowerCase();
       if (!previewAllowedAttributes.has(name) || name.startsWith('on')) element.removeAttribute(attributeName);
     });
+    if (element.tagName === 'OL') {
+      const start = element.getAttribute('start');
+      if (start !== null && !/^[+-]?\d+$/.test(start)) element.removeAttribute('start');
+    } else {
+      element.removeAttribute('start');
+    }
     if (element.tagName === 'A') {
       const href = element.getAttribute('href');
       if (href && !safePreviewURL(href, true)) element.removeAttribute('href');
