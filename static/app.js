@@ -1260,11 +1260,17 @@ async function mergeConflictedNote(operation, remote) {
   };
   const merged = window.MDNotesMerge.mergeNoteVersions(base, local, remote);
   if (!merged) return false;
+  const queued = await pendingOperationsForNote(operation.note_id);
+  const laterPin = latestLaterOperation(queued, operation, 'note.pin');
 
   const now = new Date().toISOString();
   const mergedLocal = {
     ...remote,
     ...merged,
+    ...(laterPin ? {
+      pinned: Boolean(laterPin.pinned),
+      pin_order: laterPin.pinned ? (local.pin_order || 0) : 0,
+    } : {}),
     updated_at: now,
     pending: true,
     base_revision: remote.revision,
@@ -1550,17 +1556,25 @@ async function createConflictResolution(operation, remote) {
     return false;
   }
 
+  const queued = await pendingOperationsForNote(operation.note_id);
+  const laterPin = latestLaterOperation(queued, operation, 'note.pin');
+  const resolvedRemote = laterPin ? {
+    ...remote,
+    pinned: Boolean(laterPin.pinned),
+    pin_order: laterPin.pinned ? (local.pin_order || 0) : 0,
+  } : remote;
+
   const conflict = {
     note_id: operation.note_id,
     created_at: new Date().toISOString(),
     base: conflictBase(local, operation),
     local: {title: local.title || '', tags: local.tags || '', content: local.content || ''},
-    remote: {...remote, title: remote.title || '', tags: remote.tags || '', content: remote.content || '', revision: remote.revision || 0, filename: remote.filename || ''},
+    remote: {...resolvedRemote, title: remote.title || '', tags: remote.tags || '', content: remote.content || '', revision: remote.revision || 0, filename: remote.filename || ''},
   };
   // Persist the user's version before acknowledging the conflict locally. If
   // the browser closes now, reopening the note resumes this resolver.
   await setUnresolvedConflict(conflict);
-  await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+  await putLocalNote({...resolvedRemote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
   await supersedeQueuedNoteOperations(operation.note_id, operation.client_sequence);
   await removePendingOperationIfIdentityMatches(operation.id, operation);
   // Bring the authoritative version into the normal editor before opening the
