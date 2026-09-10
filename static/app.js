@@ -58,6 +58,7 @@ let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
 let registeredServiceWorkerRevision = null;
 let updateToast = null;
 let syncStatusRevealTimer = null;
+let syncStatusGeneration = 0;
 let dashboardHydrationState = 'ready';
 let restoringHistoryRoute = false;
 let backNavigationInFlight = false;
@@ -729,12 +730,14 @@ function notifySyncCompleted() {
 
 const syncStates = {
   online: {label: 'Saved', title: 'Saved and up to date'},
+  local: {label: 'Saved locally', title: 'Saved locally; waiting to sync'},
   syncing: {label: 'Syncing', title: 'Synchronizing changes'},
   offline: {label: 'Offline', title: 'Offline — changes are saved on this device'},
 };
 let syncFailed = false;
 
 function setSyncStatus(state) {
+  syncStatusGeneration++;
   const config = syncStates[state] || syncStates.offline;
   ['#sync-status', '#editor-status'].forEach(selector => {
     const element = $(selector);
@@ -877,14 +880,22 @@ function beginSyncNetworkRequest() {
   if (!syncInFlight) setSyncStatus('syncing');
 }
 
-function endSyncNetworkRequest() {
+async function endSyncNetworkRequest() {
   syncNetworkRequestsInFlight = Math.max(0, syncNetworkRequestsInFlight - 1);
-  if (syncNetworkRequestsInFlight === 0 && !syncInFlight) setIdleSyncStatus();
+  if (syncNetworkRequestsInFlight === 0 && !syncInFlight) await setIdleSyncStatus();
 }
 
-function setIdleSyncStatus() {
+async function setIdleSyncStatus() {
   if (syncNetworkRequestsInFlight > 0 || syncInFlight) return;
-  setSyncStatus(syncFailed ? 'offline' : 'online');
+  const generation = ++syncStatusGeneration;
+  try {
+    const operations = await pendingOperations();
+    if (generation !== syncStatusGeneration || syncNetworkRequestsInFlight > 0 || syncInFlight) return;
+    if (typeof document === 'undefined') return;
+    setSyncStatus(syncFailed ? 'offline' : operations.length ? 'local' : 'online');
+  } catch (error) {
+    console.warn('could not determine pending sync status', error);
+  }
 }
 
 function beginSyncStatusPresentation() {
@@ -968,7 +979,7 @@ async function api(path, opts) {
     console.error(error);
     throw error;
   } finally {
-    if (syncRequest) endSyncNetworkRequest();
+    if (syncRequest) await endSyncNetworkRequest();
   }
 }
 
@@ -993,7 +1004,7 @@ async function syncFetch(path, options) {
     setSyncDiagnostic(`${method} ${path} failed: ${typed.message}`);
     throw typed;
   } finally {
-    endSyncNetworkRequest();
+    await endSyncNetworkRequest();
   }
 }
 
@@ -2329,7 +2340,7 @@ function markServerOffline() {
 async function handleServerHeartbeat() {
   serverHeartbeatAt = Date.now();
   if (!syncFailed) {
-    if (!syncInFlight) setSyncStatus('online');
+    if (!syncInFlight) setIdleSyncStatus();
     return;
   }
   scheduleSync({reconcile: true});
@@ -2548,6 +2559,7 @@ async function refreshLocalStateFromStorage() {
     const note = await getLocalNote(currentNoteId);
     if (note) updateOpenNote(note);
   }
+  setIdleSyncStatus();
 }
 
 async function syncDashboardInBackground() {

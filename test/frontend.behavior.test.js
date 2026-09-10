@@ -469,6 +469,22 @@ describe('server change invalidation', () => {
 });
 
 describe('sync coordinator', () => {
+  test('reports a durable queued edit as saved locally', async () => {
+    const app = track(await createApp());
+    app.hooks.setEditorState({
+      id: 'note-a', dirty: true, title: 'Note', content: 'local edit',
+      savedSnapshot: {title: '', tags: '', content: ''},
+    });
+
+    await app.hooks.saveCurrentNote(false);
+    await vi.waitFor(() => {
+      expect(app.window.document.querySelector('#editor-status')).toMatchObject({
+        dataset: expect.objectContaining({state: 'local'}),
+        title: 'Saved locally; waiting to sync',
+      });
+    });
+  });
+
   test('does not run a redundant follow-up for requests made during an idle sync', async () => {
     let markSyncStarted;
     let releaseSync;
