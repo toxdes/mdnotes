@@ -59,6 +59,9 @@ let registeredServiceWorkerRevision = null;
 let updateToast = null;
 let syncStatusRevealTimer = null;
 let dashboardHydrationState = 'ready';
+let restoringHistoryRoute = false;
+let backNavigationInFlight = false;
+const pendingHistoryRestoreResolvers = [];
 
 const httpRequestTimeoutMs = 15000;
 const syncRetryDelaysMs = [1000, 5000, 15000, 60000, 300000];
@@ -75,6 +78,7 @@ let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const noteRouteIDPattern = /^[A-Za-z0-9_-]{1,64}$/;
+const appRouteState = 'mdnotes';
 
 function noteIDFromLocation() {
   try {
@@ -85,15 +89,53 @@ function noteIDFromLocation() {
   }
 }
 
+function dashboardRouteState() {
+  return {app: appRouteState, screen: 'dashboard'};
+}
+
+function noteRouteState(noteID) {
+  return {app: appRouteState, screen: 'note', noteID};
+}
+
+function isAppNoteRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'note' && noteRouteIDPattern.test(state.noteID || '');
+}
+
+function isAppDashboardRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'dashboard';
+}
+
+function initializeHistoryRoute() {
+  const noteID = noteIDFromLocation();
+  if (noteID) {
+    if (isAppNoteRoute() && history.state.noteID === noteID) return;
+    const path = window.location.pathname;
+    history.replaceState(dashboardRouteState(), '', '/');
+    history.pushState(noteRouteState(noteID), '', path);
+    return;
+  }
+  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) {
+    history.replaceState(dashboardRouteState(), '', '/');
+  }
+}
+
 function setNoteRoute(noteID, {replace = false} = {}) {
   const path = `/${encodeURIComponent(noteID)}`;
-  if (window.location.pathname === path && !window.location.search && !window.location.hash) return;
-  history[replace ? 'replaceState' : 'pushState']({noteID}, '', path);
+  const state = noteRouteState(noteID);
+  if (window.location.pathname === path && !window.location.search && !window.location.hash) {
+    if (!isAppNoteRoute() || history.state.noteID !== noteID) history.replaceState(state, '', path);
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', path);
 }
 
 function setDashboardRoute({replace = false} = {}) {
-  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) return;
-  history[replace ? 'replaceState' : 'pushState']({}, '', '/');
+  const state = dashboardRouteState();
+  if (window.location.pathname === '/' && !window.location.search && !window.location.hash) {
+    if (!isAppDashboardRoute()) history.replaceState(state, '', '/');
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', '/');
 }
 
 function openOfflineDB() {
@@ -2494,16 +2536,30 @@ function startNewNote(title = '') {
 $('#new-note-btn').addEventListener('click', () => startNewNote());
 
 $('#back-btn').addEventListener('click', async () => {
-  if (saveTimer) clearTimeout(saveTimer);
-  if (localSaveTimer) clearTimeout(localSaveTimer);
-  if (previewTimer) clearTimeout(previewTimer);
-  // Navigation waits only for the durable local save. Network replay then runs
-  // after the cached dashboard is visible, rather than making Back feel slow.
-  await saveCurrentNote(false);
-  clearCurrentNote();
-  await loadDashboard({sync: false});
-  if ((await pendingOperations()).length) scheduleSync();
-  setDashboardRoute();
+  if (backNavigationInFlight) return;
+  backNavigationInFlight = true;
+  try {
+    if (saveTimer) clearTimeout(saveTimer);
+    if (localSaveTimer) clearTimeout(localSaveTimer);
+    if (previewTimer) clearTimeout(previewTimer);
+    // Navigation waits only for the durable local save. Network replay then runs
+    // after the cached dashboard is visible, rather than making Back feel slow.
+    await saveCurrentNote(false);
+    clearCurrentNote();
+    if ((await pendingOperations()).length) scheduleSync();
+    if (isAppNoteRoute()) {
+      // The note entry already has the dashboard entry beneath it. Consume the
+      // note entry so browser Back and the in-app button have the same result.
+      const restored = new Promise(resolve => pendingHistoryRestoreResolvers.push(resolve));
+      history.back();
+      await restored;
+      return;
+    }
+    await loadDashboard({sync: false});
+    setDashboardRoute({replace: true});
+  } finally {
+    backNavigationInFlight = false;
+  }
 });
 
 function showNoteInEditor(data) {
@@ -2535,6 +2591,7 @@ async function openNote(id, {route = 'push'} = {}) {
   if (!data) return;
   showNoteInEditor(data);
   if (route === 'push') setNoteRoute(id);
+  else if (route === 'replace') setNoteRoute(id, {replace: true});
   await showConflictResolverFor(id);
   // The note is already usable from IndexedDB. Sync is driven by the central
   // scheduler, server events, and pending local work rather than navigation.
@@ -2550,7 +2607,7 @@ async function followWikiLink(title) {
   if (isDirty) await saveCurrentNote(false);
   const existing = (await getLocalNotes()).find(note => normalizeWikiTitle(note.title || '') === normalizeWikiTitle(title));
   if (existing) {
-    await openNote(existing.id);
+    await openNote(existing.id, {route: 'replace'});
     return;
   }
   startNewNote(title);
@@ -2673,7 +2730,7 @@ async function persistEditorSnapshot(snapshot, trySync) {
       currentBaseRevision = null;
       savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
       isDirty = false;
-      if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+      if (!restoringHistoryRoute && noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
       setIdleSyncStatus();
     }
     return true;
@@ -2693,7 +2750,7 @@ async function persistEditorSnapshot(snapshot, trySync) {
     currentBaseRevision = baseRevision;
     savedSnapshot = {title: snapshot.title, tags: snapshot.tags, content: snapshot.content};
     isDirty = false;
-    if (noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
+    if (!restoringHistoryRoute && noteIDFromLocation() !== snapshot.noteID) setNoteRoute(snapshot.noteID);
     setIdleSyncStatus();
   }
   if (trySync) await syncNow();
@@ -3769,6 +3826,7 @@ async function loadPrefs() {
 async function init() {
   let localStartupReady = false;
   try {
+    initializeHistoryRoute();
     await restoreCachedStartup();
     localStartupReady = true;
     $('#app').classList.remove('booting');
@@ -3823,7 +3881,13 @@ function registerServiceWorker(revision = appRevisionAtLoad) {
   });
 }
 
-window.addEventListener('popstate', () => { void restoreRoute(); });
+window.addEventListener('popstate', () => {
+  restoringHistoryRoute = true;
+  void restoreRoute().finally(() => {
+    restoringHistoryRoute = false;
+    pendingHistoryRestoreResolvers.shift()?.();
+  });
+});
 
 window.addEventListener('online', async () => {
   connectServerEvents();
