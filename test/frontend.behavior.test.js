@@ -476,6 +476,26 @@ describe('sync scheduling while hidden', () => {
 });
 
 describe('server change invalidation', () => {
+  test('refreshes preferences without scheduling an unrelated note sync', async () => {
+    const requests = [];
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        requests.push(String(path));
+        if (String(path) === '/api/prefs') return response(200, {revision: 2, theme: 'default-light'});
+        if (String(path).startsWith('/api/sync?')) return response(200, {changes: [], nextSequence: 0, hasMore: false});
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+    Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});
+
+    await expect(app.hooks.handleServerChangeEvent({type: 'preferences', revision: 2})).resolves.toBe(true);
+    await vi.waitFor(() => expect(requests.filter(path => path === '/api/prefs')).toHaveLength(1));
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    expect(requests.some(path => path.startsWith('/api/sync?'))).toBe(false);
+    expect(app.hooks.getSyncScheduleState()).toEqual({scheduled: false, options: {}});
+  });
+
   test('ignores a note event already covered by the local sync cursor', async () => {
     const app = track(await createApp());
     Object.defineProperty(app.window.document, 'visibilityState', {value: 'visible', configurable: true});

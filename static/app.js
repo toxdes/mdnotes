@@ -2364,6 +2364,7 @@ async function handleServerChangeEvent(change = {}) {
     const revision = Number(change.revision || 0);
     if (revision > 0 && revision <= Number(prefs.revision || 0)) return false;
     void loadPrefs();
+    return true;
   }
   if (type !== 'notes') {
     scheduleServerChangeSync();
