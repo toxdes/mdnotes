@@ -78,6 +78,11 @@ describe('font preferences', () => {
     expect(error.textContent).toContain('valid font name');
     expect((await app.hooks.pendingOperations()).filter(operation => operation.type === 'prefs.save')).toHaveLength(0);
     expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs') || '{}').fontFamily).not.toBe('Bad"Font');
+
+    await app.hooks.applyFonts();
+    expect(input.value).toBe('Bad"Font');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(error.hidden).toBe(false);
   });
 
   test('does not probe Google Fonts for local-only custom preferences', async () => {

@@ -3741,7 +3741,7 @@ function removeLoadedFonts() {
   document.querySelectorAll('[data-mdnotes-font]').forEach(link => link.remove());
   FONT_SLOTS.forEach(slot => {
     document.documentElement.style.setProperty(slot.variable, fontCSSValue(prefs[slot.preference], slot.fallback));
-    setFontError(slot);
+    if (validFontValue($(slot.input)?.value)) setFontError(slot);
   });
 }
 
