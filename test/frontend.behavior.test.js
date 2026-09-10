@@ -64,6 +64,22 @@ describe('font preferences', () => {
     expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
   });
 
+  test('keeps an invalid font name visible and does not save it', async () => {
+    const app = track(await createApp());
+    const input = app.window.document.querySelector('#pref-font');
+    const error = app.window.document.querySelector('#pref-font-error');
+
+    input.value = 'Bad"Font';
+    input.dispatchEvent(new app.window.Event('change'));
+
+    await vi.waitFor(() => expect(error.hidden).toBe(false));
+    expect(input.value).toBe('Bad"Font');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(error.textContent).toContain('valid font name');
+    expect((await app.hooks.pendingOperations()).filter(operation => operation.type === 'prefs.save')).toHaveLength(0);
+    expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs') || '{}').fontFamily).not.toBe('Bad"Font');
+  });
+
   test('does not probe Google Fonts for local-only custom preferences', async () => {
     const app = track(await createApp());
     await app.hooks.savePref('fontFamily', 'Aptos');

@@ -3640,12 +3640,15 @@ function validAccentColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '';
 }
 
+function validFontValue(value) {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim();
+  return Boolean(normalized) && normalized.length <= 120 && !/[\u0000-\u001f\u007f"\\;,]/.test(normalized);
+}
+
 function normalizeFontValue(value, key) {
   if (value === 'system') return key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
-  if (typeof value !== 'string') return DEFAULT_PREFS[key];
-  const normalized = value.trim();
-  if (!normalized || normalized.length > 120 || /[\u0000-\u001f\u007f"\\;,]/.test(normalized)) return DEFAULT_PREFS[key];
-  return normalized;
+  return validFontValue(value) ? value.trim() : DEFAULT_PREFS[key];
 }
 
 function legacyThemeID() {
@@ -3716,6 +3719,11 @@ function setFontError(slot, message = '') {
   if (!error) return;
   error.textContent = message;
   error.hidden = !message;
+  const input = $(slot.input);
+  if (input) {
+    if (message) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  }
 }
 
 function shouldFetchGoogleFont(slot) {
@@ -3875,8 +3883,18 @@ $('#pref-theme').addEventListener('change', function () { void savePref('theme',
 $('#pref-accent').addEventListener('change', function () { void savePref('accentColor', this.value); });
 FONT_SLOTS.forEach(slot => {
   const input = $(slot.input);
-  input.addEventListener('input', () => setFontError(slot));
-  input.addEventListener('change', function () { void savePref(slot.preference, this.value); });
+  input.addEventListener('input', function () {
+    if (!$(slot.error)?.hidden) setFontError(slot, validFontValue(this.value) ? '' : 'Enter a valid font name without quotes, backslashes, semicolons, or commas.');
+  });
+  input.addEventListener('change', function () {
+    if (!validFontValue(this.value)) {
+      setFontError(slot, 'Enter a valid font name without quotes, backslashes, semicolons, or commas.');
+      return;
+    }
+    this.value = this.value.trim();
+    setFontError(slot);
+    void savePref(slot.preference, this.value);
+  });
   $(slot.fetch).addEventListener('change', function () {
     void savePref(slot.fetchPreference, this.checked);
   });
