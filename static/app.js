@@ -3698,7 +3698,7 @@ try {
   applyPrefs();
 }
 
-$('#prefs-btn').addEventListener('click', () => {
+function openPreferences() {
   $('#pref-autosave').checked = prefs.autoSave;
   $('#pref-hidepreview').checked = prefs.hidePreview;
   $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
@@ -3711,7 +3711,10 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
   renderFontOptions();
   openModal($('#prefs-modal'));
-});
+}
+
+$('#prefs-btn').addEventListener('click', openPreferences);
+$('#editor-prefs-btn').addEventListener('click', openPreferences);
 
 $('#prefs-close').addEventListener('click', () => {
   closeModal($('#prefs-modal'));

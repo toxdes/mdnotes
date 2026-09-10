@@ -69,3 +69,17 @@ test('direct note URLs get one dashboard history parent', async ({page}) => {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.locator('#dashboard')).toBeVisible();
 });
+
+test('editor preferences are available after Save', async ({page}) => {
+  await signIn(page);
+  await page.locator('#new-note-btn').click();
+  await page.locator('#note-title').fill('Editor preferences test');
+  await page.locator('#save-btn').click();
+  await expect(page).toHaveURL(/\/[A-Za-z0-9_-]+$/);
+
+  const editorActions = page.locator('#editor header .header-right button');
+  await expect(editorActions).toHaveCount(2);
+  await expect(page.locator('#editor-prefs-btn')).toBeVisible();
+  await page.locator('#editor-prefs-btn').click();
+  await expect(page.locator('#prefs-modal')).toBeVisible();
+});
