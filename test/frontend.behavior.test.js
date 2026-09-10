@@ -538,7 +538,7 @@ describe('server change invalidation', () => {
 });
 
 describe('sync coordinator', () => {
-  test('reports a durable queued edit as saved locally', async () => {
+  test('reports a durable queued edit as saved but waiting to sync', async () => {
     const app = track(await createApp());
     app.hooks.setEditorState({
       id: 'note-a', dirty: true, title: 'Note', content: 'local edit',
@@ -547,10 +547,13 @@ describe('sync coordinator', () => {
 
     await app.hooks.saveCurrentNote(false);
     await vi.waitFor(() => {
-      expect(app.window.document.querySelector('#editor-status')).toMatchObject({
+      const status = app.window.document.querySelector('#editor-status');
+      expect(status).toMatchObject({
         dataset: expect.objectContaining({state: 'local'}),
-        title: 'Saved locally; waiting to sync',
+        title: 'Saved on this device; waiting to sync',
       });
+      expect(status.querySelector('.sync-indicator-label').textContent).toBe('Saved');
+      expect(status.getAttribute('aria-label')).toBe('Saved on this device; waiting to sync');
     });
   });
 

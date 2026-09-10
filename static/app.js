@@ -730,7 +730,7 @@ function notifySyncCompleted() {
 
 const syncStates = {
   online: {label: 'Saved', title: 'Saved and up to date'},
-  local: {label: 'Saved locally', title: 'Saved locally; waiting to sync'},
+  local: {label: 'Saved', title: 'Saved on this device; waiting to sync'},
   syncing: {label: 'Syncing', title: 'Synchronizing changes'},
   offline: {label: 'Offline', title: 'Offline — changes are saved on this device'},
 };
