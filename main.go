@@ -13,12 +13,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var version = "dev"
+
+const artificialRTTDelayEnv = "ARTIFICIAL_RTT_DELAY_MS"
 
 //go:embed static
 var staticFS embed.FS
@@ -82,6 +85,44 @@ func gzipMiddleware(next http.Handler) http.Handler {
 		defer gw.Close()
 		w.Header().Set("Content-Encoding", "gzip")
 		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gw}, r)
+	})
+}
+
+// parseArtificialRTTDelay parses the development-only server-side latency
+// injection setting. A zero or invalid value disables the delay.
+func parseArtificialRTTDelay(raw string) time.Duration {
+	milliseconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || milliseconds <= 0 {
+		return 0
+	}
+	const maxDelay = time.Minute
+	if milliseconds > int64(maxDelay/time.Millisecond) {
+		return maxDelay
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+// artificialRTTDelayMiddleware adds one server-side delay to each request.
+// SSE is intentionally excluded because /api/events is a long-lived stream;
+// delaying its establishment or heartbeats would make connectivity tests
+// misleading. The delay is applied before the handler so the client observes
+// it as request latency.
+func artificialRTTDelayMiddleware(delay time.Duration, next http.Handler) http.Handler {
+	if delay <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/events" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			next.ServeHTTP(w, r)
+		case <-r.Context().Done():
+		}
 	})
 }
 
@@ -259,10 +300,14 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 	mux.Handle("GET /", appShell)
+	artificialDelay := parseArtificialRTTDelay(os.Getenv(artificialRTTDelayEnv))
+	if artificialDelay > 0 {
+		log.Printf("artificial request delay enabled: %s per request", artificialDelay)
+	}
 
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      securityHeaders(gzipMiddleware(mux)),
+		Handler:      securityHeaders(gzipMiddleware(artificialRTTDelayMiddleware(artificialDelay, mux))),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

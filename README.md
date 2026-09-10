@@ -32,6 +32,7 @@ Optional environment variables:
 | MDNOTES_ENCRYPTION_KEY | (none) | Enable encryption with a `hex:` or `base64:` encoded 32-byte key; arbitrary legacy values remain readable for migration |
 | MDNOTES_TRUST_PROXY | (unset) | Set to `1` only when a trusted reverse proxy supplies client-IP headers |
 | MDNOTES_MIGRATE_ENCRYPTION | (unset) | Set to `1` once with a v2 encryption setting to upgrade all legacy encrypted notes before serving requests |
+| ARTIFICIAL_RTT_DELAY_MS | 0 | Development-only delay added once before each request, in milliseconds; `/api/events` is excluded |
 
 Every secret variable also accepts a `_FILE` form—for example, `MDNOTES_ENCRYPTION_PASSWORD_FILE=/run/secrets/mdnotes_encryption_password`. This is preferred for Docker or Kubernetes secrets.
 

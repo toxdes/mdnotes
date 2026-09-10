@@ -47,6 +47,50 @@ func TestSecurityHeadersUseStrictCSP(t *testing.T) {
 	}
 }
 
+func TestParseArtificialRTTDelay(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{name: "absent", raw: "", want: 0},
+		{name: "zero", raw: "0", want: 0},
+		{name: "milliseconds", raw: "25", want: 25 * time.Millisecond},
+		{name: "whitespace", raw: " 40 ", want: 40 * time.Millisecond},
+		{name: "invalid", raw: "slow", want: 0},
+		{name: "negative", raw: "-1", want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := parseArtificialRTTDelay(test.raw)
+			if got != test.want {
+				t.Fatalf("parseArtificialRTTDelay(%q) = %s, want %s", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestArtificialRTTDelayMiddlewareDelaysRequestsButNotSSE(t *testing.T) {
+	const delay = 15 * time.Millisecond
+	handler := artificialRTTDelayMiddleware(delay, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	start := time.Now()
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/api/check", nil))
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("API request completed in %s, want at least %s", elapsed, delay)
+	}
+
+	start = time.Now()
+	result = httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/api/events", nil))
+	if elapsed := time.Since(start); elapsed >= delay {
+		t.Fatalf("SSE request completed in %s, want less than %s", elapsed, delay)
+	}
+}
+
 func TestAPIValidationErrorsUseStableJSONCodes(t *testing.T) {
 	a := &app{}
 	request := httptest.NewRequest(http.MethodGet, "/api/search?q="+strings.Repeat("x", 257), nil)
