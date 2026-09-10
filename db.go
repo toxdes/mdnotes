@@ -64,22 +64,25 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 type prefs struct {
-	Revision               int64                      `json:"revision,omitempty"`
-	AutoSave               bool                       `json:"autoSave"`
-	HidePreview            bool                       `json:"hidePreview"`
-	HideHeaderOnFullscreen bool                       `json:"hideHeaderOnFullscreen"`
-	HideToolbar            bool                       `json:"hideToolbar"`
-	HideSaveButton         bool                       `json:"hideSaveButton"`
-	CollapseDetails        bool                       `json:"collapseDetails"`
-	HideCursorHighlight    bool                       `json:"hideCursorHighlight"`
-	StatusDisplay          string                     `json:"statusDisplay,omitempty"`
-	Theme                  string                     `json:"theme,omitempty"`
-	AccentColor            string                     `json:"accentColor,omitempty"`
-	FontFamily             string                     `json:"fontFamily,omitempty"`
-	EditorFontFamily       string                     `json:"editorFontFamily,omitempty"`
-	PreviewFontFamily      string                     `json:"previewFontFamily,omitempty"`
-	SyncPatch              map[string]json.RawMessage `json:"_sync_patch,omitempty"`
-	SyncBase               map[string]json.RawMessage `json:"_sync_base,omitempty"`
+	Revision                int64                      `json:"revision,omitempty"`
+	AutoSave                bool                       `json:"autoSave"`
+	HidePreview             bool                       `json:"hidePreview"`
+	HideHeaderOnFullscreen  bool                       `json:"hideHeaderOnFullscreen"`
+	HideToolbar             bool                       `json:"hideToolbar"`
+	HideSaveButton          bool                       `json:"hideSaveButton"`
+	CollapseDetails         bool                       `json:"collapseDetails"`
+	HideCursorHighlight     bool                       `json:"hideCursorHighlight"`
+	StatusDisplay           string                     `json:"statusDisplay,omitempty"`
+	Theme                   string                     `json:"theme,omitempty"`
+	AccentColor             string                     `json:"accentColor,omitempty"`
+	FontFamily              string                     `json:"fontFamily,omitempty"`
+	FontFamilyGoogle        bool                       `json:"fontFamilyGoogle"`
+	EditorFontFamily        string                     `json:"editorFontFamily,omitempty"`
+	EditorFontFamilyGoogle  bool                       `json:"editorFontFamilyGoogle"`
+	PreviewFontFamily       string                     `json:"previewFontFamily,omitempty"`
+	PreviewFontFamilyGoogle bool                       `json:"previewFontFamilyGoogle"`
+	SyncPatch               map[string]json.RawMessage `json:"_sync_patch,omitempty"`
+	SyncBase                map[string]json.RawMessage `json:"_sync_base,omitempty"`
 }
 
 type migration struct {

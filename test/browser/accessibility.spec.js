@@ -32,7 +32,7 @@ test('preferences can be opened, navigated, trapped, and closed from the keyboar
 
   await page.locator('#prefs-tab-appearance').focus();
   await page.keyboard.press('Shift+Tab');
-  await expect(page.locator('#pref-font')).toBeFocused();
+  await expect(page.locator('#pref-font-google')).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(page.locator('#prefs-tab-appearance')).toBeFocused();
 

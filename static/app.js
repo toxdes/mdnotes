@@ -19,16 +19,12 @@ let isDirty = false;
 let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let editorSessionGeneration = 0;
-const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', editorFontFamily:'system-monospace', previewFontFamily:'system-sans'};
-const FONT_OPTIONS = ['Inter', 'Roboto', 'Rubik', 'DM Sans', 'Spectral', 'Newsreader', 'Plus Jakarta Sans', 'Google Sans'];
+const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', fontFamilyGoogle:false, editorFontFamily:'system-monospace', editorFontFamilyGoogle:false, previewFontFamily:'system-sans', previewFontFamilyGoogle:false};
 const FONT_CACHE_NAME = 'mdnotes-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
 const SYSTEM_SERIF_STACK = 'ui-serif,Georgia,Cambria,"Times New Roman",Times,serif';
 const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace';
-const SYSTEM_FONT_OPTIONS = [{value:'system-sans',label:'System (Sans)'}, {value:'system-serif',label:'System (Serif)'}, {value:'system-monospace',label:'System (Monospace)'}];
 let prefs = {...DEFAULT_PREFS};
-let fontAvailability = 'checking';
-let fontAvailabilityPromise = null;
 let fontLoadGeneration = 0;
 let fontApplyQueue = Promise.resolve();
 let renderedPreviewSource = null;
@@ -3385,6 +3381,14 @@ function validAccentColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : '';
 }
 
+function normalizeFontValue(value, key) {
+  if (value === 'system') return key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
+  if (typeof value !== 'string') return DEFAULT_PREFS[key];
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 120 || /[\u0000-\u001f\u007f"\\;,]/.test(normalized)) return DEFAULT_PREFS[key];
+  return normalized;
+}
+
 function legacyThemeID() {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark') return 'default-dark';
@@ -3400,8 +3404,7 @@ function normalizePrefs(value = {}, fallback = {}) {
   if (!themeByID.has(merged.theme)) merged.theme = legacyThemeID();
   if (!validAccentColor(merged.accentColor)) merged.accentColor = '';
   ['fontFamily', 'editorFontFamily', 'previewFontFamily'].forEach(key => {
-    if (merged[key] === 'system') merged[key] = key === 'editorFontFamily' ? 'system-monospace' : 'system-sans';
-    if (!['system-sans', 'system-serif', 'system-monospace', ...FONT_OPTIONS].includes(merged[key])) merged[key] = DEFAULT_PREFS[key];
+    merged[key] = normalizeFontValue(merged[key], key);
   });
   return merged;
 }
@@ -3421,7 +3424,7 @@ function applyTheme(themeID = prefs.theme) {
 
 function fontCSSURL(fontFamily) {
   const family = encodeURIComponent(fontFamily).replace(/%20/g, '+');
-  return `https://fonts.googleapis.com/css2?family=${family}:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600;1,700&display=swap`;
+  return `https://fonts.googleapis.com/css2?family=${family}&display=swap`;
 }
 
 function isSystemFont(fontFamily) {
@@ -3439,22 +3442,42 @@ async function clearFontCache() {
 }
 
 const FONT_SLOTS = [
-  {preference:'fontFamily', variable:'--font'},
-  {preference:'editorFontFamily', variable:'--editor-font'},
-  {preference:'previewFontFamily', variable:'--preview-font'},
+  {preference:'fontFamily', fetchPreference:'fontFamilyGoogle', variable:'--font', input:'#pref-font', fetch:'#pref-font-google', error:'#pref-font-error', fallback:SYSTEM_FONT_STACK},
+  {preference:'editorFontFamily', fetchPreference:'editorFontFamilyGoogle', variable:'--editor-font', input:'#pref-editor-font', fetch:'#pref-editor-font-google', error:'#pref-editor-font-error', fallback:SYSTEM_MONO_STACK},
+  {preference:'previewFontFamily', fetchPreference:'previewFontFamilyGoogle', variable:'--preview-font', input:'#pref-preview-font', fetch:'#pref-preview-font-google', error:'#pref-preview-font-error', fallback:SYSTEM_FONT_STACK},
 ];
+
+function fontCSSValue(fontFamily, fallback) {
+  if (isSystemFont(fontFamily)) return systemFontStack(fontFamily);
+  return `"${fontFamily}",${fallback}`;
+}
+
+function setFontError(slot, message = '') {
+  const error = $(slot.error);
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = !message;
+}
+
+function shouldFetchGoogleFont(slot) {
+  return prefs[slot.fetchPreference] === true;
+}
 
 function removeLoadedFonts() {
   document.querySelectorAll('[data-mdnotes-font]').forEach(link => link.remove());
-  FONT_SLOTS.forEach(slot => document.documentElement.style.setProperty(slot.variable, systemFontStack(prefs[slot.preference])));
+  FONT_SLOTS.forEach(slot => {
+    document.documentElement.style.setProperty(slot.variable, fontCSSValue(prefs[slot.preference], slot.fallback));
+    setFontError(slot);
+  });
 }
 
 async function applyFontsNow(clearCache = false) {
   const generation = ++fontLoadGeneration;
   if (clearCache) await clearFontCache();
   removeLoadedFonts();
-  const families = [...new Set(FONT_SLOTS.map(slot => prefs[slot.preference]).filter(font => font && !isSystemFont(font)))];
+  const families = [...new Set(FONT_SLOTS.filter(shouldFetchGoogleFont).map(slot => prefs[slot.preference]).filter(font => font && !isSystemFont(font)))];
   const loaded = new Map();
+  const failed = new Set();
   await Promise.all(families.map(async fontFamily => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
@@ -3472,13 +3495,15 @@ async function applyFontsNow(clearCache = false) {
       loaded.set(fontFamily, true);
     } catch (error) {
       link.remove();
+      failed.add(fontFamily);
       console.warn(`font unavailable: ${fontFamily}`, error);
     }
   }));
   if (generation !== fontLoadGeneration) return;
   FONT_SLOTS.forEach(slot => {
     const fontFamily = prefs[slot.preference];
-    if (!isSystemFont(fontFamily) && loaded.has(fontFamily)) document.documentElement.style.setProperty(slot.variable, `"${fontFamily}",${SYSTEM_FONT_STACK}`);
+    document.documentElement.style.setProperty(slot.variable, fontCSSValue(fontFamily, slot.fallback));
+    if (shouldFetchGoogleFont(slot) && !isSystemFont(fontFamily) && failed.has(fontFamily) && !loaded.has(fontFamily)) setFontError(slot, 'Font not available from Google Fonts.');
   });
 }
 
@@ -3494,21 +3519,18 @@ function renderThemeOptions() {
 }
 
 function renderFontOptions() {
-  const localOptions = SYSTEM_FONT_OPTIONS.map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
-  const downloadableOptions = FONT_OPTIONS.map(font => `<option value="${esc(font)}"${fontAvailability === 'available' ? '' : ' disabled'}>${esc(font)}</option>`).join('');
-  ['#pref-font', '#pref-editor-font', '#pref-preview-font'].forEach(selector => {
-    const target = $(selector);
-    target.disabled = false;
-    target.innerHTML = localOptions + downloadableOptions;
+  FONT_SLOTS.forEach(slot => {
+    const input = $(slot.input);
+    if (input) input.value = prefs[slot.preference];
+    const fetchToggle = $(slot.fetch);
+    if (fetchToggle) fetchToggle.checked = Boolean(prefs[slot.fetchPreference]);
   });
-  $('#pref-font').value = prefs.fontFamily;
-  $('#pref-editor-font').value = prefs.editorFontFamily;
-  $('#pref-preview-font').value = prefs.previewFontFamily;
 }
 
 function applyPrefs() {
   applyTheme(prefs.theme);
   void applyFonts();
+  renderFontOptions();
   applyEditorPrefs();
 }
 
@@ -3537,11 +3559,8 @@ $('#prefs-btn').addEventListener('click', () => {
   $('#pref-status').value = prefs.statusDisplay;
   $('#pref-theme').value = prefs.theme;
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
-  $('#pref-font').value = prefs.fontFamily;
-  $('#pref-editor-font').value = prefs.editorFontFamily;
-  $('#pref-preview-font').value = prefs.previewFontFamily;
+  renderFontOptions();
   openModal($('#prefs-modal'));
-  void checkFontAvailability(fontAvailability === 'unavailable');
 });
 
 $('#prefs-close').addEventListener('click', () => {
@@ -3567,7 +3586,7 @@ async function savePref(key, value) {
     },
   });
   if (key === 'theme' || key === 'accentColor') applyTheme(prefs.theme);
-  if (['fontFamily', 'editorFontFamily', 'previewFontFamily'].includes(key)) void applyFonts(true);
+  if (['fontFamily', 'fontFamilyGoogle', 'editorFontFamily', 'editorFontFamilyGoogle', 'previewFontFamily', 'previewFontFamilyGoogle'].includes(key)) void applyFonts(true);
   applyEditorPrefs();
   scheduleSync();
 }
@@ -3595,9 +3614,14 @@ $('#pref-hidecursor').addEventListener('change', function () {
 });
 $('#pref-theme').addEventListener('change', function () { void savePref('theme', this.value); });
 $('#pref-accent').addEventListener('change', function () { void savePref('accentColor', this.value); });
-$('#pref-font').addEventListener('change', function () { void savePref('fontFamily', this.value); });
-$('#pref-editor-font').addEventListener('change', function () { void savePref('editorFontFamily', this.value); });
-$('#pref-preview-font').addEventListener('change', function () { void savePref('previewFontFamily', this.value); });
+FONT_SLOTS.forEach(slot => {
+  const input = $(slot.input);
+  input.addEventListener('input', () => setFontError(slot));
+  input.addEventListener('change', function () { void savePref(slot.preference, this.value); });
+  $(slot.fetch).addEventListener('change', function () {
+    void savePref(slot.fetchPreference, this.checked);
+  });
+});
 $('#pref-status').addEventListener('change', function () { void savePref('statusDisplay', this.value); });
 
 $$('.prefs-nav').forEach(button => button.addEventListener('click', () => {
@@ -3626,44 +3650,6 @@ $$('.prefs-nav').forEach(button => button.addEventListener('keydown', event => {
   tabs[next].click();
 }));
 
-async function checkFontAvailability(force = false) {
-  if (!force && (fontAvailability === 'available' || fontAvailability === 'unavailable')) return fontAvailability;
-  if (fontAvailabilityPromise) return fontAvailabilityPromise;
-  fontAvailability = 'checking';
-  $('#font-availability').textContent = 'Checking Google Fonts...';
-  renderFontOptions();
-
-  fontAvailabilityPromise = (async () => {
-    const probe = document.createElement('link');
-    probe.rel = 'stylesheet';
-    probe.href = fontCSSURL('Inter');
-    const stylesheetLoaded = await new Promise(resolve => {
-      const timeout = setTimeout(() => resolve(false), 5000);
-      probe.addEventListener('load', () => { clearTimeout(timeout); resolve(true); }, {once:true});
-      probe.addEventListener('error', () => { clearTimeout(timeout); resolve(false); }, {once:true});
-      document.head.append(probe);
-    });
-    probe.remove();
-    let faceLoaded = false;
-    if (stylesheetLoaded) {
-      try {
-        const loadedFaces = await document.fonts.load('1rem "Inter"');
-        faceLoaded = Boolean(loadedFaces && loadedFaces.length);
-      } catch (_) {}
-    }
-    fontAvailability = stylesheetLoaded && faceLoaded ? 'available' : 'unavailable';
-    $('#font-availability').textContent = fontAvailability === 'available' ? 'Google Fonts available' : 'Google Fonts unavailable; using system font';
-    renderFontOptions();
-    if (fontAvailability === 'available') void applyFonts();
-    return fontAvailability;
-  })().finally(() => { fontAvailabilityPromise = null; });
-  return fontAvailabilityPromise;
-}
-
-function hasSelectedWebFont() {
-  return FONT_SLOTS.some(slot => prefs[slot.preference] && !isSystemFont(prefs[slot.preference]));
-}
-
 async function loadPrefs() {
   let p = null;
   try {
@@ -3677,7 +3663,6 @@ async function loadPrefs() {
     prefs = normalizePrefs(p, cached);
     localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
     applyPrefs();
-    if (hasSelectedWebFont()) void checkFontAvailability();
     return;
   }
   try {
@@ -3685,7 +3670,6 @@ async function loadPrefs() {
     if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
   applyPrefs();
-  if (hasSelectedWebFont()) void checkFontAvailability();
 }
 
 // --- Init ---
@@ -3750,10 +3734,6 @@ window.addEventListener('popstate', () => { void restoreRoute(); });
 
 window.addEventListener('online', async () => {
   connectServerEvents();
-  if (hasSelectedWebFont()) {
-    fontAvailability = 'checking';
-    void checkFontAvailability();
-  }
   scheduleSync({reconcile: true});
 });
 

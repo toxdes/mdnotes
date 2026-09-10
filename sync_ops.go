@@ -209,19 +209,22 @@ func storedSyncOperation(db *sql.DB, deviceID string, sequence int64, opID strin
 }
 
 var preferenceFieldNames = map[string]struct{}{
-	"autoSave":               {},
-	"hidePreview":            {},
-	"hideHeaderOnFullscreen": {},
-	"hideToolbar":            {},
-	"hideSaveButton":         {},
-	"collapseDetails":        {},
-	"hideCursorHighlight":    {},
-	"statusDisplay":          {},
-	"theme":                  {},
-	"accentColor":            {},
-	"fontFamily":             {},
-	"editorFontFamily":       {},
-	"previewFontFamily":      {},
+	"autoSave":                {},
+	"hidePreview":             {},
+	"hideHeaderOnFullscreen":  {},
+	"hideToolbar":             {},
+	"hideSaveButton":          {},
+	"collapseDetails":         {},
+	"hideCursorHighlight":     {},
+	"statusDisplay":           {},
+	"theme":                   {},
+	"accentColor":             {},
+	"fontFamily":              {},
+	"fontFamilyGoogle":        {},
+	"editorFontFamily":        {},
+	"editorFontFamilyGoogle":  {},
+	"previewFontFamily":       {},
+	"previewFontFamilyGoogle": {},
 }
 
 func preferenceFields(p *prefs) (map[string]json.RawMessage, error) {

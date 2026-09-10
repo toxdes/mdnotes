@@ -27,28 +27,136 @@ function track(app) {
 
 const styleSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'static', 'style.css'), 'utf8');
 
-describe('font availability', () => {
-  test('requires both the stylesheet and a loaded font face', async () => {
+describe('font preferences', () => {
+  test('uses text inputs and leaves Google Fonts fetching disabled by default', async () => {
     const app = track(await createApp());
+
+    expect(app.window.document.querySelector('#pref-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-editor-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-preview-font').tagName).toBe('INPUT');
+    expect(app.window.document.querySelector('#pref-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-editor-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-preview-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-font-google').closest('.font-input-wrap')).not.toBeNull();
+    expect(app.window.document.querySelector('#pref-editor-font-google').closest('.font-input-wrap')).not.toBeNull();
+    expect(app.window.document.querySelector('#pref-preview-font-google').closest('.font-input-wrap')).not.toBeNull();
+  });
+
+  test('keeps arbitrary local font names and applies slot-specific system fallbacks', async () => {
+    const app = track(await createApp());
+
+    await app.hooks.savePref('fontFamily', 'Aptos');
+    await app.hooks.savePref('editorFontFamily', 'Fira Code');
+    await app.hooks.savePref('previewFontFamily', 'Source Serif 4');
+    await app.hooks.applyFonts();
+
+    const root = app.window.document.documentElement;
+    expect(root.style.getPropertyValue('--font')).toContain('"Aptos"');
+    expect(root.style.getPropertyValue('--font')).toContain('ui-sans-serif');
+    expect(root.style.getPropertyValue('--editor-font')).toContain('"Fira Code"');
+    expect(root.style.getPropertyValue('--editor-font')).toContain('ui-monospace');
+    expect(root.style.getPropertyValue('--preview-font')).toContain('"Source Serif 4"');
+    expect(root.style.getPropertyValue('--preview-font')).toContain('ui-sans-serif');
+    await app.hooks.savePref('previewFontFamily', 'system-serif');
+    await app.hooks.applyFonts();
+    expect(root.style.getPropertyValue('--preview-font')).toContain('ui-serif');
+    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
+  });
+
+  test('does not probe Google Fonts for local-only custom preferences', async () => {
+    const app = track(await createApp());
+    await app.hooks.savePref('fontFamily', 'Aptos');
     const head = app.window.document.head;
     const append = head.append.bind(head);
-    const fontLoads = [];
-    app.window.document.fonts.load = async descriptor => {
-      fontLoads.push(descriptor);
-      return [{}];
-    };
+    let probeCount = 0;
     head.append = (...nodes) => {
       append(...nodes);
-      nodes.filter(node => node.rel === 'stylesheet').forEach(node => {
-        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      nodes.filter(node => node.rel === 'stylesheet' && !node.dataset.mdnotesFont).forEach(node => {
+        probeCount++;
+        setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
       });
     };
 
-    await expect(app.hooks.checkFontAvailability()).resolves.toBe('available');
+    await app.hooks.loadPrefs();
 
-    expect(fontLoads).toContain('1rem "Inter"');
-    expect(app.window.document.querySelector('#font-availability').textContent).toBe('Google Fonts available');
-    expect(app.window.document.querySelector('#pref-font option[value="Inter"]').disabled).toBe(false);
+    expect(probeCount).toBe(0);
+    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
+  });
+
+  test('shows a font error when opt-in Google loading fails', async () => {
+    const app = track(await createApp());
+    app.window.console.warn = () => {};
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    head.append = (...nodes) => {
+      append(...nodes);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
+      });
+    };
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.savePref('fontFamily', 'Definitely Not A Google Font');
+    await app.hooks.applyFonts();
+
+    const error = app.window.document.querySelector('#pref-font-error');
+    expect(error.hidden).toBe(false);
+    expect(error.textContent).toContain('Font not available');
+    expect(app.window.document.documentElement.style.getPropertyValue('--font')).toContain('ui-sans-serif');
+  });
+
+  test('requests a Google family without assuming unsupported weights or styles', async () => {
+    const app = track(await createApp());
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    let stylesheet;
+    head.append = (...nodes) => {
+      append(...nodes);
+      stylesheet ||= nodes.find(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      });
+    };
+    app.window.document.fonts.load = async () => [{}];
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.savePref('fontFamily', 'Crimson Pro');
+    await app.hooks.applyFonts();
+
+    expect(stylesheet.href).toContain('family=Crimson+Pro&display=swap');
+    expect(stylesheet.href).not.toContain('ital,wght');
+  });
+
+  test('keeps Google fetching independent for each font slot', async () => {
+    const app = track(await createApp());
+    const head = app.window.document.head;
+    const append = head.append.bind(head);
+    head.append = (...nodes) => {
+      append(...nodes);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+        setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
+      });
+    };
+    app.window.document.fonts.load = async () => [{}];
+
+    await app.hooks.savePref('editorFontFamily', 'Fira Code');
+    const editorFetch = app.window.document.querySelector('#pref-editor-font-google');
+    editorFetch.checked = true;
+    editorFetch.dispatchEvent(new app.window.Event('change'));
+    await app.hooks.pendingOperations();
+    await app.hooks.applyFonts();
+
+    const requested = [...app.window.document.querySelectorAll('[data-mdnotes-font]')];
+    expect(requested).toHaveLength(1);
+    expect(requested[0].href).toContain('family=Fira+Code&display=swap');
+    expect(app.window.document.querySelector('#pref-font-google').checked).toBe(false);
+    expect(app.window.document.querySelector('#pref-preview-font-google').checked).toBe(false);
   });
 });
 
@@ -1044,6 +1152,41 @@ describe('sync request lifecycle', () => {
 });
 
 describe('preference sync coordination', () => {
+  test('syncs Google font fetch switches as preference patches', async () => {
+    const app = track(await createApp());
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    fetchFonts.checked = true;
+    fetchFonts.dispatchEvent(new app.window.Event('change'));
+    app.hooks.cancelScheduledSync();
+
+    const pending = await app.hooks.pendingOperations();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].prefs._sync_patch).toEqual({fontFamilyGoogle: true});
+  });
+
+  test('restores Google font fetch switches from remote preferences', async () => {
+    const app = track(await createApp({
+      fetchImpl: async path => {
+        if (String(path) === '/api/prefs') return response(200, JSON.stringify({
+          revision: 2,
+          autoSave: true,
+          fontFamily: 'Inter',
+          fontFamilyGoogle: true,
+          editorFontFamily: 'system-monospace',
+          editorFontFamilyGoogle: false,
+          previewFontFamily: 'system-sans',
+          previewFontFamilyGoogle: false,
+        }));
+        throw new Error(`unexpected request: ${path}`);
+      },
+    }));
+
+    const fetchFonts = app.window.document.querySelector('#pref-font-google');
+    await app.hooks.loadPrefs();
+    expect(fetchFonts.checked).toBe(true);
+  });
+
   test('coalesces preference changes into field-level patches', async () => {
     const app = track(await createApp());
 
