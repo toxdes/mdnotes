@@ -358,6 +358,34 @@ describe('markdown preview policy', () => {
     }
   });
 
+  test('maps a Setext heading to its rendered heading block', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = 'Setext heading\n==============\n\nparagraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.selectionStart = textarea.selectionEnd = content.indexOf('Setext');
+    app.hooks.highlightBlock();
+
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    expect(blocks.map(block => block.tagName)).toEqual(['H1', 'P']);
+    expect(blocks[0].classList.contains('highlight')).toBe(true);
+  });
+
+  test('maps rendered blocks after an omitted link-reference definition', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '[docs]: https://example.com\n\nParagraph with [docs].';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+
+    const textarea = app.window.document.querySelector('#note-content');
+    textarea.selectionStart = textarea.selectionEnd = content.indexOf('Paragraph');
+    app.hooks.highlightBlock();
+
+    const paragraph = app.window.document.querySelector('#preview > p');
+    expect(paragraph).not.toBeNull();
+    expect(paragraph.classList.contains('highlight')).toBe(true);
+  });
+
   test('highlighting does not change preview block geometry', () => {
     expect(styleSource).toMatch(/\.preview \.highlight\{[^}]*background:/);
     expect(styleSource).not.toMatch(/\.preview \.highlight\{[^}]*\bmargin:/);

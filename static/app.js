@@ -3284,7 +3284,8 @@ function previewTokenTag(token) {
     case 'code': return 'PRE';
     case 'heading': {
       const match = (token.raw || '').match(/^\s*(#+)/);
-      return match ? `H${match[1].length}` : null;
+      if (match) return `H${match[1].length}`;
+      return Number.isInteger(token.depth) && token.depth >= 1 && token.depth <= 6 ? `H${token.depth}` : null;
     }
     case 'hr': return 'HR';
     case 'list': return token.ordered ? 'OL' : 'UL';
@@ -3292,6 +3293,11 @@ function previewTokenTag(token) {
     case 'table': return 'TABLE';
     default: return null;
   }
+}
+
+function previewGapDoesNotRender(source) {
+  if (!source) return true;
+  return marked.lexer(source, markdownRenderOptions()).every(token => token.type === 'space');
 }
 
 function clearPreviewHighlight() {
@@ -3404,7 +3410,7 @@ function cachePreviewBlocks() {
       const raw = typeof token.raw === 'string' ? token.raw : '';
       if (!raw) continue;
       const start = source.indexOf(raw, offset);
-      if (start !== offset) {
+      if (start < offset || !previewGapDoesNotRender(source.slice(offset, start))) {
         previewBlockRanges = [];
         return;
       }
@@ -3419,7 +3425,7 @@ function cachePreviewBlocks() {
       const contentEnd = start + raw.replace(/[\s\r\n]+$/, '').length;
       ranges.push({start, end: Math.max(start, contentEnd)});
     }
-    if (offset !== source.length || blockIndex !== previewBlocks.length) return;
+    if (!previewGapDoesNotRender(source.slice(offset)) || blockIndex !== previewBlocks.length) return;
     previewBlockRanges = ranges;
     previewRangeSource = source;
   } catch (_) {
