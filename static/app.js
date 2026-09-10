@@ -3139,6 +3139,96 @@ function clearPreviewHighlight() {
   if (current) current.classList.remove('highlight');
 }
 
+function calculatePreviewScrollAdjustment({previewTop, previewHeight, previewScrollTop, previewScrollHeight, anchorTop, caretTop, margin, deadband}) {
+  const safeTop = previewTop + margin;
+  const safeBottom = previewTop + Math.max(margin, previewHeight - margin);
+  const targetCaretTop = Math.min(safeBottom, Math.max(safeTop, caretTop));
+  const delta = anchorTop - targetCaretTop;
+  if (Math.abs(delta) <= deadband) return 0;
+  const maxScroll = Math.max(0, previewScrollHeight - previewHeight);
+  return Math.max(-previewScrollTop, Math.min(maxScroll - previewScrollTop, delta));
+}
+
+function measureEditorCaret() {
+  const ta = $('#note-content');
+  const taRect = ta.getBoundingClientRect();
+  if (!taRect.width || !taRect.height) return null;
+  const computed = getComputedStyle(ta);
+  const mirror = document.createElement('div');
+  mirror.style.position = 'absolute';
+  mirror.style.visibility = 'hidden';
+  mirror.style.pointerEvents = 'none';
+  mirror.style.left = `${taRect.left + window.scrollX}px`;
+  mirror.style.top = `${taRect.top + window.scrollY}px`;
+  mirror.style.width = `${taRect.width}px`;
+  mirror.style.boxSizing = computed.boxSizing;
+  mirror.style.border = computed.border;
+  mirror.style.padding = computed.padding;
+  mirror.style.font = computed.font;
+  mirror.style.letterSpacing = computed.letterSpacing;
+  mirror.style.lineHeight = computed.lineHeight;
+  mirror.style.tabSize = computed.tabSize;
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.overflowWrap = 'break-word';
+  mirror.style.wordBreak = 'break-word';
+  mirror.style.height = 'auto';
+  mirror.textContent = ta.value.slice(0, ta.selectionStart);
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  mirror.append(marker);
+  document.body.append(mirror);
+  const mirrorRect = mirror.getBoundingClientRect();
+  const markerRect = marker.getBoundingClientRect();
+  const lineHeight = parseFloat(computed.lineHeight) || parseFloat(computed.fontSize) * 1.5 || 24;
+  mirror.remove();
+  return {
+    top: taRect.top + markerRect.top - mirrorRect.top - ta.scrollTop,
+    height: markerRect.height || lineHeight,
+    lineHeight,
+  };
+}
+
+function previewBlockIndexAtPosition(position) {
+  let previous = -1;
+  let next = -1;
+  for (let index = 0; index < previewBlockRanges.length; index++) {
+    const range = previewBlockRanges[index];
+    if (range.start <= position && position < range.end) return index;
+    if (range.end <= position) previous = index;
+    if (next < 0 && position < range.start) next = index;
+  }
+  if (previous < 0) return next;
+  if (next < 0) return previous;
+  const distanceToPrevious = position - previewBlockRanges[previous].end;
+  const distanceToNext = previewBlockRanges[next].start - position;
+  return distanceToPrevious <= distanceToNext ? previous : next;
+}
+
+function alignPreviewWithCaret(block, range) {
+  const preview = $('#preview');
+  const caret = measureEditorCaret();
+  if (!caret || !preview.clientHeight || !preview.scrollHeight) return;
+  const previewRect = preview.getBoundingClientRect();
+  const blockRect = block.getBoundingClientRect();
+  const sourceLength = Math.max(1, range.end - range.start);
+  const sourceProgress = Math.min(1, Math.max(0, ($('#note-content').selectionStart - range.start) / sourceLength));
+  const anchorTop = blockRect.top + blockRect.height * sourceProgress;
+  const caretTop = caret.top + caret.height / 2;
+  const margin = Math.max(caret.lineHeight * 2, Math.min(96, preview.clientHeight * .18));
+  const deadband = caret.lineHeight * 2;
+  const adjustment = calculatePreviewScrollAdjustment({
+    previewTop: previewRect.top,
+    previewHeight: preview.clientHeight,
+    previewScrollTop: preview.scrollTop,
+    previewScrollHeight: preview.scrollHeight,
+    anchorTop,
+    caretTop,
+    margin,
+    deadband,
+  });
+  if (adjustment) preview.scrollTop += adjustment;
+}
+
 function cachePreviewBlocks() {
   const pv = $('#preview');
   previewBlocks = Array.from(pv.children).filter(c => c.tagName && !['STYLE','SCRIPT'].includes(c.tagName));
@@ -3187,8 +3277,11 @@ function highlightBlock() {
   const text = ta.value;
   const pos = ta.selectionStart;
   if (!text.trim() || !previewBlocks.length || renderedPreviewSource !== text || previewRangeSource !== text) return;
-  const idx = previewBlockRanges.findIndex(range => range.start <= pos && pos < range.end);
-  previewBlocks[idx]?.classList.add('highlight');
+  const idx = previewBlockIndexAtPosition(pos);
+  const block = previewBlocks[idx];
+  if (!block) return;
+  block.classList.add('highlight');
+  alignPreviewWithCaret(block, previewBlockRanges[idx]);
 }
 
 // --- Delete ---

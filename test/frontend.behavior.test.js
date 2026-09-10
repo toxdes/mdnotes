@@ -181,6 +181,36 @@ describe('editor display preferences', () => {
 });
 
 describe('markdown preview policy', () => {
+  test('leaves three editor lines of bottom breathing room', async () => {
+    expect(styleSource).toContain('#note-content{padding-bottom:4.95em;scroll-padding-bottom:4.95em}');
+  });
+
+  test('softly aligns the preview anchor with the editor caret', async () => {
+    const app = track(await createApp());
+
+    expect(app.hooks.calculatePreviewScrollAdjustment({
+      previewTop: 0,
+      previewHeight: 200,
+      previewScrollTop: 0,
+      previewScrollHeight: 600,
+      anchorTop: 300,
+      caretTop: 100,
+      margin: 30,
+      deadband: 20,
+    })).toBe(200);
+
+    expect(app.hooks.calculatePreviewScrollAdjustment({
+      previewTop: 0,
+      previewHeight: 200,
+      previewScrollTop: 100,
+      previewScrollHeight: 600,
+      anchorTop: 112,
+      caretTop: 100,
+      margin: 30,
+      deadband: 20,
+    })).toBe(0);
+  });
+
   test('highlights the rendered block containing the caret', async () => {
     const app = track(await createApp({realMarked: true}));
     app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content: '# Heading\n\n- first\n\n- second\n\n```text\ninside\n\ncode\n```\n\ntail'});
@@ -210,6 +240,29 @@ describe('markdown preview policy', () => {
     expect(blocks[0].tagName).toBe('UL');
     expect(blocks[0].classList.contains('highlight')).toBe(true);
     expect(blocks[1].classList.contains('highlight')).toBe(false);
+  });
+
+  test('maps caret positions at block ends and in separator whitespace', async () => {
+    const app = track(await createApp({realMarked: true}));
+    const content = '# First\n\nfirst paragraph\n\n# Second\n\nsecond paragraph';
+    app.hooks.showNoteInEditor({id: 'note-a', title: 'Note', content});
+    app.hooks.updatePreview();
+
+    const textarea = app.window.document.querySelector('#note-content');
+    const blocks = [...app.window.document.querySelector('#preview').children];
+    const positions = [
+      {position: content.indexOf('# First') + '# First'.length, block: 0},
+      {position: content.indexOf('\n\nfirst') + 1, block: 0},
+      {position: content.indexOf('\n\n# Second') + 1, block: 1},
+      {position: content.length, block: blocks.length - 1},
+    ];
+
+    for (const {position, block} of positions) {
+      textarea.selectionStart = textarea.selectionEnd = position;
+      app.hooks.highlightBlock();
+      expect(blocks.filter(element => element.classList.contains('highlight'))).toHaveLength(1);
+      expect(blocks[block].classList.contains('highlight')).toBe(true);
+    }
   });
 
   test('maps a caret inside fenced code across blank lines to the code block', async () => {

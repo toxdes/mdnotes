@@ -68,6 +68,7 @@ globalThis.__mdnotesTestHooks = {
   showNoteInEditor,
   updatePreview,
   highlightBlock,
+  calculatePreviewScrollAdjustment,
   closeDatabase: async () => {
     const db = offlineDBPromise && await offlineDBPromise;
     db?.close();
