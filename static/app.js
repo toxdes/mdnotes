@@ -79,9 +79,11 @@ let offlineDBPromise;
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const noteRouteIDPattern = /^[A-Za-z0-9_-]{1,64}$/;
 const appRouteState = 'mdnotes';
+const preferencesPath = '/preferences';
 
 function noteIDFromLocation() {
   try {
+    if (window.location.pathname === preferencesPath) return null;
     const id = decodeURIComponent(window.location.pathname.slice(1));
     return noteRouteIDPattern.test(id) ? id : null;
   } catch (_) {
@@ -97,6 +99,10 @@ function noteRouteState(noteID) {
   return {app: appRouteState, screen: 'note', noteID};
 }
 
+function preferencesRouteState(returnRoute) {
+  return {app: appRouteState, screen: 'preferences', returnRoute};
+}
+
 function isAppNoteRoute(state = history.state) {
   return state?.app === appRouteState && state.screen === 'note' && noteRouteIDPattern.test(state.noteID || '');
 }
@@ -105,7 +111,25 @@ function isAppDashboardRoute(state = history.state) {
   return state?.app === appRouteState && state.screen === 'dashboard';
 }
 
+function isAppPreferencesRoute(state = history.state) {
+  return state?.app === appRouteState && state.screen === 'preferences';
+}
+
+function currentAppRouteState() {
+  if (isAppNoteRoute()) return noteRouteState(history.state.noteID);
+  if (isAppDashboardRoute()) return dashboardRouteState();
+  const noteID = noteIDFromLocation();
+  return noteID ? noteRouteState(noteID) : dashboardRouteState();
+}
+
 function initializeHistoryRoute() {
+  if (window.location.pathname === preferencesPath) {
+    if (isAppPreferencesRoute()) return;
+    const path = window.location.pathname;
+    history.replaceState(dashboardRouteState(), '', '/');
+    history.pushState(preferencesRouteState(dashboardRouteState()), '', path);
+    return;
+  }
   const noteID = noteIDFromLocation();
   if (noteID) {
     if (isAppNoteRoute() && history.state.noteID === noteID) return;
@@ -136,6 +160,15 @@ function setDashboardRoute({replace = false} = {}) {
     return;
   }
   history[replace ? 'replaceState' : 'pushState'](state, '', '/');
+}
+
+function setPreferencesRoute({replace = false, returnRoute = currentAppRouteState()} = {}) {
+  const state = preferencesRouteState(returnRoute);
+  if (window.location.pathname === preferencesPath && !window.location.search && !window.location.hash) {
+    if (!isAppPreferencesRoute()) history.replaceState(state, '', preferencesPath);
+    return;
+  }
+  history[replace ? 'replaceState' : 'pushState'](state, '', preferencesPath);
 }
 
 function openOfflineDB() {
@@ -1355,6 +1388,14 @@ function closeConflictResolver() {
   closeModal($('#conflict-modal'));
 }
 
+function closePreferences() {
+  if (isAppPreferencesRoute()) {
+    history.back();
+    return;
+  }
+  closeModal($('#prefs-modal'));
+}
+
 function openModal(modal) {
   if (!modal.__keyboardBound) {
     modal.addEventListener('keydown', handleModalKeydown);
@@ -1380,6 +1421,7 @@ function handleModalKeydown(event) {
   if (event.key === 'Escape') {
     event.preventDefault();
     if (modal.id === 'conflict-modal') closeConflictResolver();
+    else if (modal.id === 'prefs-modal') closePreferences();
     else closeModal(modal);
     return;
   }
@@ -2617,6 +2659,32 @@ async function followWikiLink(title) {
 }
 
 async function restoreRoute({fetchRemote = false} = {}) {
+  if (!isAppPreferencesRoute() && !$('#prefs-modal').classList.contains('hidden')) closeModal($('#prefs-modal'));
+  if (isAppPreferencesRoute()) {
+    const returnRoute = history.state?.returnRoute;
+    const noteID = returnRoute?.screen === 'note' ? returnRoute.noteID : null;
+    if (noteID && await getLocalNote(noteID)) {
+      await openNote(noteID, {route: 'none'});
+      openPreferences({route: 'none'});
+      return;
+    }
+    if (noteID && fetchRemote && !await hasPendingOperation(noteID) && !await getUnresolvedConflict(noteID)) {
+      try {
+        const remote = await api(`/api/notes/${encodeURIComponent(noteID)}`, {syncRequest: true, throwOnError: true});
+        await putLocalNote({...remote, pending: false, base_revision: null, base_content: null, base_title: null, base_tags: null});
+        await openNote(noteID, {route: 'none'});
+        openPreferences({route: 'none'});
+        return;
+      } catch (error) {
+        if (error?.responseStatus !== 404) return;
+      }
+    }
+    if (noteID) setDashboardRoute({replace: true});
+    clearCurrentNote();
+    await loadDashboard({sync: false});
+    if (!noteID) openPreferences({route: 'none'});
+    return;
+  }
   const noteID = noteIDFromLocation();
   if (!screens.editor.classList.contains('hidden') && isDirty) await saveCurrentNote(false);
   if (noteID && await getLocalNote(noteID)) {
@@ -3704,7 +3772,7 @@ try {
   applyPrefs();
 }
 
-function openPreferences() {
+function openPreferences({route = 'push'} = {}) {
   $('#pref-autosave').checked = prefs.autoSave;
   $('#pref-hidepreview').checked = prefs.hidePreview;
   $('#pref-hideheader').checked = prefs.hideHeaderOnFullscreen;
@@ -3716,19 +3784,16 @@ function openPreferences() {
   $('#pref-theme').value = prefs.theme;
   $('#pref-accent').value = prefs.accentColor || themeByID.get(prefs.theme)?.vars.accent || '#ae2448';
   renderFontOptions();
+  if (route === 'push') setPreferencesRoute();
   openModal($('#prefs-modal'));
 }
 
 $('#prefs-btn').addEventListener('click', openPreferences);
 $('#editor-prefs-btn').addEventListener('click', openPreferences);
 
-$('#prefs-close').addEventListener('click', () => {
-  closeModal($('#prefs-modal'));
-});
+$('#prefs-close').addEventListener('click', closePreferences);
 
-$('#prefs-modal .modal-backdrop').addEventListener('click', () => {
-  closeModal($('#prefs-modal'));
-});
+$('#prefs-modal .modal-backdrop').addEventListener('click', closePreferences);
 
 async function savePref(key, value) {
   const previous = {...prefs};
