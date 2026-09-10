@@ -1875,7 +1875,11 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
       const hasLaterSave = Boolean(latestLaterOperation(queued, operation, 'note.save'));
       const laterPin = latestLaterOperation(queued, operation, 'note.pin');
       const desiredPinned = laterPin ? Boolean(laterPin.pinned) : Boolean(operation.pinned);
-      await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
+      // A later save was authored against the pin's older base. Let that save
+      // conflict normally so its content is three-way merged with the remote
+      // edit; rebasing it here would make the stale snapshot look current and
+      // allow it to overwrite the remote change.
+      if (!hasLaterSave) await rebaseQueuedNoteOperations(operation.note_id, operation.id, remote.revision, remote);
       await removePendingOperationIfIdentityMatches(operation.id, operation);
       const local = await getLocalNote(operation.note_id);
       const preserveLocalContent = hasLaterSave || (currentNoteId === operation.note_id && isDirty);

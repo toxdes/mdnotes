@@ -810,6 +810,55 @@ describe('F-02 immutable queue operations', () => {
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
   });
 
+  test('does not overwrite a remote edit when a stale pin precedes a local save', async () => {
+    let revision = 3;
+    let remote = {
+      id: 'note-a', title: 'Note', tags: '',
+      content: 'one\ntwo\nthree\nremote change',
+      revision, pinned: false, pin_order: 0,
+    };
+    const app = track(await createApp({
+      realMerge: true,
+      fetchImpl: async (path, options = {}) => {
+        if (String(path) === '/api/notes/note-a') return response(200, JSON.stringify(remote));
+        if (String(path) !== '/api/sync/push') throw new Error(`unexpected request: ${path}`);
+        const request = JSON.parse(options.body);
+        const acknowledged = request.operations.map(operation => {
+          if (operation.type !== 'noop' && operation.base_revision !== revision) {
+            return {op_id: operation.op_id, status: 'conflict', current_revision: revision};
+          }
+          if (operation.type === 'noop') return {op_id: operation.op_id, status: 'applied'};
+          revision++;
+          if (operation.type === 'note.save') {
+            remote = {...remote, title: operation.title, tags: operation.tags, content: operation.content, revision};
+          } else if (operation.type === 'note.pin') {
+            remote = {...remote, pinned: operation.pinned, pin_order: operation.pinned ? 9 : 0, revision};
+          }
+          return {op_id: operation.op_id, status: 'applied', revision, pin_order: remote.pin_order};
+        });
+        return response(200, JSON.stringify({
+          acknowledged,
+          expected_sequence: request.operations.at(-1).client_sequence + 1,
+        }));
+      },
+    }));
+    const base = 'one\ntwo\nthree\nfour';
+    const localContent = 'one\nlocal change\nthree\nfour';
+    await app.hooks.putLocalNote({
+      ...remote, content: localContent, revision: 2, pinned: true, pin_order: 5,
+      pending: true, base_revision: 2, base_content: base, base_title: 'Note', base_tags: '',
+    });
+    await app.hooks.queueOperation({type: 'note.pin', note_id: 'note-a', base_revision: 2, pinned: true});
+    await app.hooks.queueOperation({
+      type: 'note.save', note_id: 'note-a', base_revision: 2,
+      note: {id: 'note-a', title: 'Note', tags: '', content: localContent, revision: 2, pinned: true, base_revision: 2, base_content: base, base_title: 'Note', base_tags: ''},
+    });
+
+    await app.hooks.flushPendingChanges();
+
+    expect(remote.content).toBe('one\nlocal change\nthree\nremote change');
+  });
+
   test('allows only one tab to hold the fallback sync lease', async () => {
     const firstTab = track(await createApp());
     const secondTab = track(await createApp());

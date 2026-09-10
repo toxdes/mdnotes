@@ -8,6 +8,7 @@ const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const appSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'app.js'), 'utf8');
 const themesSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'themes.js'), 'utf8');
 const markedSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'marked.min.js'), 'utf8');
+const mergeSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'merge.js'), 'utf8');
 
 const testHookSource = `
 globalThis.__mdnotesTestHooks = {
@@ -107,7 +108,7 @@ export async function deleteOfflineDatabase() {
   });
 }
 
-export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null, realMarked = false} = {}) {
+export async function createApp({deferredSave = false, fetchImpl = async () => response(200, '{}'), serviceWorker = null, realMarked = false, realMerge = false} = {}) {
   const dom = new JSDOM(fs.readFileSync(path.join(testDirectory, '..', 'static', 'index.html'), 'utf8'), {
     url: 'http://localhost:8080/',
     pretendToBeVisual: true,
@@ -119,6 +120,7 @@ export async function createApp({deferredSave = false, fetchImpl = async () => r
   window.fetch = fetchImpl;
   if (serviceWorker) Object.defineProperty(window.navigator, 'serviceWorker', {value: serviceWorker, configurable: true});
   window.eval(themesSource);
+  if (realMerge) window.eval(mergeSource);
   if (realMarked) {
     window.eval(markedSource);
   } else {
