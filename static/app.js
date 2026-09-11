@@ -20,7 +20,7 @@ let panelState = 'both';
 let savedSnapshot = { title: '', tags: '', content: '' };
 let editorSessionGeneration = 0;
 const DEFAULT_PREFS = {revision:1, autoSave:true, hidePreview:false, hideHeaderOnFullscreen:false, hideToolbar:false, hideSaveButton:false, collapseDetails:false, hideCursorHighlight:false, statusDisplay:'normal', theme:'default-light', accentColor:'', fontFamily:'system-sans', fontFamilyGoogle:false, editorFontFamily:'system-monospace', editorFontFamilyGoogle:false, previewFontFamily:'system-sans', previewFontFamilyGoogle:false};
-const FONT_CACHE_NAME = 'mdnotes-fonts';
+const FONT_CACHE_NAME = 'vylk-fonts';
 const SYSTEM_FONT_STACK = 'ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
 const SYSTEM_SERIF_STACK = 'ui-serif,Georgia,Cambria,"Times New Roman",Times,serif';
 const SYSTEM_MONO_STACK = 'ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace';
@@ -51,10 +51,10 @@ const syncLeaseKey = 'syncLease';
 const syncLeaseDurationMs = 60000;
 let syncCoordinationChannel = null;
 let syncLeaseRenewTimer = null;
-let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('mdnotes-panel-ratio')) || .5));
+let panelRatio = Math.min(.8, Math.max(.2, Number(localStorage.getItem('vylk-panel-ratio')) || .5));
 let panelWide = false;
-let appVersionAtLoad = localStorage.getItem('mdnotes-version') || null;
-let appRevisionAtLoad = localStorage.getItem('mdnotes-revision') || null;
+let appVersionAtLoad = localStorage.getItem('vylk-version') || null;
+let appRevisionAtLoad = localStorage.getItem('vylk-revision') || null;
 let registeredServiceWorkerRevision = null;
 let updateToast = null;
 let syncStatusRevealTimer = null;
@@ -73,13 +73,13 @@ const unhealthySseFallbackSyncAgeMs = 30 * 1000;
 // Notes are stored locally before any network request. The service worker keeps
 // the app shell available, while IndexedDB holds the user's working set and a
 // durable queue of mutations to replay after connectivity returns.
-const offlineDBName = 'mdnotes-offline';
+const offlineDBName = 'vylk-offline';
 const offlineDBVersion = 4;
 let offlineDBPromise;
 
 const syncOperationIDPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const noteRouteIDPattern = /^[A-Za-z0-9_-]{1,64}$/;
-const appRouteState = 'mdnotes';
+const appRouteState = 'vylk';
 const preferencesPath = '/preferences';
 
 function noteIDFromLocation() {
@@ -704,7 +704,7 @@ function newLocalNoteID() {
 
 try {
   if (typeof BroadcastChannel !== 'undefined') {
-    syncCoordinationChannel = new BroadcastChannel('mdnotes-sync');
+    syncCoordinationChannel = new BroadcastChannel('vylk-sync');
     syncCoordinationChannel.addEventListener('message', event => {
       if (!event.data || event.data.sender === syncTabID) return;
       if (event.data.type === 'sync-request') scheduleSync({}, 0);
@@ -823,14 +823,14 @@ function cacheAppVersion(response) {
   if (changedVersion || changedRevision) showUpdateAvailable();
   if (response?.version) {
     if (!appVersionAtLoad) appVersionAtLoad = response.version;
-    localStorage.setItem('mdnotes-version', response.version);
+    localStorage.setItem('vylk-version', response.version);
   }
   if (response?.revision) {
     if (!appRevisionAtLoad) appRevisionAtLoad = response.revision;
-    localStorage.setItem('mdnotes-revision', response.revision);
+    localStorage.setItem('vylk-revision', response.revision);
     registerServiceWorker(response.revision);
   }
-  const version = response?.version || localStorage.getItem('mdnotes-version') || 'dev';
+  const version = response?.version || localStorage.getItem('vylk-version') || 'dev';
   $('#app-version').textContent = `v${version}`;
 }
 
@@ -1253,7 +1253,7 @@ async function loadConflictRemoteNote(noteID) {
 }
 
 async function mergeConflictedNote(operation, remote) {
-  if (operation.type !== 'note.save' || !operation.note || !window.MDNotesMerge) return false;
+  if (operation.type !== 'note.save' || !operation.note || !window.VylkMerge) return false;
   // A network response can arrive while the user is still typing. Capture that
   // newer local state before deriving the merge, rather than merging an older
   // queued snapshot and accidentally omitting the last keystrokes.
@@ -1269,7 +1269,7 @@ async function mergeConflictedNote(operation, remote) {
     tags: local.base_tags ?? operation.note.base_tags ?? operation.note.tags ?? '',
     content: local.base_content ?? operation.note.base_content ?? '',
   };
-  const merged = window.MDNotesMerge.mergeNoteVersions(base, local, remote);
+  const merged = window.VylkMerge.mergeNoteVersions(base, local, remote);
   if (!merged) return false;
   const queued = await pendingOperationsForNote(operation.note_id);
   const laterPin = latestLaterOperation(queued, operation, 'note.pin');
@@ -1940,7 +1940,7 @@ async function applySyncAcknowledgement(operation, acknowledgement) {
   if (acknowledgement.status !== 'applied') throw new Error('unknown sync acknowledgement');
   if (operation.type === 'prefs.save') {
     prefs = normalizePrefs({...prefs, revision: acknowledgement.revision || prefs.revision});
-    localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    localStorage.setItem('vylk-prefs', JSON.stringify(prefs));
     applyPrefs();
   }
   if (operation.type === 'note.save') {
@@ -2062,7 +2062,7 @@ async function resolvePreferenceConflict(operation) {
     }
   });
   prefs = next;
-  localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+  localStorage.setItem('vylk-prefs', JSON.stringify(prefs));
   applyPrefs();
   if (conflicts.length) {
     showToast('Some preferences changed on another device. Those settings were kept.', 'warning');
@@ -2124,7 +2124,7 @@ async function withSyncLeadership(work) {
     let acquired = false;
     let result;
     try {
-      await navigator.locks.request('mdnotes-sync', {ifAvailable: true}, async lock => {
+      await navigator.locks.request('vylk-sync', {ifAvailable: true}, async lock => {
         if (!lock) return;
         acquired = true;
         result = await work();
@@ -2237,7 +2237,7 @@ async function performSync(options = {}) {
       reconcile = Boolean(pendingOptions.reconcile);
     }
 
-    localStorage.setItem('mdnotes-offline-ready', '1');
+    localStorage.setItem('vylk-offline-ready', '1');
     clearSyncDiagnostic();
     syncFailed = false;
     lastSuccessfulSyncAt = Date.now();
@@ -2477,8 +2477,8 @@ $('#logout-btn').addEventListener('click', async () => {
     showToast('Close other app tabs, then try signing out again.', 'warning');
     return;
   }
-  localStorage.removeItem('mdnotes-offline-ready');
-  localStorage.removeItem('mdnotes-prefs');
+  localStorage.removeItem('vylk-offline-ready');
+  localStorage.removeItem('vylk-prefs');
   show(screens.login);
   $('#login-form input').focus();
 });
@@ -3228,7 +3228,7 @@ function applyPanelRatio() {
 
 function setPanelRatio(ratio) {
   panelRatio = Math.min(.8, Math.max(.2, ratio));
-  localStorage.setItem('mdnotes-panel-ratio', String(panelRatio));
+  localStorage.setItem('vylk-panel-ratio', String(panelRatio));
   applyPanelRatio();
 }
 
@@ -3636,7 +3636,7 @@ function formatDate(iso) {
 }
 
 // --- Theme and appearance ---
-const themeDefinitions = Array.isArray(window.MDNotesThemes) ? window.MDNotesThemes : [];
+const themeDefinitions = Array.isArray(window.VylkThemes) ? window.VylkThemes : [];
 const themeByID = new Map(themeDefinitions.map(theme => [theme.id, theme]));
 
 function kebabCase(value) {
@@ -3738,7 +3738,7 @@ function shouldFetchGoogleFont(slot) {
 }
 
 function removeLoadedFonts() {
-  document.querySelectorAll('[data-mdnotes-font]').forEach(link => link.remove());
+  document.querySelectorAll('[data-vylk-font]').forEach(link => link.remove());
   FONT_SLOTS.forEach(slot => {
     document.documentElement.style.setProperty(slot.variable, fontCSSValue(prefs[slot.preference], slot.fallback));
     if (validFontValue($(slot.input)?.value)) setFontError(slot);
@@ -3755,7 +3755,7 @@ async function applyFontsNow(clearCache = false) {
   await Promise.all(families.map(async fontFamily => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.dataset.mdnotesFont = fontFamily;
+    link.dataset.vylkFont = fontFamily;
     link.href = fontCSSURL(fontFamily);
     document.head.append(link);
     try {
@@ -3814,7 +3814,7 @@ applyPrefs();
 
 // Apply cached preferences immediately, then the server's preferences later.
 try {
-  const cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}');
+  const cached = JSON.parse(localStorage.getItem('vylk-prefs') || '{}');
   prefs = normalizePrefs(cached);
   applyPrefs();
 } catch (_) {
@@ -3848,7 +3848,7 @@ $('#prefs-modal .modal-backdrop').addEventListener('click', closePreferences);
 async function savePref(key, value) {
   const previous = {...prefs};
   prefs = normalizePrefs({...prefs, [key]: value});
-  localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+  localStorage.setItem('vylk-prefs', JSON.stringify(prefs));
   await queueOperation({
     type: 'prefs.save',
     note_id: '__prefs__',
@@ -3943,14 +3943,14 @@ async function loadPrefs() {
   }
   if (p && !await hasPendingOperation('__prefs__')) {
     let cached = {};
-    try { cached = JSON.parse(localStorage.getItem('mdnotes-prefs') || '{}'); } catch (_) {}
+    try { cached = JSON.parse(localStorage.getItem('vylk-prefs') || '{}'); } catch (_) {}
     prefs = normalizePrefs(p, cached);
-    localStorage.setItem('mdnotes-prefs', JSON.stringify(prefs));
+    localStorage.setItem('vylk-prefs', JSON.stringify(prefs));
     applyPrefs();
     return;
   }
   try {
-    const cached = localStorage.getItem('mdnotes-prefs');
+    const cached = localStorage.getItem('vylk-prefs');
     if (cached) prefs = normalizePrefs(JSON.parse(cached));
   } catch (_) {}
   applyPrefs();

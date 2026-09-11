@@ -21,7 +21,7 @@ import (
 const (
 	envelopeMagic   = "MDN2"
 	envelopeVersion = byte(1)
-	metaFilename    = ".mdnotes-crypto.json"
+	metaFilename    = ".vylk-crypto.json"
 
 	argonTime    = uint32(2)
 	argonMemory  = uint32(19 * 1024) // KiB
@@ -52,7 +52,7 @@ func deriveKey(s string) []byte {
 
 func newEncryptionConfig(notesDir, password, rawKey string) (*encryptionConfig, error) {
 	if password != "" && rawKey != "" {
-		return nil, errors.New("set only one of MDNOTES_ENCRYPTION_PASSWORD or MDNOTES_ENCRYPTION_KEY")
+		return nil, errors.New("set only one of VYLK_ENCRYPTION_PASSWORD or VYLK_ENCRYPTION_KEY")
 	}
 	if password == "" && rawKey == "" {
 		return nil, nil
@@ -77,7 +77,7 @@ func newEncryptionConfig(notesDir, password, rawKey string) (*encryptionConfig, 
 
 	key, err := parseRawKey(rawKey)
 	if err != nil {
-		// Preserve the previous MDNOTES_ENCRYPTION_KEY behavior for existing
+		// Preserve the previous VYLK_ENCRYPTION_KEY behavior for existing
 		// deployments. New deployments should use a base64 or hex 32-byte key.
 		return &encryptionConfig{key: deriveKey(rawKey), legacyWrite: true}, nil
 	}
@@ -141,7 +141,7 @@ func loadOrCreateEncryptionMetadata(notesDir string) (*encryptionMetadata, error
 }
 
 func writePrivateFile(path string, content []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".mdnotes-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vylk-*")
 	if err != nil {
 		return err
 	}
@@ -166,7 +166,7 @@ func writePrivateFile(path string, content []byte) error {
 }
 
 func noteAAD(id string) []byte {
-	return []byte("mdnotes:v2:" + id)
+	return []byte("vylk:v2:" + id)
 }
 
 func isVersionedEnvelope(data []byte) bool {

@@ -27,7 +27,7 @@ test('in-app Back does not leave a stale note in browser history', async ({page}
   });
   await expect(page.locator('#dashboard')).toBeVisible();
   await expect(page).toHaveURL(/\/$/);
-  await expect.poll(() => page.evaluate(() => history.state)).toMatchObject({app: 'mdnotes', screen: 'dashboard'});
+  await expect.poll(() => page.evaluate(() => history.state)).toMatchObject({app: 'vylk', screen: 'dashboard'});
 
   await page.goBack();
   expect(page.url()).not.toBe(noteURL);

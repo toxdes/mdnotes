@@ -60,7 +60,7 @@ describe('font preferences', () => {
     await app.hooks.savePref('previewFontFamily', 'system-serif');
     await app.hooks.applyFonts();
     expect(root.style.getPropertyValue('--preview-font')).toContain('ui-serif');
-    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelectorAll('[data-vylk-font]')).toHaveLength(0);
     expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
   });
 
@@ -77,7 +77,7 @@ describe('font preferences', () => {
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(error.textContent).toContain('valid font name');
     expect((await app.hooks.pendingOperations()).filter(operation => operation.type === 'prefs.save')).toHaveLength(0);
-    expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs') || '{}').fontFamily).not.toBe('Bad"Font');
+    expect(JSON.parse(app.window.localStorage.getItem('vylk-prefs') || '{}').fontFamily).not.toBe('Bad"Font');
 
     await app.hooks.applyFonts();
     expect(input.value).toBe('Bad"Font');
@@ -93,7 +93,7 @@ describe('font preferences', () => {
     let probeCount = 0;
     head.append = (...nodes) => {
       append(...nodes);
-      nodes.filter(node => node.rel === 'stylesheet' && !node.dataset.mdnotesFont).forEach(node => {
+      nodes.filter(node => node.rel === 'stylesheet' && !node.dataset.vylkFont).forEach(node => {
         probeCount++;
         setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
       });
@@ -102,7 +102,7 @@ describe('font preferences', () => {
     await app.hooks.loadPrefs();
 
     expect(probeCount).toBe(0);
-    expect(app.window.document.querySelectorAll('[data-mdnotes-font]')).toHaveLength(0);
+    expect(app.window.document.querySelectorAll('[data-vylk-font]')).toHaveLength(0);
     expect(app.window.document.querySelector('#pref-font-error').hidden).toBe(true);
   });
 
@@ -113,7 +113,7 @@ describe('font preferences', () => {
     const append = head.append.bind(head);
     head.append = (...nodes) => {
       append(...nodes);
-      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.vylkFont).forEach(node => {
         setTimeout(() => node.dispatchEvent(new app.window.Event('error')), 0);
       });
     };
@@ -137,8 +137,8 @@ describe('font preferences', () => {
     let stylesheet;
     head.append = (...nodes) => {
       append(...nodes);
-      stylesheet ||= nodes.find(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont);
-      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+      stylesheet ||= nodes.find(node => node.rel === 'stylesheet' && node.dataset.vylkFont);
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.vylkFont).forEach(node => {
         setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
       });
     };
@@ -160,7 +160,7 @@ describe('font preferences', () => {
     const append = head.append.bind(head);
     head.append = (...nodes) => {
       append(...nodes);
-      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.mdnotesFont).forEach(node => {
+      nodes.filter(node => node.rel === 'stylesheet' && node.dataset.vylkFont).forEach(node => {
         setTimeout(() => node.dispatchEvent(new app.window.Event('load')), 0);
       });
     };
@@ -173,7 +173,7 @@ describe('font preferences', () => {
     await app.hooks.pendingOperations();
     await app.hooks.applyFonts();
 
-    const requested = [...app.window.document.querySelectorAll('[data-mdnotes-font]')];
+    const requested = [...app.window.document.querySelectorAll('[data-vylk-font]')];
     expect(requested).toHaveLength(1);
     expect(requested[0].href).toContain('family=Fira+Code&display=swap');
     expect(app.window.document.querySelector('#pref-font-google').checked).toBe(false);
@@ -1524,7 +1524,7 @@ describe('preference sync coordination', () => {
     await expect(app.hooks.flushPendingChanges()).resolves.toBe(true);
 
     expect(await app.hooks.pendingOperations()).toHaveLength(0);
-    expect(JSON.parse(app.window.localStorage.getItem('mdnotes-prefs'))).toMatchObject({theme: 'solarized-dark', revision: 2});
+    expect(JSON.parse(app.window.localStorage.getItem('vylk-prefs'))).toMatchObject({theme: 'solarized-dark', revision: 2});
     expect(app.window.document.querySelector('#toast-region').textContent).toContain('Some preferences changed on another device');
   });
 });
@@ -1791,7 +1791,7 @@ describe('offline database migrations', () => {
   test('upgrades the legacy layout to the explicit schema and queue index', async () => {
     const app = track(await createApp());
     const legacy = await new Promise((resolve, reject) => {
-      const request = app.window.indexedDB.open('mdnotes-offline', 1);
+      const request = app.window.indexedDB.open('vylk-offline', 1);
       request.onupgradeneeded = () => {
         const db = request.result;
         db.createObjectStore('notes', {keyPath: 'id'});

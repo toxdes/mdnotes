@@ -1,5 +1,5 @@
 {
-  "name": "mdnotes-frontend-tests",
+  "name": "vylk-frontend-tests",
   "private": true,
   "scripts": {
     "test:frontend": "vitest run test && node --test static/merge.test.js",

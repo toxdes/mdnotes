@@ -77,7 +77,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, value any, maxBytes int6
 }
 
 func writeNoteFile(path string, content []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".mdnotes-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vylk-*")
 	if err != nil {
 		return err
 	}

@@ -1,4 +1,4 @@
-module mdnotes
+module vylk
 
 go 1.25.1
 

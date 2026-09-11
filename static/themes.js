@@ -1,6 +1,6 @@
 // UI theme definitions. Adding or removing a preset only requires changing
 // this data list; themes do not affect Markdown syntax highlighting.
-window.MDNotesThemes = [
+window.VylkThemes = [
   {id:'default-light',name:'Default Light',dark:false,vars:{bg:'#fafafa',fg:'#0a4067',muted:'#64748b',border:'#e2e8f0',accent:'#ae2448',accentHover:'#8a1d3a',danger:'#dc2626',dangerHover:'#b91c1c',cardBg:'#fff',surface:'#fafafa',shadow:'0 1px 3px rgba(0,0,0,.06)',highlight:'#fef9c3',online:'#167a42',syncing:'#a65f00',offline:'#c24141'}},
   {id:'default-dark',name:'Default Dark',dark:true,vars:{bg:'#0e1124',fg:'#cfd1fc',muted:'#7c7fa8',border:'#1e293b',accent:'#f13c66',accentHover:'#d42e55',danger:'#ef4444',dangerHover:'#f87171',cardBg:'#1a1d31',surface:'#0e1124',shadow:'0 1px 3px rgba(0,0,0,.2)',highlight:'#3b3b1a',online:'#55d58a',syncing:'#f5b84b',offline:'#fb7185'}},
   {id:'solarized-light',name:'Solarized Light',dark:false,vars:{bg:'#fdf6e3',fg:'#073642',muted:'#657b83',border:'#eee8d5',accent:'#268bd2',accentHover:'#1f6fae',danger:'#dc322f',dangerHover:'#b32926',cardBg:'#fdf6e3',surface:'#eee8d5',shadow:'0 1px 3px rgba(0,43,54,.12)',highlight:'#eee8d5',online:'#859900',syncing:'#b58900',offline:'#dc322f'}},
