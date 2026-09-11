@@ -1,0 +1,64 @@
+[project]
+id = "vylk"
+name = "Vylk"
+version_file = "VERSION"
+description = "Lightweight, low-resource single-binary markdown notes editor"
+homepage = "https://github.com/toxdes/vylk"
+repository = "https://github.com/toxdes/vylk"
+license = "MIT"
+maintainer = "toxdes <hi@toxdes.com>"
+
+[build]
+dockerfile = "Dockerfile"
+context = "."
+output_dir = "dist"
+platforms = ["linux/amd64", "linux/arm64"]
+
+[build.args]
+INCLUDE_APPIMAGE = "0"
+
+[artifacts]
+deb = ["*.deb"]
+rpm = ["*.rpm"]
+archive = ["*.tar.gz"]
+
+[package]
+binary = "vylk"
+
+[deb]
+package_name = "vylk"
+section = "utils"
+priority = "optional"
+architectures = ["amd64", "arm64"]
+
+[rpm]
+package_name = "vylk"
+release = "1"
+architectures = ["x86_64", "aarch64"]
+
+[aur]
+binary_package = "vylk-bin"
+git_package = "vylk-git"
+architectures = ["x86_64", "aarch64"]
+git_pkgbuild = "PKGBUILD"
+
+[hosting]
+public_base_url = "https://packages.toxdes.com"
+apt_prefix = "apt"
+rpm_prefix = "rpm"
+release_prefix = "releases"
+
+[hosting.apt]
+suite = "stable"
+component = "main"
+origin = "toxdes"
+label = "Toxdes"
+
+[hosting.signing]
+gpg_key_env = "GPG_KEY_ID"
+gpg_passphrase_env = "GPG_PASSPHRASE"
+
+[hosting.aur]
+host = "aur.archlinux.org"
+ssh_user = "aur"
+maintainer = "toxdes <hi@toxdes.com>"

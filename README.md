@@ -78,6 +78,20 @@ Cross-compile all targets (Linux binaries compressed with UPX):
 ./build.py
 ```
 
+### Linux packages
+
+Release builds use [yesb](https://github.com/toxdes/yesb) and produce amd64 and arm64 Debian packages, RPMs, and release archives:
+
+```
+./yesb/build_all.py
+```
+
+The published package repositories are available at:
+
+- Debian/Ubuntu: `https://packages.toxdes.com/apt`
+- RPM-based distributions: `https://packages.toxdes.com/rpm`
+- Arch Linux: `vylk-bin` or `vylk-git` from the AUR
+
 ## Tests
 
 Run the default frontend behavior suite with `npm run test:frontend`. The opt-in browser reliability suite uses the installed Chrome binary and a temporary Go server; run it with `npm run test:browser`. It covers offline cached startup, unchanged navigation request counts, a warm dashboard performance budget, keyboard navigation, and serious accessibility violations.

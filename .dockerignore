@@ -1,0 +1,10 @@
+.git
+.gitmodules
+dist
+node_modules
+notes
+test-results
+playwright-report
+*.db
+vylk
+*.pre-migration-*.db
