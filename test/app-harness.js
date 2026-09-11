@@ -11,7 +11,7 @@ const markedSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'm
 const mergeSource = fs.readFileSync(path.join(testDirectory, '..', 'static', 'merge.js'), 'utf8');
 
 const testHookSource = `
-globalThis.__mdnotesTestHooks = {
+globalThis.__vylkTestHooks = {
   saveCurrentNote,
   queueOperation,
   flushPendingChanges,
@@ -88,8 +88,8 @@ globalThis.__mdnotesTestHooks = {
 
 const deferredSaveCall = "await saveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});";
 const deferredSaveReplacement = "await globalThis.__testSaveLocalNoteAndQueue(local, {type: 'note.save', note_id: snapshot.noteID, base_revision: baseRevision, note: local});";
-const syncCompletionCall = "    localStorage.setItem('mdnotes-offline-ready', '1');";
-const syncCompletionReplacement = "    await globalThis.__testBeforeSyncCompletion();\n    localStorage.setItem('mdnotes-offline-ready', '1');";
+const syncCompletionCall = "    localStorage.setItem('vylk-offline-ready', '1');";
+const syncCompletionReplacement = "    await globalThis.__testBeforeSyncCompletion();\n    localStorage.setItem('vylk-offline-ready', '1');";
 
 function response(status, body = '') {
   return {
@@ -103,7 +103,7 @@ function response(status, body = '') {
 
 export async function deleteOfflineDatabase() {
   await new Promise((resolve, reject) => {
-    const request = indexedDB.deleteDatabase('mdnotes-offline');
+    const request = indexedDB.deleteDatabase('vylk-offline');
     request.onsuccess = resolve;
     request.onerror = () => reject(request.error);
     request.onblocked = () => reject(new Error('offline test database is blocked'));
@@ -178,14 +178,14 @@ export async function createApp({deferredSave = false, deferredSyncCompletion = 
 
   return {
     window,
-    hooks: window.__mdnotesTestHooks,
+    hooks: window.__vylkTestHooks,
     saveCalls,
     firstSaveStarted,
     releaseFirstSave,
     syncCompletionStarted,
     releaseSyncCompletion,
     close: async () => {
-      await window.__mdnotesTestHooks.closeDatabase();
+      await window.__vylkTestHooks.closeDatabase();
       window.close();
     },
   };

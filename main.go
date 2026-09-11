@@ -62,7 +62,7 @@ func embeddedAppRevision() string {
 
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-MDNotes-Shell") == "1" {
+		if r.Header.Get("X-Vylk-Shell") == "1" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -170,12 +170,12 @@ func main() {
 		}
 	}
 
-	password, err := readSecret("MDNOTES_PASSWORD")
+	password, err := readSecret("VYLK_PASSWORD")
 	if err != nil {
 		log.Fatalf("password: %v", err)
 	}
 	if password == "" {
-		log.Fatal("MDNOTES_PASSWORD environment variable is required")
+		log.Fatal("VYLK_PASSWORD environment variable is required")
 	}
 
 	port := os.Getenv("PORT")
@@ -183,7 +183,7 @@ func main() {
 		port = "8080"
 	}
 
-	notesDir := os.Getenv("MDNOTES_DIR")
+	notesDir := os.Getenv("VYLK_DIR")
 	if notesDir == "" {
 		notesDir = "./notes"
 	}
@@ -195,9 +195,9 @@ func main() {
 		log.Fatalf("cannot create notes directory: %v", err)
 	}
 
-	dbPath := os.Getenv("MDNOTES_DB")
+	dbPath := os.Getenv("VYLK_DB")
 	if dbPath == "" {
-		dbPath = "./mdnotes.db"
+		dbPath = "./vylk.db"
 	}
 
 	db, err := openDB(dbPath)
@@ -212,17 +212,17 @@ func main() {
 
 	sessions := newSessionStore(db)
 
-	trustProxy := os.Getenv("MDNOTES_TRUST_PROXY") == "1"
+	trustProxy := os.Getenv("VYLK_TRUST_PROXY") == "1"
 	rl, err := newRateLimiter(db, trustProxy)
 	if err != nil {
 		log.Fatalf("rate limiter: %v", err)
 	}
 
-	encryptionPassword, err := readSecret("MDNOTES_ENCRYPTION_PASSWORD")
+	encryptionPassword, err := readSecret("VYLK_ENCRYPTION_PASSWORD")
 	if err != nil {
 		log.Fatalf("encryption password: %v", err)
 	}
-	encryptionKey, err := readSecret("MDNOTES_ENCRYPTION_KEY")
+	encryptionKey, err := readSecret("VYLK_ENCRYPTION_KEY")
 	if err != nil {
 		log.Fatalf("encryption key: %v", err)
 	}
@@ -232,7 +232,7 @@ func main() {
 	}
 	if encryption != nil {
 		if encryption.legacyWrite {
-			log.Println("legacy file encryption enabled; migrate to MDNOTES_ENCRYPTION_PASSWORD or an explicitly encoded 32-byte key")
+			log.Println("legacy file encryption enabled; migrate to VYLK_ENCRYPTION_PASSWORD or an explicitly encoded 32-byte key")
 		} else {
 			log.Println("versioned file encryption enabled")
 		}
@@ -251,7 +251,7 @@ func main() {
 	if err := app.recoverFileOperations(); err != nil {
 		log.Fatalf("recover pending file operations: %v", err)
 	}
-	if os.Getenv("MDNOTES_MIGRATE_ENCRYPTION") == "1" {
+	if os.Getenv("VYLK_MIGRATE_ENCRYPTION") == "1" {
 		count, err := migrateEncryption(app)
 		if err != nil {
 			log.Fatalf("encryption migration: %v", err)
@@ -317,7 +317,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("mdnotes running on :%s (notes: %s, db: %s)", port, notesDir, dbPath)
+		log.Printf("vylk running on :%s (notes: %s, db: %s)", port, notesDir, dbPath)
 		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server: %v", err)
@@ -347,7 +347,7 @@ func readSecret(name string) (string, error) {
 
 func migrateEncryption(a *app) (int, error) {
 	if a.encryption == nil || a.encryption.legacyWrite {
-		return 0, fmt.Errorf("MDNOTES_MIGRATE_ENCRYPTION requires MDNOTES_ENCRYPTION_PASSWORD or an explicitly encoded key")
+		return 0, fmt.Errorf("VYLK_MIGRATE_ENCRYPTION requires VYLK_ENCRYPTION_PASSWORD or an explicitly encoded key")
 	}
 	notes, err := listNotes(a.db, "")
 	if err != nil {

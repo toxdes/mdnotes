@@ -15,7 +15,7 @@ import (
 const (
 	fileOperationReplace = "replace"
 	fileOperationDelete  = "delete"
-	stageFilePrefix      = ".mdnotes-stage-"
+	stageFilePrefix      = ".vylk-stage-"
 )
 
 type fileOperation struct {

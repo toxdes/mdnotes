@@ -1,7 +1,7 @@
 (function(root, factory) {
   const api = factory();
   if (typeof module === 'object' && module.exports) module.exports = api;
-  root.MDNotesMerge = api;
+  root.VylkMerge = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function() {
   'use strict';
 

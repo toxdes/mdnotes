@@ -1,5 +1,5 @@
-const CACHE_PREFIX = 'mdnotes-shell-';
-const LEGACY_CACHE = 'mdnotes-shell';
+const CACHE_PREFIX = 'vylk-shell-';
+const LEGACY_CACHE = 'vylk-shell';
 const revisionFromURL = new URL(self.location.href).searchParams.get('revision') || 'legacy';
 const safeRevision = /^[A-Za-z0-9._-]{1,128}$/.test(revisionFromURL) ? revisionFromURL : 'legacy';
 const CACHE = `${CACHE_PREFIX}${safeRevision}`;
@@ -9,7 +9,7 @@ const ASSETS = [
   '/icon-192.png', '/icon-512.png', '/logo.svg'
 ];
 const SHELL_ASSETS = new Set(ASSETS);
-const FONT_CACHE = 'mdnotes-fonts';
+const FONT_CACHE = 'vylk-fonts';
 const FONT_ORIGINS = new Set(['https://fonts.googleapis.com', 'https://fonts.gstatic.com']);
 
 async function normalizeShellResponse(response) {
@@ -35,7 +35,7 @@ async function cachedShellResponse(request) {
 }
 
 async function fetchShellAsset(request) {
-  const response = await fetch(request, {cache: 'no-cache', headers: {'X-MDNotes-Shell': '1'}});
+  const response = await fetch(request, {cache: 'no-cache', headers: {'X-Vylk-Shell': '1'}});
   if (response.ok) {
     const url = new URL(request.url);
     if (!url.search && SHELL_ASSETS.has(url.pathname)) {
@@ -52,7 +52,7 @@ self.addEventListener('install', e => {
     // cache used by the active worker.
     const cache = await caches.open(CACHE);
     await Promise.all(ASSETS.map(async asset => {
-      const response = await fetch(asset, {cache: 'no-cache', headers: {'X-MDNotes-Shell': '1'}});
+      const response = await fetch(asset, {cache: 'no-cache', headers: {'X-Vylk-Shell': '1'}});
       if (!response.ok) throw new Error(`could not cache ${asset}`);
       await cache.put(asset, response);
     }));

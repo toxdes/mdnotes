@@ -140,7 +140,7 @@ func TestGzipMiddlewareLeavesServiceWorkerShellUncompressed(t *testing.T) {
 	}))
 	request := httptest.NewRequest(http.MethodGet, "/index.html", nil)
 	request.Header.Set("Accept-Encoding", "gzip")
-	request.Header.Set("X-MDNotes-Shell", "1")
+	request.Header.Set("X-Vylk-Shell", "1")
 	result := httptest.NewRecorder()
 	handler.ServeHTTP(result, request)
 
@@ -363,8 +363,8 @@ func TestReadSecretFromFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("value\n"), 0600); err != nil {
 		t.Fatalf("write secret: %v", err)
 	}
-	t.Setenv("MDNOTES_TEST_SECRET_FILE", path)
-	value, err := readSecret("MDNOTES_TEST_SECRET")
+	t.Setenv("VYLK_TEST_SECRET_FILE", path)
+	value, err := readSecret("VYLK_TEST_SECRET")
 	if err != nil || value != "value" {
 		t.Fatalf("read secret = %q, %v", value, err)
 	}

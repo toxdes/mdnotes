@@ -91,39 +91,39 @@ function loadWorker({revision = 'new', caches, fetchImpl}) {
 
 test('a failed install leaves the active revision cache untouched', async () => {
   const caches = createCacheStorage();
-  const oldCache = await caches.open('mdnotes-shell-old');
+  const oldCache = await caches.open('vylk-shell-old');
   await oldCache.put('/app.js', new Response('old app'));
   const fetchImpl = vi.fn(async (request, options) => {
-    expect(options.headers['X-MDNotes-Shell']).toBe('1');
+    expect(options.headers['X-Vylk-Shell']).toBe('1');
     if (String(request).endsWith('/app.js')) throw new Error('asset unavailable');
     return new Response(`asset ${request}`);
   });
   const worker = loadWorker({caches, fetchImpl});
 
   await expect(worker.install()).rejects.toThrow('asset unavailable');
-  expect(await caches.keys()).toEqual(expect.arrayContaining(['mdnotes-shell-old', 'mdnotes-shell-new']));
-  expect(await (await caches.open('mdnotes-shell-old')).match('/app.js')).toBeDefined();
+  expect(await caches.keys()).toEqual(expect.arrayContaining(['vylk-shell-old', 'vylk-shell-new']));
+  expect(await (await caches.open('vylk-shell-old')).match('/app.js')).toBeDefined();
   expect(worker.self.skipWaiting).not.toHaveBeenCalled();
 });
 
 test('activation promotes a complete revision and removes old shell caches', async () => {
   const caches = createCacheStorage();
-  await caches.open('mdnotes-shell-old');
-  await caches.open('mdnotes-shell');
-  await caches.open('mdnotes-fonts');
+  await caches.open('vylk-shell-old');
+  await caches.open('vylk-shell');
+  await caches.open('vylk-fonts');
   const worker = loadWorker({caches, fetchImpl: async request => new Response(`asset ${request}`)});
 
   await worker.install();
   await worker.activate();
 
-  expect(await caches.keys()).toEqual(expect.arrayContaining(['mdnotes-shell-new', 'mdnotes-fonts']));
-  expect(await caches.keys()).not.toEqual(expect.arrayContaining(['mdnotes-shell-old', 'mdnotes-shell']));
+  expect(await caches.keys()).toEqual(expect.arrayContaining(['vylk-shell-new', 'vylk-fonts']));
+  expect(await caches.keys()).not.toEqual(expect.arrayContaining(['vylk-shell-old', 'vylk-shell']));
   expect(worker.self.clients.claim).toHaveBeenCalledOnce();
 });
 
 test('navigation is served from the active shell cache without waiting for network', async () => {
   const caches = createCacheStorage();
-  const shell = await caches.open('mdnotes-shell-new');
+  const shell = await caches.open('vylk-shell-new');
   await shell.put('/index.html', new Response('cached shell'));
   const fetchImpl = vi.fn(async () => { throw new Error('network unavailable'); });
   const worker = loadWorker({caches, fetchImpl});
@@ -154,7 +154,7 @@ test('caches Google Fonts CSS and font binaries for offline reloads', async () =
 
 test('returns a fetched font when browser cache storage rejects the cache write', async () => {
   const caches = createCacheStorage();
-  const fonts = await caches.open('mdnotes-fonts');
+  const fonts = await caches.open('vylk-fonts');
   fonts.put = vi.fn(async () => { throw new Error('cross-origin cache write rejected'); });
   const fetchImpl = vi.fn(async () => new Response('font binary'));
   const worker = loadWorker({caches, fetchImpl});
@@ -167,7 +167,7 @@ test('returns a fetched font when browser cache storage rejects the cache write'
 
 test('fetches a font when browser cache lookup rejects', async () => {
   const caches = createCacheStorage();
-  const fonts = await caches.open('mdnotes-fonts');
+  const fonts = await caches.open('vylk-fonts');
   fonts.match = vi.fn(async () => { throw new Error('cross-origin cache lookup rejected'); });
   const fetchImpl = vi.fn(async () => new Response('font binary'));
   const worker = loadWorker({caches, fetchImpl});

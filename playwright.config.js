@@ -7,7 +7,7 @@ const port = 18080;
 const chromePath = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 if (!existsSync(chromePath)) throw new Error(`Chrome was not found at ${chromePath}`);
 
-const dataRoot = path.join(tmpdir(), `mdnotes-browser-${process.pid}`);
+const dataRoot = path.join(tmpdir(), `vylk-browser-${process.pid}`);
 
 export default defineConfig({
   testDir: './test/browser',
@@ -31,10 +31,10 @@ export default defineConfig({
     env: {
       ...process.env,
       PORT: String(port),
-      MDNOTES_PASSWORD: 'browser-test-password',
-      MDNOTES_DIR: path.join(dataRoot, 'notes'),
-      MDNOTES_DB: path.join(dataRoot, 'mdnotes.db'),
-      GOCACHE: path.join(tmpdir(), 'mdnotes-browser-go-cache'),
+      VYLK_PASSWORD: 'browser-test-password',
+      VYLK_DIR: path.join(dataRoot, 'notes'),
+      VYLK_DB: path.join(dataRoot, 'vylk.db'),
+      GOCACHE: path.join(tmpdir(), 'vylk-browser-go-cache'),
     },
   },
 });

@@ -19,7 +19,7 @@ os.makedirs(outdir, exist_ok=True)
 upx = shutil.which("upx")
 
 for os_name, arch, ext in targets:
-    name = f"mdnotes_{os_name}_{arch}_{version}{ext}"
+    name = f"vylk_{os_name}_{arch}_{version}{ext}"
     path = os.path.join(outdir, name)
     env = os.environ.copy()
     env["GOOS"] = os_name
