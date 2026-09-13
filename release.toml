@@ -17,6 +17,42 @@ platforms = ["linux/amd64", "linux/arm64"]
 [build.args]
 INCLUDE_APPIMAGE = "0"
 
+[release]
+[[release.artifacts]]
+name = "vylk_{version}_amd64.tar.gz"
+platform = "linux"
+architecture = "x86_64"
+
+[[release.artifacts]]
+name = "vylk_{version}_arm64.tar.gz"
+platform = "linux"
+architecture = "arm64"
+
+[[release.artifacts]]
+name = "vylk_linux_amd64_{version}"
+platform = "linux"
+architecture = "x86_64"
+
+[[release.artifacts]]
+name = "vylk_linux_arm64_{version}"
+platform = "linux"
+architecture = "arm64"
+
+[[release.artifacts]]
+name = "vylk_darwin_amd64_{version}"
+platform = "macos"
+architecture = "x86_64"
+
+[[release.artifacts]]
+name = "vylk_darwin_arm64_{version}"
+platform = "macos"
+architecture = "arm64"
+
+[[release.artifacts]]
+name = "vylk_windows_amd64_{version}.exe"
+platform = "windows"
+architecture = "x86_64"
+
 [artifacts]
 deb = ["*.deb"]
 rpm = ["*.rpm"]
